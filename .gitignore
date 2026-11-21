@@ -1,0 +1,27 @@
+# Compiled binaries
+/seamline
+/simworker
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts & coverage
+*.test
+*.out
+coverage.txt
+
+# Local data / WAL directories (Phase 2+)
+/data/
+*.wal
+*.db
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

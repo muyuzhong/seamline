@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & Test (Go 1.23)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      - name: Format, Vet, and Race Test
+        run: |
+          if [ -n "$(find . -name '*.go' -not -path './vendor/*')" ]; then
+            unformatted="$(gofmt -l .)"
+            if [ -n "$unformatted" ]; then
+              echo "Go files must be formatted with gofmt:"
+              echo "$unformatted"
+              exit 1
+            fi
+            go vet ./...
+            go test -race -v ./...
+          fi
