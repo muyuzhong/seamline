@@ -14,6 +14,18 @@ const (
 	StateFailed    SessionState = "failed"
 )
 
+// StateFromRecordType derives the SessionState implied by a committed Record's Type.
+func StateFromRecordType(recordType string) SessionState {
+	switch recordType {
+	case "run_finished":
+		return StateCompleted
+	case "run_failed":
+		return StateFailed
+	default:
+		return StateIdle
+	}
+}
+
 type Record struct {
 	Offset    uint64          `json:"offset"`
 	Epoch     string          `json:"epoch"`
