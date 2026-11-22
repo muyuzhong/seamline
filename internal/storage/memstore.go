@@ -116,6 +116,20 @@ func (m *MemoryStorage) LoadMeta(ctx context.Context, sessionID string) (model.S
 	return meta, ok, nil
 }
 
+func stateFromRecordType(typ string, fallback model.SessionState) model.SessionState {
+	switch typ {
+	case "run_finished":
+		return model.StateCompleted
+	case "run_failed":
+		return model.StateFailed
+	default:
+		if fallback == "" {
+			return model.StateIdle
+		}
+		return fallback
+	}
+}
+
 func (m *MemoryStorage) ListSessions(ctx context.Context) ([]model.SessionMeta, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -124,8 +138,34 @@ func (m *MemoryStorage) ListSessions(ctx context.Context) ([]model.SessionMeta, 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	out := make([]model.SessionMeta, 0, len(m.metas))
-	for _, meta := range m.metas {
+	seen := make(map[string]model.SessionMeta, len(m.metas))
+	for id, meta := range m.metas {
+		if recs := m.records[id]; len(recs) > 0 {
+			lastRec := recs[len(recs)-1]
+			if lastRec.Offset > meta.LastOffset {
+				meta.LastOffset = lastRec.Offset
+				meta.UpdatedAt = lastRec.CreatedAt
+				meta.State = stateFromRecordType(lastRec.Type, model.StateIdle)
+			}
+		}
+		seen[id] = meta
+	}
+	for id, recs := range m.records {
+		if _, ok := seen[id]; !ok && len(recs) > 0 {
+			lastRec := recs[len(recs)-1]
+			seen[id] = model.SessionMeta{
+				SessionID:  id,
+				Epoch:      lastRec.Epoch,
+				State:      stateFromRecordType(lastRec.Type, model.StateIdle),
+				LastOffset: lastRec.Offset,
+				CreatedAt:  recs[0].CreatedAt,
+				UpdatedAt:  lastRec.CreatedAt,
+			}
+		}
+	}
+
+	out := make([]model.SessionMeta, 0, len(seen))
+	for _, meta := range seen {
 		out = append(out, meta)
 	}
 	sort.Slice(out, func(i, j int) bool {

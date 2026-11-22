@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/model"
@@ -89,22 +90,24 @@ type sessionActor struct {
 	mu                    sync.Mutex
 	meta                  model.SessionMeta
 	metaPersisted         bool
+	metaFlushTried        bool
 	lastOffset            uint64
 	inFlight              *inFlightState
 	lastCompactedStreamID string
 	lastCompactedSeq      uint64
 	lastCompactedOffset   uint64
 	subscribers           map[*subState]struct{}
-	lastActive            time.Time
-	pins                  int
-	evicted               bool
+	lastActiveNano        atomic.Int64
+	pins                  atomic.Int32
+}
+
+func (a *sessionActor) touch() {
+	a.lastActiveNano.Store(time.Now().UnixNano())
 }
 
 func (a *sessionActor) unpin() {
-	a.mu.Lock()
-	a.pins--
-	a.lastActive = time.Now()
-	a.mu.Unlock()
+	a.touch()
+	a.pins.Add(-1)
 }
 
 func (a *sessionActor) inFlightViewLocked() *model.InFlightView {
@@ -128,6 +131,15 @@ func (a *sessionActor) snapshotLocked() model.SessionSnapshot {
 	}
 }
 
+func (a *sessionActor) saveMetaBestEffortLocked(ctx context.Context, store storage.Storage) {
+	a.metaFlushTried = false
+	if err := store.SaveMeta(context.WithoutCancel(ctx), a.meta); err == nil {
+		a.metaPersisted = true
+	} else {
+		a.metaPersisted = false
+	}
+}
+
 func (a *sessionActor) fanOutLocked(ev model.OutEvent) {
 	for sub := range a.subscribers {
 		select {
@@ -145,7 +157,7 @@ type Broker struct {
 	store   storage.Storage
 	cfg     Config
 	epoch   string
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	closed  bool
 	doneCh  chan struct{}
 	actors  map[string]*sessionActor
@@ -196,16 +208,16 @@ func (b *Broker) Epoch() string {
 }
 
 func (b *Broker) isClosed() bool {
-	b.mu.Lock()
+	b.mu.RLock()
 	closed := b.closed
-	b.mu.Unlock()
+	b.mu.RUnlock()
 	return closed
 }
 
 // activeActorCount returns the number of in-memory session actors (used by tests).
 func (b *Broker) activeActorCount() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	return len(b.actors)
 }
 
@@ -225,39 +237,76 @@ func (b *Broker) sweepLoop() {
 }
 
 func (b *Broker) evictIdleActors(now time.Time) {
+	var toFlush []*sessionActor
+
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.closed {
+		b.mu.Unlock()
 		return
 	}
 
 	for id, actor := range b.actors {
-		actor.mu.Lock()
-		if actor.pins == 0 && len(actor.subscribers) == 0 && actor.inFlight == nil && now.Sub(actor.lastActive) > b.cfg.IdleSessionTTL {
-			actor.evicted = true
-			delete(b.actors, id)
+		if actor.pins.Load() > 0 {
+			continue
+		}
+		if !actor.mu.TryLock() {
+			continue
+		}
+		lastActive := time.Unix(0, actor.lastActiveNano.Load())
+		if actor.pins.Load() == 0 && len(actor.subscribers) == 0 && actor.inFlight == nil && now.Sub(lastActive) > b.cfg.IdleSessionTTL {
+			if !actor.metaPersisted && !actor.metaFlushTried {
+				actor.pins.Add(1)
+				toFlush = append(toFlush, actor)
+			} else {
+				delete(b.actors, id)
+			}
 		}
 		actor.mu.Unlock()
 	}
+	b.mu.Unlock()
+
+	for _, actor := range toFlush {
+		actor.mu.Lock()
+		if !actor.metaPersisted {
+			actor.metaFlushTried = true
+			if err := b.store.SaveMeta(context.Background(), actor.meta); err == nil {
+				actor.metaPersisted = true
+			}
+		}
+		actor.mu.Unlock()
+		actor.pins.Add(-1)
+	}
 }
 
-// acquireActor finds or hydrates a sessionActor and increments its pin count so
-// the background sweeper cannot evict it while an operation is in progress.
-func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMissing bool) (*sessionActor, bool, error) {
-	b.mu.Lock()
+func reconcileStateFromTail(recType string, current model.SessionState) model.SessionState {
+	switch recType {
+	case "run_finished":
+		return model.StateCompleted
+	case "run_failed":
+		return model.StateFailed
+	default:
+		if current == "" || current == model.StateRunning {
+			return model.StateIdle
+		}
+		return current
+	}
+}
+
+// acquireActor finds or hydrates a sessionActor and increments its atomic pin
+// count so the background sweeper cannot evict it while an operation runs.
+func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMissing bool, persistInitialMeta bool) (*sessionActor, bool, error) {
+	b.mu.RLock()
 	if b.closed {
-		b.mu.Unlock()
+		b.mu.RUnlock()
 		return nil, false, ErrBrokerClosed
 	}
 	if actor, ok := b.actors[sessionID]; ok {
-		actor.mu.Lock()
-		actor.pins++
-		actor.lastActive = time.Now()
-		actor.mu.Unlock()
-		b.mu.Unlock()
+		actor.pins.Add(1)
+		actor.touch()
+		b.mu.RUnlock()
 		return actor, true, nil
 	}
-	b.mu.Unlock()
+	b.mu.RUnlock()
 
 	// Load from storage outside b.mu so storage I/O never blocks other sessions.
 	meta, exists, err := b.store.LoadMeta(ctx, sessionID)
@@ -270,20 +319,22 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMis
 		startOffset = meta.LastOffset
 	}
 
-	// Catch up startOffset if storage has newer committed records than saved meta.
+	// Catch up startOffset and state if storage has newer committed records than saved meta.
 	tailRecs, err := b.store.ReadFrom(ctx, sessionID, startOffset)
 	if err != nil {
 		return nil, false, err
 	}
+	needsMetaHeal := false
 	if len(tailRecs) > 0 {
 		lastRec := tailRecs[len(tailRecs)-1]
 		startOffset = lastRec.Offset
+		needsMetaHeal = true
 		if !exists {
 			exists = true
 			meta = model.SessionMeta{
 				SessionID:  sessionID,
 				Epoch:      b.epoch,
-				State:      model.StateIdle,
+				State:      reconcileStateFromTail(lastRec.Type, model.StateIdle),
 				LastOffset: startOffset,
 				CreatedAt:  tailRecs[0].CreatedAt,
 				UpdatedAt:  lastRec.CreatedAt,
@@ -291,6 +342,7 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMis
 		} else {
 			meta.LastOffset = startOffset
 			meta.UpdatedAt = lastRec.CreatedAt
+			meta.State = reconcileStateFromTail(lastRec.Type, model.StateIdle)
 		}
 	}
 
@@ -299,9 +351,9 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMis
 	}
 
 	now := time.Now().UTC()
-	var persisted bool
+	persisted := false
 	if exists {
-		persisted = true
+		persisted = !needsMetaHeal
 		meta.Epoch = b.epoch
 		if meta.State == model.StateRunning {
 			// Cold reload has no in-memory stream; normalize state to idle.
@@ -323,9 +375,9 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMis
 		metaPersisted: persisted,
 		lastOffset:    meta.LastOffset,
 		subscribers:   make(map[*subState]struct{}),
-		lastActive:    time.Now(),
-		pins:          1,
 	}
+	candidate.pins.Store(1)
+	candidate.touch()
 
 	b.mu.Lock()
 	if b.closed {
@@ -333,25 +385,20 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMis
 		return nil, false, ErrBrokerClosed
 	}
 	if existing, ok := b.actors[sessionID]; ok {
-		existing.mu.Lock()
-		existing.pins++
-		existing.lastActive = time.Now()
-		existing.mu.Unlock()
+		existing.pins.Add(1)
+		existing.touch()
 		b.mu.Unlock()
 		return existing, true, nil
 	}
 	b.actors[sessionID] = candidate
 	b.mu.Unlock()
 
-	if !persisted {
+	if (persistInitialMeta && !persisted) || needsMetaHeal {
 		candidate.mu.Lock()
 		if !candidate.metaPersisted {
-			if err := b.store.SaveMeta(ctx, candidate.meta); err != nil {
-				candidate.mu.Unlock()
-				candidate.unpin()
-				return nil, false, err
+			if err := b.store.SaveMeta(context.WithoutCancel(ctx), candidate.meta); err == nil {
+				candidate.metaPersisted = true
 			}
-			candidate.metaPersisted = true
 		}
 		candidate.mu.Unlock()
 	}
@@ -370,7 +417,7 @@ func (b *Broker) CreateSession(ctx context.Context, sessionID string) (model.Ses
 		sessionID = "sess_" + randomHex(6)
 	}
 
-	actor, _, err := b.acquireActor(ctx, sessionID, true)
+	actor, _, err := b.acquireActor(ctx, sessionID, true, false)
 	if err != nil {
 		return model.SessionMeta{}, err
 	}
@@ -398,7 +445,7 @@ func marshalContentPayload(content string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(raw), nil
+	return raw, nil
 }
 
 func cloneRawMessage(raw json.RawMessage) json.RawMessage {
@@ -421,7 +468,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		return model.PublishResult{}, ErrInvalidInput
 	}
 
-	// Pre-validate atomic event inputs before acquiring actor.
+	// Pre-validate payload inputs before acquiring actor.
 	hasPayload := len(bytes.TrimSpace(req.Payload)) > 0
 	if req.StreamID == "" {
 		if hasPayload {
@@ -437,7 +484,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		}
 	}
 
-	actor, _, err := b.acquireActor(ctx, sessionID, true)
+	actor, _, err := b.acquireActor(ctx, sessionID, true, false)
 	if err != nil {
 		return model.PublishResult{}, err
 	}
@@ -451,9 +498,12 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		return model.PublishResult{}, ErrBrokerClosed
 	default:
 	}
+	if err := ctx.Err(); err != nil {
+		return model.PublishResult{}, err
+	}
 
 	now := time.Now().UTC()
-	actor.lastActive = time.Now()
+	actor.touch()
 
 	// Path 1: Atomic committed event (no StreamID).
 	if req.StreamID == "" {
@@ -479,6 +529,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 			return model.PublishResult{}, err
 		}
 
+		// Point of no return: record is committed in storage. Advance memory state and fan out first.
 		actor.lastOffset = nextOffset
 		actor.meta.Epoch = b.epoch
 		actor.meta.LastOffset = nextOffset
@@ -495,10 +546,6 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 				actor.meta.State = model.StateIdle
 			}
 		}
-		if err := b.store.SaveMeta(ctx, actor.meta); err != nil {
-			return model.PublishResult{}, err
-		}
-		actor.metaPersisted = true
 
 		actor.fanOutLocked(model.OutEvent{
 			Kind:      model.EventCommitted,
@@ -509,6 +556,8 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 			CreatedAt: rec.CreatedAt,
 		})
 
+		actor.saveMetaBestEffortLocked(ctx, b.store)
+
 		return model.PublishResult{
 			CommittedOffset: rec.Offset,
 			Epoch:           b.epoch,
@@ -516,6 +565,14 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 	}
 
 	// Path 2: Streaming delta (req.StreamID != "").
+	// Validate sequence & conflict and compute candidate values in local variables
+	// BEFORE mutating actor or actor.inFlight state.
+	var (
+		seq        uint64
+		baseType   string
+		baseMerged string
+	)
+
 	if actor.inFlight == nil {
 		// Check if this is a late duplicate retry of the just-compacted stream.
 		if actor.lastCompactedStreamID != "" && req.StreamID == actor.lastCompactedStreamID {
@@ -528,15 +585,11 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 				}, nil
 			}
 		}
-
 		if req.Seq > 1 {
 			return model.PublishResult{}, ErrSequenceGap
 		}
-		actor.inFlight = &inFlightState{
-			streamID:  req.StreamID,
-			typ:       req.Type,
-			startedAt: now,
-		}
+		seq = 1
+		baseType = req.Type
 	} else {
 		if actor.inFlight.streamID != req.StreamID {
 			return model.PublishResult{}, ErrStreamConflict
@@ -552,37 +605,41 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 			if req.Seq > actor.inFlight.lastSeq+1 {
 				return model.PublishResult{}, ErrSequenceGap
 			}
+			seq = req.Seq
+		} else {
+			seq = actor.inFlight.lastSeq + 1
 		}
-		if actor.inFlight.typ == "" && req.Type != "" {
-			actor.inFlight.typ = req.Type
+		baseType = actor.inFlight.typ
+		if baseType == "" && req.Type != "" {
+			baseType = req.Type
+		}
+		if req.Fin {
+			baseMerged = actor.inFlight.mergedBuf.String()
 		}
 	}
-
-	seq := req.Seq
-	if seq == 0 {
-		seq = actor.inFlight.lastSeq + 1
-	}
-
-	actor.inFlight.mergedBuf.WriteString(req.Delta)
-	actor.inFlight.lastSeq = seq
 
 	evType := req.Type
 	if evType == "" {
-		evType = actor.inFlight.typ
+		evType = baseType
 	}
 
 	if !req.Fin {
-		if actor.meta.State != model.StateRunning {
-			actor.meta.State = model.StateRunning
-			actor.meta.Epoch = b.epoch
-			actor.meta.UpdatedAt = now
-			if err := b.store.SaveMeta(ctx, actor.meta); err != nil {
-				return model.PublishResult{}, err
+		if actor.inFlight == nil {
+			actor.inFlight = &inFlightState{
+				streamID:  req.StreamID,
+				typ:       baseType,
+				startedAt: now,
 			}
-			actor.metaPersisted = true
 		} else {
-			actor.meta.UpdatedAt = now
+			actor.inFlight.typ = baseType
 		}
+		_, _ = actor.inFlight.mergedBuf.WriteString(req.Delta)
+		actor.inFlight.lastSeq = seq
+
+		needMetaSave := !actor.metaPersisted || actor.meta.State != model.StateRunning
+		actor.meta.State = model.StateRunning
+		actor.meta.Epoch = b.epoch
+		actor.meta.UpdatedAt = now
 
 		actor.fanOutLocked(model.OutEvent{
 			Kind:      model.EventDelta,
@@ -595,15 +652,19 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 			CreatedAt: now,
 		})
 
+		if needMetaSave {
+			actor.saveMetaBestEffortLocked(ctx, b.store)
+		}
+
 		return model.PublishResult{
 			Epoch:       b.epoch,
 			InFlightSeq: seq,
 		}, nil
 	}
 
-	// Fin == true: emit final delta, compact entire stream into 1 single Record, and emit EventCommitted.
-	mergedText := actor.inFlight.mergedBuf.String()
-	recordType := actor.inFlight.typ
+	// Fin == true: build compacted Record in local variables and persist BEFORE mutating actor state.
+	mergedText := baseMerged + req.Delta
+	recordType := baseType
 	if recordType == "" {
 		recordType = req.Type
 	}
@@ -631,6 +692,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		return model.PublishResult{}, err
 	}
 
+	// Point of no return: compacted record is committed in storage.
 	nextState := model.StateIdle
 	if req.Type == "run_finished" || recordType == "run_finished" {
 		nextState = model.StateCompleted
@@ -647,11 +709,6 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 	actor.meta.State = nextState
 	actor.meta.LastOffset = nextOffset
 	actor.meta.UpdatedAt = now
-
-	if err := b.store.SaveMeta(ctx, actor.meta); err != nil {
-		return model.PublishResult{}, err
-	}
-	actor.metaPersisted = true
 
 	actor.fanOutLocked(model.OutEvent{
 		Kind:      model.EventDelta,
@@ -673,6 +730,8 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		Payload:   rec.Payload,
 		CreatedAt: rec.CreatedAt,
 	})
+
+	actor.saveMetaBestEffortLocked(ctx, b.store)
 
 	return model.PublishResult{
 		CommittedOffset: rec.Offset,
@@ -696,7 +755,7 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset ui
 		afterOffset = 0
 	}
 
-	actor, _, err := b.acquireActor(ctx, sessionID, true)
+	actor, _, err := b.acquireActor(ctx, sessionID, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -724,18 +783,15 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset ui
 		return nil, ErrBrokerClosed
 	default:
 	}
-	if !actor.metaPersisted {
-		if err := b.store.SaveMeta(ctx, actor.meta); err != nil {
-			actor.mu.Unlock()
-			b.subWg.Done()
-			return nil, err
-		}
-		actor.metaPersisted = true
+	if err := ctx.Err(); err != nil {
+		actor.mu.Unlock()
+		b.subWg.Done()
+		return nil, err
 	}
 	actor.subscribers[sub] = struct{}{}
 	snapOffset := actor.lastOffset
 	inFlightSnap := actor.inFlightViewLocked()
-	actor.lastActive = time.Now()
+	actor.touch()
 	actor.mu.Unlock()
 
 	outCh := make(chan model.OutEvent)
@@ -767,7 +823,7 @@ func (b *Broker) runSubscriberPump(
 			delete(actor.subscribers, sub)
 			close(sub.liveCh)
 		}
-		actor.lastActive = time.Now()
+		actor.touch()
 		actor.mu.Unlock()
 	}()
 
@@ -907,7 +963,7 @@ func (b *Broker) Inspect(ctx context.Context, sessionID string) (model.SessionSn
 		return model.SessionSnapshot{}, false, nil
 	}
 
-	actor, exists, err := b.acquireActor(ctx, sessionID, false)
+	actor, exists, err := b.acquireActor(ctx, sessionID, false, false)
 	if err != nil {
 		return model.SessionSnapshot{}, false, err
 	}
@@ -917,9 +973,19 @@ func (b *Broker) Inspect(ctx context.Context, sessionID string) (model.SessionSn
 	defer actor.unpin()
 
 	actor.mu.Lock()
+	if !actor.metaPersisted {
+		if err := b.store.SaveMeta(context.WithoutCancel(ctx), actor.meta); err == nil {
+			actor.metaPersisted = true
+		}
+	}
 	snap := actor.snapshotLocked()
 	actor.mu.Unlock()
 	return snap, true, nil
+}
+
+type namedActor struct {
+	id    string
+	actor *sessionActor
 }
 
 func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, error) {
@@ -948,17 +1014,22 @@ func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, err
 		}
 	}
 
-	b.mu.Lock()
+	b.mu.RLock()
 	if b.closed {
-		b.mu.Unlock()
+		b.mu.RUnlock()
 		return nil, ErrBrokerClosed
 	}
+	active := make([]namedActor, 0, len(b.actors))
 	for id, actor := range b.actors {
-		actor.mu.Lock()
-		byID[id] = actor.snapshotLocked()
-		actor.mu.Unlock()
+		active = append(active, namedActor{id: id, actor: actor})
 	}
-	b.mu.Unlock()
+	b.mu.RUnlock()
+
+	for _, item := range active {
+		item.actor.mu.Lock()
+		byID[item.id] = item.actor.snapshotLocked()
+		item.actor.mu.Unlock()
+	}
 
 	out := make([]model.SessionSnapshot, 0, len(byID))
 	for _, snap := range byID {
@@ -975,22 +1046,24 @@ func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, err
 
 func (b *Broker) Close() error {
 	b.mu.Lock()
+	var oldActors map[string]*sessionActor
 	if !b.closed {
 		b.closed = true
 		close(b.doneCh)
-		for _, actor := range b.actors {
-			actor.mu.Lock()
-			for sub := range actor.subscribers {
-				delete(actor.subscribers, sub)
-				sub.setErr(ErrBrokerClosed)
-				close(sub.liveCh)
-			}
-			actor.evicted = true
-			actor.mu.Unlock()
-		}
+		oldActors = b.actors
 		b.actors = make(map[string]*sessionActor)
 	}
 	b.mu.Unlock()
+
+	for _, actor := range oldActors {
+		actor.mu.Lock()
+		for sub := range actor.subscribers {
+			delete(actor.subscribers, sub)
+			sub.setErr(ErrBrokerClosed)
+			close(sub.liveCh)
+		}
+		actor.mu.Unlock()
+	}
 
 	b.sweepWg.Wait()
 	b.subWg.Wait()

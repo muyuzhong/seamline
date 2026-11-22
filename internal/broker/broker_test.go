@@ -9,12 +9,22 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/model"
 	"github.com/muyuzhong/seamline/internal/storage"
 )
+
+func closeBroker(t *testing.T, b *Broker) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := b.Close(); err != nil {
+			t.Errorf("Broker.Close failed: %v", err)
+		}
+	})
+}
 
 func decodeContent(t *testing.T, raw json.RawMessage) string {
 	t.Helper()
@@ -31,7 +41,7 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 	ctx := context.Background()
 	store := storage.NewMemoryStorage()
 	b := New(store, Config{})
-	defer b.Close()
+	closeBroker(t, b)
 
 	if len(b.Epoch()) != 12 {
 		t.Fatalf("expected 12-char random hex epoch, got %q", b.Epoch())
@@ -42,7 +52,7 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 
 	for i := 1; i <= totalChunks; i++ {
 		tok := fmt.Sprintf("[tok-%03d]", i)
-		wantBuilder.WriteString(tok)
+		_, _ = wantBuilder.WriteString(tok)
 		fin := i == totalChunks
 		typ := "assistant_delta"
 		if fin {
@@ -158,14 +168,14 @@ func (c *clientState) apply(t *testing.T, ev model.OutEvent) {
 	case model.EventInFlightSnapshot:
 		c.inFlightID = ev.StreamID
 		c.inFlightBuf.Reset()
-		c.inFlightBuf.WriteString(ev.Delta)
+		_, _ = c.inFlightBuf.WriteString(ev.Delta)
 	case model.EventDelta:
 		if c.inFlightID != "" && c.inFlightID != ev.StreamID {
 			t.Errorf("delta stream mismatch: active=%s got=%s", c.inFlightID, ev.StreamID)
 			return
 		}
 		c.inFlightID = ev.StreamID
-		c.inFlightBuf.WriteString(ev.Delta)
+		_, _ = c.inFlightBuf.WriteString(ev.Delta)
 	default:
 		t.Errorf("unknown EventKind: %q", ev.Kind)
 	}
@@ -184,7 +194,7 @@ func Test50ConcurrentSubscribersZeroGapZeroDuplicate(t *testing.T) {
 	b := New(store, Config{
 		SubscriberBufferSize: 1024,
 	})
-	defer b.Close()
+	closeBroker(t, b)
 
 	const sessionID = "concurrent-50"
 	const numSubscribers = 50
@@ -192,8 +202,8 @@ func Test50ConcurrentSubscribersZeroGapZeroDuplicate(t *testing.T) {
 
 	var wantStream1, wantStream2 strings.Builder
 	for i := 1; i <= chunksPerStream; i++ {
-		wantStream1.WriteString(fmt.Sprintf("A%03d-", i))
-		wantStream2.WriteString(fmt.Sprintf("B%03d-", i))
+		_, _ = wantStream1.WriteString(fmt.Sprintf("A%03d-", i))
+		_, _ = wantStream2.WriteString(fmt.Sprintf("B%03d-", i))
 	}
 
 	wantOffsets := map[uint64]string{
@@ -395,7 +405,7 @@ func Test50ConcurrentSubscribersZeroGapZeroDuplicate(t *testing.T) {
 func TestIdempotentSeqRetryAndValidationErrors(t *testing.T) {
 	ctx := context.Background()
 	b := New(storage.NewMemoryStorage(), Config{})
-	defer b.Close()
+	closeBroker(t, b)
 
 	// Empty sessionID rejected.
 	if _, err := b.Publish(ctx, "", model.PublishRequest{Delta: "hi"}); !errors.Is(err, ErrInvalidInput) {
@@ -514,7 +524,7 @@ func TestEpochMismatchResetsAfterOffset(t *testing.T) {
 	ctx := context.Background()
 	store := storage.NewMemoryStorage()
 	b := New(store, Config{Epoch: "epoch-curr12"})
-	defer b.Close()
+	closeBroker(t, b)
 
 	for i := 1; i <= 3; i++ {
 		if _, err := b.Publish(ctx, "sess-ep", model.PublishRequest{
@@ -561,7 +571,7 @@ func TestSlowSubscriberEviction(t *testing.T) {
 	b := New(storage.NewMemoryStorage(), Config{
 		SubscriberBufferSize: 4,
 	})
-	defer b.Close()
+	closeBroker(t, b)
 
 	// Slow subscriber: never reads from Events while producer bursts.
 	slowSub, err := b.Subscribe(ctx, "sess-slow", 0, "")
@@ -582,7 +592,7 @@ func TestSlowSubscriberEviction(t *testing.T) {
 	go func() {
 		for ev := range fastSub.Events {
 			if ev.Kind == model.EventDelta {
-				fastText.WriteString(ev.Delta)
+				_, _ = fastText.WriteString(ev.Delta)
 			} else if ev.Kind == model.EventCommitted {
 				fastDone <- ev.Offset
 				return
@@ -594,7 +604,7 @@ func TestSlowSubscriberEviction(t *testing.T) {
 	var want strings.Builder
 	for i := 1; i <= burst; i++ {
 		tok := fmt.Sprintf("c%d.", i)
-		want.WriteString(tok)
+		_, _ = want.WriteString(tok)
 		if _, err := b.Publish(ctx, "sess-slow", model.PublishRequest{
 			StreamID: "burst-1",
 			Seq:      uint64(i),
@@ -643,7 +653,7 @@ func TestIdleSessionEvictionAndTransparentReload(t *testing.T) {
 		IdleSessionTTL: 25 * time.Millisecond,
 		SweepInterval:  8 * time.Millisecond,
 	})
-	defer b.Close()
+	closeBroker(t, b)
 
 	// Create session A (will go idle) and session B (kept alive by an in-flight stream).
 	if _, err := b.Publish(ctx, "idle-sess", model.PublishRequest{Type: "user", Delta: "first"}); err != nil {
@@ -802,5 +812,426 @@ func TestCreateSessionInspectAndNoGoroutineLeaksOnClose(t *testing.T) {
 	afterGoroutines := runtime.NumGoroutine()
 	if afterGoroutines > baseGoroutines+2 {
 		t.Fatalf("potential goroutine leak: before=%d after=%d", baseGoroutines, afterGoroutines)
+	}
+}
+
+var errInjectedStorage = errors.New("injected storage failure")
+
+type flakyStore struct {
+	*storage.MemoryStorage
+	failNextAppend     atomic.Bool
+	failNextSaveMeta   atomic.Bool
+	alwaysFailSaveMeta atomic.Bool
+
+	slowSessionID string
+	enteredAppend chan struct{}
+	releaseAppend chan struct{}
+}
+
+func (f *flakyStore) Append(ctx context.Context, id string, r model.Record) error {
+	if f.slowSessionID != "" && id == f.slowSessionID {
+		select {
+		case f.enteredAppend <- struct{}{}:
+		default:
+		}
+		<-f.releaseAppend
+	}
+	if f.failNextAppend.CompareAndSwap(true, false) {
+		return errInjectedStorage
+	}
+	return f.MemoryStorage.Append(ctx, id, r)
+}
+
+func (f *flakyStore) SaveMeta(ctx context.Context, m model.SessionMeta) error {
+	if f.alwaysFailSaveMeta.Load() {
+		return errInjectedStorage
+	}
+	if f.failNextSaveMeta.CompareAndSwap(true, false) {
+		return errInjectedStorage
+	}
+	return f.MemoryStorage.SaveMeta(ctx, m)
+}
+
+func TestFinAppendFailureThenRetryCommits(t *testing.T) {
+	ctx := context.Background()
+	st := &flakyStore{MemoryStorage: storage.NewMemoryStorage()}
+	b := New(st, Config{})
+	closeBroker(t, b)
+
+	// Case 1: Explicit same-Seq retry after Fin Append failure.
+	if _, err := b.Publish(ctx, "s", model.PublishRequest{
+		StreamID: "m1",
+		Seq:      1,
+		Type:     "assistant",
+		Delta:    "Hel",
+	}); err != nil {
+		t.Fatalf("Seq 1: %v", err)
+	}
+
+	st.failNextAppend.Store(true)
+	if _, err := b.Publish(ctx, "s", model.PublishRequest{
+		StreamID: "m1",
+		Seq:      2,
+		Type:     "assistant",
+		Delta:    "lo",
+		Fin:      true,
+	}); !errors.Is(err, errInjectedStorage) {
+		t.Fatalf("expected errInjectedStorage on Fin Append, got %v", err)
+	}
+
+	// Verify inFlight was NOT mutated by the failed Fin attempt.
+	snap, ok, err := b.Inspect(ctx, "s")
+	if err != nil || !ok || snap.InFlight == nil {
+		t.Fatalf("expected InFlight still active after failed Fin, got snap=%+v ok=%v err=%v", snap, ok, err)
+	}
+	if snap.InFlight.LastSeq != 1 || snap.InFlight.Merged != "Hel" {
+		t.Fatalf("expected InFlight untouched (LastSeq=1, Merged='Hel'), got %+v", snap.InFlight)
+	}
+
+	// Retry with same Seq=2 must commit Offset=1 with "Hello" (NOT Deduplicated: true!).
+	res, err := b.Publish(ctx, "s", model.PublishRequest{
+		StreamID: "m1",
+		Seq:      2,
+		Type:     "assistant",
+		Delta:    "lo",
+		Fin:      true,
+	})
+	if err != nil || res.CommittedOffset != 1 || res.Deduplicated {
+		t.Fatalf("fin retry must commit Offset=1, got res=%+v err=%v", res, err)
+	}
+
+	// Case 2: Seq=0 retry after Fin Append failure must NOT duplicate delta ("Hello", not "Hellolo")!
+	if _, err := b.Publish(ctx, "s", model.PublishRequest{
+		StreamID: "m2",
+		Seq:      1,
+		Type:     "assistant",
+		Delta:    "Hel",
+	}); err != nil {
+		t.Fatalf("m2 Seq 1: %v", err)
+	}
+	st.failNextAppend.Store(true)
+	if _, err := b.Publish(ctx, "s", model.PublishRequest{
+		StreamID: "m2",
+		Seq:      0,
+		Type:     "assistant",
+		Delta:    "lo",
+		Fin:      true,
+	}); !errors.Is(err, errInjectedStorage) {
+		t.Fatalf("expected errInjectedStorage on m2 Fin, got %v", err)
+	}
+	res2, err := b.Publish(ctx, "s", model.PublishRequest{
+		StreamID: "m2",
+		Seq:      0,
+		Type:     "assistant",
+		Delta:    "lo",
+		Fin:      true,
+	})
+	if err != nil || res2.CommittedOffset != 2 || res2.InFlightSeq != 2 {
+		t.Fatalf("m2 Seq=0 retry must commit Offset=2 Seq=2, got res=%+v err=%v", res2, err)
+	}
+
+	recs, err := st.ReadFrom(ctx, "s", 0)
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("expected 2 committed records, got len=%d err=%v", len(recs), err)
+	}
+	if got1 := decodeContent(t, recs[0].Payload); got1 != "Hello" {
+		t.Fatalf("record 1 content=%q, want 'Hello'", got1)
+	}
+	if got2 := decodeContent(t, recs[1].Payload); got2 != "Hello" {
+		t.Fatalf("record 2 content=%q, want 'Hello'", got2)
+	}
+}
+
+func TestFirstChunkFailureLeavesNoOrphanInFlight(t *testing.T) {
+	ctx := context.Background()
+	st := &flakyStore{MemoryStorage: storage.NewMemoryStorage()}
+	b := New(st, Config{})
+	closeBroker(t, b)
+
+	// 1. Single-chunk stream (Seq=1, Fin=true) failing Append must NOT leave an empty inFlight placeholder!
+	st.failNextAppend.Store(true)
+	if _, err := b.Publish(ctx, "s-first", model.PublishRequest{
+		StreamID: "orphan-candidate",
+		Seq:      1,
+		Type:     "assistant",
+		Delta:    "one-shot",
+		Fin:      true,
+	}); !errors.Is(err, errInjectedStorage) {
+		t.Fatalf("expected errInjectedStorage, got %v", err)
+	}
+
+	snap, ok, err := b.Inspect(ctx, "s-first")
+	if err != nil || !ok {
+		t.Fatalf("Inspect failed: ok=%v err=%v", ok, err)
+	}
+	if snap.InFlight != nil {
+		t.Fatalf("expected nil InFlight after failed first chunk, got %+v", snap.InFlight)
+	}
+
+	// 2. Non-Fin first chunk with canceled ctx must also leave InFlight == nil.
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := b.Publish(canceledCtx, "s-first", model.PublishRequest{
+		StreamID: "canceled-stream",
+		Seq:      1,
+		Type:     "assistant",
+		Delta:    "aborted",
+		Fin:      false,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// 3. Subsequent stream with a brand-new StreamID must succeed without ErrStreamConflict,
+	// even if SaveMeta fails on StateRunning transition!
+	sub, err := b.Subscribe(ctx, "s-first", 0, "")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Cancel()
+
+	st.failNextSaveMeta.Store(true)
+	if _, err := b.Publish(ctx, "s-first", model.PublishRequest{
+		StreamID: "clean-stream",
+		Seq:      1,
+		Type:     "assistant",
+		Delta:    "works",
+		Fin:      false,
+	}); err != nil {
+		t.Fatalf("expected non-Fin first chunk to succeed despite SaveMeta failure, got %v", err)
+	}
+
+	select {
+	case ev := <-sub.Events:
+		if ev.Kind != model.EventDelta || ev.Delta != "works" {
+			t.Fatalf("expected live EventDelta 'works', got %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for live EventDelta")
+	}
+}
+
+func TestSaveMetaFailureAfterAppendPreservesCommitAndFanOut(t *testing.T) {
+	ctx := context.Background()
+	st := &flakyStore{MemoryStorage: storage.NewMemoryStorage()}
+	b := New(st, Config{
+		IdleSessionTTL: 20 * time.Millisecond,
+		SweepInterval:  6 * time.Millisecond,
+	})
+	closeBroker(t, b)
+
+	sub, err := b.Subscribe(ctx, "s-meta", 0, "")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Subcase A: Atomic event where SaveMeta fails after Append succeeded.
+	st.failNextSaveMeta.Store(true)
+	atomicRes, err := b.Publish(ctx, "s-meta", model.PublishRequest{
+		Type:  "user",
+		Delta: "hello atomic",
+	})
+	if err != nil || atomicRes.CommittedOffset != 1 {
+		t.Fatalf("atomic Publish must succeed after Append despite SaveMeta error: res=%+v err=%v", atomicRes, err)
+	}
+
+	select {
+	case ev := <-sub.Events:
+		if ev.Kind != model.EventCommitted || ev.Offset != 1 || decodeContent(t, ev.Payload) != "hello atomic" {
+			t.Fatalf("expected live EventCommitted offset=1, got %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for atomic EventCommitted")
+	}
+
+	// Subcase B: Streaming Fin where SaveMeta fails permanently (even across sweeper flush) ->
+	// live subscriber still receives delta + record, retry is deduplicated, and cold reload recovers meta from ReadFrom!
+	if _, err := b.Publish(ctx, "s-meta", model.PublishRequest{
+		StreamID: "m-fin",
+		Seq:      1,
+		Type:     "assistant",
+		Delta:    "Hel",
+	}); err != nil {
+		t.Fatalf("Seq 1: %v", err)
+	}
+
+	st.alwaysFailSaveMeta.Store(true)
+	finRes, err := b.Publish(ctx, "s-meta", model.PublishRequest{
+		StreamID: "m-fin",
+		Seq:      2,
+		Type:     "run_finished",
+		Delta:    "lo",
+		Fin:      true,
+	})
+	if err != nil || finRes.CommittedOffset != 2 {
+		t.Fatalf("Fin Publish must succeed after Append despite SaveMeta error: res=%+v err=%v", finRes, err)
+	}
+
+	// Late retry of Seq=2 returns Deduplicated: true without creating a 3rd record.
+	dupRes, err := b.Publish(ctx, "s-meta", model.PublishRequest{
+		StreamID: "m-fin",
+		Seq:      2,
+		Type:     "run_finished",
+		Delta:    "lo",
+		Fin:      true,
+	})
+	if err != nil || !dupRes.Deduplicated || dupRes.CommittedOffset != 2 {
+		t.Fatalf("expected deduplicated retry at Offset=2, got res=%+v err=%v", dupRes, err)
+	}
+
+	// Live subscriber must receive Seq 1 delta, Seq 2 Fin delta, AND Offset 2 committed record!
+	var sawFinDelta, sawRecord2 bool
+	for !sawRecord2 {
+		select {
+		case ev := <-sub.Events:
+			if ev.Kind == model.EventDelta && ev.Seq == 2 && ev.Fin {
+				sawFinDelta = true
+			}
+			if ev.Kind == model.EventCommitted && ev.Offset == 2 {
+				if decodeContent(t, ev.Payload) != "Hello" {
+					t.Fatalf("unexpected Offset 2 payload: %s", string(ev.Payload))
+				}
+				sawRecord2 = true
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for Fin events (sawFinDelta=%v sawRecord2=%v)", sawFinDelta, sawRecord2)
+		}
+	}
+	if !sawFinDelta {
+		t.Fatalf("expected live subscriber to receive Fin delta before committed record")
+	}
+
+	// Disconnect subscriber so "s-meta" becomes idle and gets evicted from memory.
+	sub.Cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.activeActorCount() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := b.activeActorCount(); got != 0 {
+		t.Fatalf("expected actor eviction even when SaveMeta fails, active=%d", got)
+	}
+
+	st.alwaysFailSaveMeta.Store(false)
+
+	// ListSessions and Inspect must recover accurate LastOffset=2 from stored records!
+	list, err := b.ListSessions(ctx)
+	if err != nil || len(list) != 1 || list[0].Meta.LastOffset != 2 {
+		t.Fatalf("expected ListSessions LastOffset=2 after eviction, got list=%+v err=%v", list, err)
+	}
+
+	snap, ok, err := b.Inspect(ctx, "s-meta")
+	if err != nil || !ok || snap.Meta.LastOffset != 2 {
+		t.Fatalf("expected Inspect LastOffset=2 after cold reload, got snap=%+v ok=%v err=%v", snap, ok, err)
+	}
+}
+
+func TestSlowStorageOnSessionADoesNotBlockOtherSessions(t *testing.T) {
+	ctx := context.Background()
+	st := &flakyStore{
+		MemoryStorage: storage.NewMemoryStorage(),
+		slowSessionID: "slow-A",
+		enteredAppend: make(chan struct{}, 1),
+		releaseAppend: make(chan struct{}),
+	}
+	b := New(st, Config{
+		IdleSessionTTL: 15 * time.Millisecond,
+		SweepInterval:  5 * time.Millisecond,
+	})
+	closeBroker(t, b)
+
+	// Create an idle session C first so we can verify sweeper evicts C while A is blocked!
+	if _, err := b.Publish(ctx, "idle-C", model.PublishRequest{Type: "user", Delta: "c"}); err != nil {
+		t.Fatalf("Publish idle-C: %v", err)
+	}
+
+	// Start slow Publish on session A (blocks inside store.Append while holding actorA.mu).
+	slowDone := make(chan error, 1)
+	go func() {
+		_, err := b.Publish(ctx, "slow-A", model.PublishRequest{Type: "user", Delta: "slow write"})
+		slowDone <- err
+	}()
+
+	select {
+	case <-st.enteredAppend:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("slow-A did not enter Append")
+	}
+
+	// Also queue a concurrent Inspect("slow-A") and ListSessions(ctx) — both wait on actorA.mu,
+	// proving neither acquireActor nor ListSessions holds global b.mu while waiting on actorA.mu!
+	inspectADone := make(chan struct{})
+	go func() {
+		_, _, _ = b.Inspect(ctx, "slow-A")
+		close(inspectADone)
+	}()
+	listDone := make(chan error, 1)
+	go func() {
+		_, err := b.ListSessions(ctx)
+		listDone <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// Session B Publish + Subscribe + Inspect must complete rapidly without blocking on Session A!
+	fastFinished := make(chan error, 1)
+	go func() {
+		if _, err := b.Publish(ctx, "fast-B", model.PublishRequest{Type: "user", Delta: "fast write"}); err != nil {
+			fastFinished <- err
+			return
+		}
+		sub, err := b.Subscribe(ctx, "fast-B", 0, "")
+		if err != nil {
+			fastFinished <- err
+			return
+		}
+		ev := <-sub.Events
+		sub.Cancel()
+		if ev.Offset != 1 {
+			fastFinished <- fmt.Errorf("unexpected fast-B offset %d", ev.Offset)
+			return
+		}
+		if _, ok, err := b.Inspect(ctx, "fast-B"); err != nil || !ok {
+			fastFinished <- fmt.Errorf("Inspect fast-B ok=%v err=%v", ok, err)
+			return
+		}
+		fastFinished <- nil
+	}()
+
+	select {
+	case err := <-fastFinished:
+		if err != nil {
+			close(st.releaseAppend)
+			t.Fatalf("fast-B failed while slow-A blocked: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(st.releaseAppend)
+		t.Fatalf("fast-B was blocked by slow-A storage I/O!")
+	}
+
+	// Also verify sweeper did NOT block on slow-A and was able to evict idle-C + fast-B!
+	evictedWhileABlocked := false
+	evictDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(evictDeadline) {
+		if b.activeActorCount() == 1 { // only slow-A remains!
+			evictedWhileABlocked = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !evictedWhileABlocked {
+		close(st.releaseAppend)
+		t.Fatalf("expected sweeper to evict idle-C and fast-B while slow-A was blocked; active=%d", b.activeActorCount())
+	}
+
+	// Release slow-A and verify clean completion of slow-A, Inspect("slow-A"), and ListSessions.
+	close(st.releaseAppend)
+
+	if err := <-slowDone; err != nil {
+		t.Fatalf("slow-A Publish failed: %v", err)
+	}
+	<-inspectADone
+	if err := <-listDone; err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
 	}
 }
