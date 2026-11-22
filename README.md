@@ -93,6 +93,7 @@ Requirements: **Go 1.23+** (100% Go standard library, zero external dependencies
 ### 1. Start the Seamline Server & Live F5 Playground
 
 ```bash
+# Run directly with Go (or via Makefile: make run-demo)
 go run ./cmd/seamline --addr :8080 --demo=true
 ```
 
@@ -165,10 +166,22 @@ curl -N -H 'Last-Event-ID: <epoch>:1' \
 ## Testing / 测试验证
 
 ```bash
+# Run full formatting, vet, and race-detector suite
+make check
+
+# Or directly with the Go toolchain:
 gofmt -l .
 go vet ./...
 go test -race -v ./...
 ```
+
+---
+
+## Documentation & Governance / 工程文档与规范
+
+- [Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the dual-speed state machine, storage failure consistency model, lock hierarchy, and catch-up handoff proof sketch.
+- [Contributing Guide (`CONTRIBUTING.md`)](CONTRIBUTING.md) — Development workflow, stacked PR conventions, linter & race-test gates.
+- [Agent & Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Hard invariants and verification rules for contributors and coding agents.
 
 ---
 

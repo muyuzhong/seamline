@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability Report / 私密报告安全漏洞
+    url: https://github.com/muyuzhong/seamline/security/advisories/new
+    about: Privately report security vulnerabilities without creating a public issue.
+  - name: Architecture & Wire Protocol Spec / 架构与协议规范
+    url: https://github.com/muyuzhong/seamline/blob/main/docs/ARCHITECTURE.md
+    about: Read Seamline's Dual-Speed Engine, consistency invariants, and SSE protocol docs before filing.
