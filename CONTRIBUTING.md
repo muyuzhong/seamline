@@ -29,7 +29,8 @@ Please review:
 make help        # List all available workflow targets
 make fmt         # Format Go files with gofmt
 make check       # Run mandatory pre-PR gate: fmt-check + vet + test-race (-count=2)
-make lint        # Run golangci-lint with .golangci.yml
+make lint        # Run golangci-lint with .golangci.yml (enforces gocognit <= 15)
+make complexity  # Run cognitive complexity check (gocognit <= 15 on production Go files)
 make build       # Build static ./bin/seamline and ./bin/simworker binaries (CGO_ENABLED=0)
 make run-demo    # Launch Seamline server + embedded F5 Live Playground at http://localhost:8080
 ```
@@ -44,6 +45,7 @@ make run-demo    # Launch Seamline server + embedded F5 Live Playground at http:
    - **Strict Lock Hierarchy:** `b.mu -> actor.mu -> sub.errMu`. Never block on `actor.mu.Lock()` while holding `b.mu` (`TryLock` in sweepers; copy actor pointers and release `b.mu` before inspecting actors in `ListSessions`).
    - **Commit Boundary (`store.Append`):** Never mutate `sessionActor` memory state (`inFlight`, `mergedBuf`, `lastSeq`, `lastCompacted*`) before `store.Append` succeeds. Once `store.Append` succeeds, update memory state and `fanOutLocked` immediately, running `SaveMeta` as best-effort with `context.WithoutCancel(ctx)`.
    - **SSE Wire Safety:** Emit `id: <epoch>:<offset>` **only** on finalized `event: record` frames; use `event: stream_error` (never `event: error`) for terminal stream errors; never use unescaped `innerHTML` in `internal/server/demo.html`.
+   - **Readability & Cognitive Complexity (`gocognit <= 15`):** Every non-test `.go` function must have cognitive complexity `<= 15` (enforced by `golangci-lint`). Favor flat guard clauses, top-to-bottom table-of-contents functions, and focused ~200–300 line files (`broker.go`, `actor.go`, `publish.go`, `subscribe.go`) rather than 1,000-line monoliths.
 3. **Fault-Injection & Race Testing (故障注入与并发竞态测试):**
    - Any change to `internal/broker` or `internal/storage` must include deterministic fault-injection tests (`flakyStore` / `slowStore`) exercising `Append` failures, post-`Append` `SaveMeta` failures, and cross-session concurrency under `go test -race -count=2 ./...`.
 4. **Conventional Commit Messages:** Use clear prefixes such as `feat(broker): ...`, `fix(server): ...`, `docs(arch): ...`, `chore(ci): ...`.

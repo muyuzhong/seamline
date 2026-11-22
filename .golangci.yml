@@ -17,6 +17,7 @@ linters:
     - bodyclose    # Ensure all HTTP response bodies are closed (prod & tests)
     - errcheck     # Catch unhandled error returns
     - errorlint    # Enforce %w wrapping and errors.Is / errors.As (Go 1.13+)
+    - gocognit     # Enforce human-readable cognitive complexity (<= 15 per prod func)
     - govet        # Official Go vet static analyzer suite
     - ineffassign  # Detect ineffectual variable assignments
     - misspell     # Catch common English typos in comments and strings
@@ -30,6 +31,8 @@ linters:
       errorf: true
       asserts: true
       comparison: true
+    gocognit:
+      min-complexity: 15
     staticcheck:
       checks:
         - "all"
@@ -45,6 +48,9 @@ linters:
       - comments
       - std-error-handling
     rules:
+      - path: "_test\\.go$"
+        linters:
+          - gocognit
       - path: "_test\\.go$"
         linters:
           - errorlint

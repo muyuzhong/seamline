@@ -12,7 +12,7 @@ This file is the **single source of truth** for AI coding agents (Claude Code, C
 - `cmd/simworker/`: Standalone CLI worker simulator streaming realistic token deltas over HTTP.
 - `internal/model/`: Canonical domain and wire structs (`Record`, `PublishRequest`, `PublishResult`, `OutEvent`, `InFlightView`, `SessionMeta`, `SessionSnapshot`).
 - `internal/storage/`: `Storage` interface and `MemoryStorage` reference implementation (`sync.RWMutex`, deep-copied `Payload` slices, strictly monotonic `Offset >= 1`).
-- `internal/broker/`: Core `Broker`, per-session `sessionActor`, dual-speed `Publish` state machine, zero-gap `Subscribe` catch-up/live pump, and idle actor sweeper.
+- `internal/broker/`: Core `Broker` (`broker.go`), per-session `sessionActor` & idle sweeper (`actor.go`), dual-speed `Publish` state machine (`publish.go`), and zero-gap `Subscribe` catch-up/live pump (`subscribe.go`).
 - `internal/server/`: Standard-library `http.ServeMux` REST + W3C SSE transport (`server.go`) and embedded F5 Live Playground (`demo.go`, `demo.html`).
 - `docs/ARCHITECTURE.md`: Formal specification of the Dual-Speed Engine, storage failure consistency model, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
 
@@ -40,7 +40,8 @@ Run these targets before marking any task complete or opening/updating a PR:
 | :--- | :--- | :--- |
 | Format check | `make fmt-check` | Zero unformatted `.go` files (`gofmt -l .`) |
 | Static analysis | `make vet` | `go vet ./...` exits `0` |
-| Linter suite | `make lint` | `golangci-lint run` exits `0` with `.golangci.yml` |
+| Linter suite | `make lint` | `golangci-lint run` exits `0` (includes `gocognit <= 15` gate) |
+| Complexity gate | `make complexity` | Every non-test `.go` function has `gocognit <= 15` |
 | Race detector tests | `make test-race` | `go test -race -count=2 ./...` passes with zero races |
 | Static binary build | `make build` | `CGO_ENABLED=0 go build` succeeds for `./cmd/...` |
 | **Full pre-PR gate** | **`make check`** | Runs `fmt-check` + `vet` + `test-race` |
@@ -51,7 +52,7 @@ Formatting rewrites files; always re-run `make check` and `make lint` **after** 
 
 ## Hard Engineering Invariants
 
-Every change to Seamline **must** preserve the following six invariants. Violations cause silent stream corruption, cross-session stalls, stuck sessions, or browser security bugs.
+Every change to Seamline **must** preserve the following seven invariants. Violations cause silent stream corruption, cross-session stalls, stuck sessions, browser security bugs, or unmaintainable monoliths.
 
 ### 1. Zero-Dependency Core & No `cgo`
 - Phase 1 runtime packages use **100% Go 1.23+ standard library** (`go 1.23` in `go.mod`). Do not add third-party modules to `go.mod` without explicit architectural approval.
@@ -97,7 +98,12 @@ Every change to Seamline **must** preserve the following six invariants. Violati
 - **Single CORS & Shutdown Path:** Set CORS headers once in `withCORS` middleware rather than duplicating them inside handlers. During shutdown (`cmd/seamline/main.go`), call `brk.Close()` **once** and **before** `httpServer.Shutdown()` so open SSE handlers terminate immediately instead of waiting out the shutdown timeout.
 - **DOM XSS Prevention:** In `internal/server/demo.html` (and any future web UI), render session IDs, payloads, deltas, and URL parameters exclusively via safe DOM APIs (`document.createElement`, `node.textContent`, `element.replaceChildren`)—**never** interpolate dynamic strings into `innerHTML`.
 
-### 6. Testing & Linter Discipline
+### 6. Readability, File Modularity & Cognitive Complexity (`gocognit <= 15`)
+- **Hard Complexity Ceiling (`gocognit <= 15`):** Every non-test Go function across `cmd/` and `internal/` **must** keep cognitive complexity `<= 15` (strictly enforced in CI via `gocognit` in `.golangci.yml`).
+- **Flat Guard Clauses & Table-of-Contents Top-Level Functions:** Prefer early returns and flat guard clauses over deeply nested `if / else / switch / select` blocks. Top-level entrypoints (`Publish`, `Subscribe`, `handleStream`, `acquireActor`) should read top-to-bottom like a concise table of contents delegating to single-purpose helpers (`publishAtomicLocked`, `publishStreamLocked`, `replayCatchUp`, `drainLiveStream`, `streamSSELoop`).
+- **Focused ~250-Line Files Over 1,000-Line Monoliths:** Split multi-concern packages by cohesive responsibility (e.g., `broker.go`, `actor.go`, `publish.go`, `subscribe.go`) around ~200–300 lines per file so human reviewers can understand each file without scrolling a 1,000-line monolith. Never contort logic artificially just to game metrics—extract natural domain steps with clear names.
+
+### 7. Testing & Linter Discipline
 - Every bug fix or state-machine change in `internal/broker` or `internal/storage` must ship with deterministic **fault-injection regression tests** (`flakyStore` / `slowStore`) verifying:
   - `fin=true` `Append` failure followed by same-`seq` retry commits cleanly with exact content;
   - first-chunk failure leaves `InFlight == nil` and does not block subsequent streams;

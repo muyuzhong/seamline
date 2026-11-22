@@ -5,7 +5,7 @@ GOLANGCI_LINT_VERSION := $(shell tr -d '[:space:]' < .golangci-lint-version 2>/d
 
 .DEFAULT_GOAL := help
 
-.PHONY: help fmt fmt-check vet lint install-lint test test-race build run-demo check clean
+.PHONY: help fmt fmt-check vet lint complexity install-lint test test-race build run-demo check clean
 
 help: ## Show available Makefile targets
 	@echo "Seamline — Resumable Dual-Speed AI Stream Broker"
@@ -28,12 +28,19 @@ fmt-check: ## Verify all Go files are formatted with gofmt
 vet: ## Run go vet static analysis across all packages
 	$(GO) vet ./...
 
-lint: ## Run golangci-lint using .golangci.yml
+lint: ## Run golangci-lint using .golangci.yml (includes gocognit <= 15 gate)
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Run 'make install-lint' to install $(GOLANGCI_LINT_VERSION)."; \
 		exit 1; \
 	fi
 	golangci-lint run --timeout 5m --verbose ./...
+
+complexity: ## Verify cognitive complexity (gocognit <= 15) on non-test Go functions
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		echo "golangci-lint not found. Run 'make install-lint' to install $(GOLANGCI_LINT_VERSION)."; \
+		exit 1; \
+	fi
+	golangci-lint run --enable-only gocognit ./...
 
 install-lint: ## Install pinned golangci-lint version from .golangci-lint-version
 	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
