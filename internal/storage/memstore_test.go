@@ -86,7 +86,7 @@ func TestMemoryStorageDeepCopyPayloadIsolation(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStorage()
 
-	callerBuf := json.RawMessage([]byte(`{"content":"original"}`))
+	callerBuf := json.RawMessage(`{"content":"original"}`)
 	if err := s.Append(ctx, "sess-copy", model.Record{
 		Offset:  1,
 		Epoch:   "ep1",
