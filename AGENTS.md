@@ -28,7 +28,7 @@ Consult the corresponding specification **before** modifying that subsystem:
 | `Broker.Subscribe`, `runSubscriberPump`, `Last-Event-ID`, or epoch cursor handling | [Zero-Gap Catch-Up to Live Handoff](docs/ARCHITECTURE.md#5-catch-up-to-live-tailing-zero-gap-proof-sketch) |
 | Locks (`b.mu`, `actor.mu`, `sub.errMu`), `pins`, `evictIdleActors`, or `ListSessions` | [Concurrency, Lock Hierarchy & Pinning](docs/ARCHITECTURE.md#6-concurrency-lock-hierarchy--actor-pinning-model) |
 | `internal/server/`, SSE frame formatting, CORS, or `demo.html` Playground UI | [SSE Wire Protocol Specification](docs/ARCHITECTURE.md#7-sse-wire-protocol-specification) |
-| Linter rules, Makefile targets, GitHub Actions CI, or PR workflow | [Contributing Guide](CONTRIBUTING.md), [`.golangci.yml`](.golangci.yml) |
+| Linter rules, Makefile targets, or GitHub Actions CI | [`Makefile`](Makefile), [`.golangci.yml`](.golangci.yml), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
 ---
 
@@ -79,7 +79,7 @@ Every change to Seamline **must** preserve the following seven invariants. Viola
 - **Point of No Return (`store.Append`):** Once `store.Append` returns `nil` (for either an atomic event or a `fin=true` stream compaction), the record is durably committed:
   1. Immediately advance `actor` in-memory state (`lastOffset`, `meta`, `lastCompacted*`, and `actor.inFlight = nil` on `fin=true`).
   2. Immediately call `actor.fanOutLocked(...)` so live subscribers never miss a committed record or terminal `fin=true` delta.
-  3. Persist `store.SaveMeta` as **best-effort** using `context.WithoutCancel(ctx)` so caller cancellation mid-commit cannot abort metadata persistence. **Never** return an error from `Publish` or skip `fanOutLocked` if `SaveMeta` fails after `store.Append` succeeded—`acquireActor` automatically reconciles `LastOffset` and session state from `store.ReadFrom` tail records on cold load.
+  3. Persist `store.SaveMeta` as **best-effort** using `context.WithoutCancel(ctx)` so caller cancellation mid-commit cannot abort metadata persistence. **Never** return an error from `Publish` or skip `fanOutLocked` if `SaveMeta` fails after `store.Append` succeeded—terminal `fin=true` types (`run_finished` / `run_failed`) are persisted on the compacted `Record.Type`, allowing `acquireActor` and `ListSessions` to deterministically reconstruct both `LastOffset` and `SessionState` from tail records via `model.StateFromRecordType` on cold load.
 - **Non-`fin` Delta Consistency:** On `fin=false` chunks, ensure memory mutation (`inFlight`, `mergedBuf`, `lastSeq`) and `fanOutLocked` execute atomically without an intervening failing `SaveMeta` aborting between buffer mutation and fan-out.
 
 ### 4. Zero-Gap Subscription Handoff
@@ -94,7 +94,7 @@ Every change to Seamline **must** preserve the following seven invariants. Viola
 ### 5. Non-Blocking Fan-Out, SSE Wire Protocol & Playground XSS Safety
 - **Non-blocking `Publish`:** `fanOutLocked` must use non-blocking channel sends (`select { case sub.liveCh <- ev: default: ... }`). A stalled reader is evicted (`ErrSlowSubscriber`) without delaying producers or sibling subscribers.
 - **Cursor placement (`id:`):** Emit SSE `id: <epoch>:<offset>` **exclusively** on finalized `event: record` frames. Never emit `id:` on `inflight_snapshot`, `delta`, or `stream_error` frames; otherwise browser `EventSource` overwrites its last committed offset cursor.
-- **Terminal error event naming:** Emit `event: stream_error` (never `event: error`). In browsers, `event: error` collides with `EventSource`'s native network `error` event and confuses reconnection handlers.
+- **Terminal error event naming & reconnection:** Emit `event: stream_error` (never `event: error`, which collides with `EventSource`'s native network `error` event). Browsers only send `Last-Event-ID` on automatic `EventSource` reconnects—never on `new EventSource(url)`—so native `EventSource` clients must leave the instance open on `stream_error` for automatic `Last-Event-ID` recovery, or pass `?after_offset=<epoch>:<offset>` when opening a new `EventSource`.
 - **Single CORS & Shutdown Path:** Set CORS headers once in `withCORS` middleware rather than duplicating them inside handlers. During shutdown (`cmd/seamline/main.go`), call `brk.Close()` **once** and **before** `httpServer.Shutdown()` so open SSE handlers terminate immediately instead of waiting out the shutdown timeout.
 - **DOM XSS Prevention:** In `internal/server/demo.html` (and any future web UI), render session IDs, payloads, deltas, and URL parameters exclusively via safe DOM APIs (`document.createElement`, `node.textContent`, `element.replaceChildren`)—**never** interpolate dynamic strings into `innerHTML`.
 
@@ -117,5 +117,5 @@ Every change to Seamline **must** preserve the following seven invariants. Viola
 
 ## Maintaining These Instructions
 
-- Keep `AGENTS.md` concise and authoritative. Deep protocol proofs and state tables belong in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); contributor workflow belongs in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- Keep `AGENTS.md` concise and authoritative. Deep protocol proofs, failure matrices, and wire-protocol state machines belong in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Keep [`CLAUDE.md`](CLAUDE.md) synchronized as a lightweight pointer to `AGENTS.md` so every AI coding assistant follows identical engineering constraints.

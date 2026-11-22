@@ -177,11 +177,10 @@ go test -race -v ./...
 
 ---
 
-## Documentation & Governance / 工程文档与规范
+## Documentation & Engineering Specs / 架构与工程规范
 
 - [Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the dual-speed state machine, storage failure consistency model, lock hierarchy, and catch-up handoff proof sketch.
-- [Contributing Guide (`CONTRIBUTING.md`)](CONTRIBUTING.md) — Development workflow, stacked PR conventions, linter & race-test gates.
-- [Agent & Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Hard invariants and verification rules for contributors and coding agents.
+- [Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Hard concurrency, cognitive complexity (`gocognit <= 15`), and verification rules (`make check`, `make lint`).
 
 ---
 

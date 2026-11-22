@@ -21,4 +21,4 @@ Read **[`AGENTS.md`](AGENTS.md)** first — it is the canonical repository instr
 4. **Zero-gap SSE handoff:** Register `liveCh` and snapshot `(snapOffset, inFlightSnap)` in one `actor.mu` critical section; emit `id: <epoch>:<offset>` **only** on `event: record`; emit terminal stream errors as `event: stream_error` (never `event: error`).
 5. **Playground safety:** Never write untrusted strings (such as `session_id` from URL params) via `innerHTML`; use `document.createElement` + `textContent` + `replaceChildren`.
 
-For deep subsystem contracts, read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+For deep subsystem contracts, read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

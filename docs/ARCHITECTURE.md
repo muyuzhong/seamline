@@ -97,10 +97,10 @@ All request validation (`json.Valid`, sequence gap checks, stream conflict check
      - Even if `SaveMeta` returns an error, `Publish` **still succeeds** (`CommittedOffset: rec.Offset`) because `SessionMeta.LastOffset` is reconstructible from the record log.
 
 ### 4.3 Cold-Load Tail Reconciliation
-Whenever an idle-evicted or restarted session is hydrated in `acquireActor`:
+Whenever an idle-evicted or restarted session is hydrated in `acquireActor` (or listed via `ListSessions`):
 1. `LoadMeta(ctx, sessionID)` loads the last saved `SessionMeta` (if any, giving `startOffset = meta.LastOffset`).
 2. `ReadFrom(ctx, sessionID, startOffset)` scans any committed records beyond `startOffset`.
-3. If `ReadFrom` finds newer records (because a prior best-effort `SaveMeta` failed after `Append` succeeded), `acquireActor` advances `meta.LastOffset` and `meta.UpdatedAt` to match the tail record automatically.
+3. Because `commitFinStreamLocked` persists terminal `fin=true` types (`run_finished` / `run_failed`) directly on the compacted `Record.Type`, any newer tail records found by `ReadFrom` deterministically advance `meta.LastOffset`, `meta.UpdatedAt`, and `meta.State` via the single canonical helper `model.StateFromRecordType(lastRec.Type)`—even if prior best-effort `SaveMeta` calls failed.
 
 ### 4.4 Failure Consistency Matrix
 
@@ -191,7 +191,9 @@ Clients maintain a map of committed messages by `offset` plus at most one active
 1. On `event: record`: If `stream_id` matches the active `inFlight` buffer, replace the temporary streaming bubble with the authoritative `payload` at `offset`; otherwise append `record` at `offset`. Browser `EventSource` automatically updates `Last-Event-ID` to `<epoch>:<offset>`.
 2. On `event: inflight_snapshot`: Initialize/replace the temporary `inFlight` buffer for `stream_id` with `text = ev.delta` and `lastSeq = ev.seq`.
 3. On `event: delta`: If `ev.seq > lastSeq`, append `ev.delta` to the `inFlight` buffer and advance `lastSeq = ev.seq`.
-4. On `event: stream_error`: Inspect `data.error` (e.g., `"slow_subscriber"`), close or re-open `EventSource` using the last committed `Last-Event-ID` to recover cleanly via catch-up + `inflight_snapshot`.
+4. On `event: stream_error`: Inspect `data.error` (e.g., `"slow_subscriber"`). Note that browsers send the `Last-Event-ID` HTTP header **only** during automatic `EventSource` reconnection—never when instantiating a brand-new `new EventSource(url)`:
+   - **Native `EventSource` client:** Do **not** call `es.close()`; once the server closes the HTTP stream after `stream_error`, the browser automatically reconnects with `Last-Event-ID: <epoch>:<offset>` and recovers via catch-up + `inflight_snapshot`.
+   - **New `EventSource` instance or manual reconnect:** Pass the saved cursor in the query string (`?after_offset=<epoch>:<offset>`, supported by `extractStreamCursor`), or send an explicit `Last-Event-ID` header in non-browser HTTP SDKs.
 
 ---
 
