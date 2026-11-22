@@ -700,11 +700,16 @@
           renderPane(pane);
         } else if (eventType === "stream_error") {
           const errCode = ev && ev.error ? ev.error : rawData;
-          logWire(pane, "err", "event=stream_error error=" + errCode);
+          setConnected(pane, false);
           if (pane === clientA) {
-            disconnectClientA();
+            // Leave native EventSource open so the browser auto-reconnects with Last-Event-ID.
+            logWire(pane, "err", "event=stream_error error=" + errCode + " (waiting for native EventSource Last-Event-ID reconnect)");
           } else {
+            logWire(pane, "err", "event=stream_error error=" + errCode + " (resuming from saved cursor in 500ms)");
             disconnectClientB();
+            clientB.reconnectTimer = setTimeout(() => {
+              connectClientB(false);
+            }, 500);
           }
         }
       }
@@ -723,7 +728,10 @@
       function connectClientA(fromZero) {
         disconnectClientA();
         if (fromZero) resetPaneData(clientA);
-        const url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
+        let url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
+        if (!fromZero && clientA.cursor) {
+          url += "?after_offset=" + encodeURIComponent(clientA.cursor);
+        }
         const es = new EventSource(url);
         clientA.es = es;
         es.onopen = () => {

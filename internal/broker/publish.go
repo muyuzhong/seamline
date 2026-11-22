@@ -102,20 +102,16 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 }
 
 func nextAtomicState(reqType string, hasInFlight bool, current model.SessionState) model.SessionState {
-	switch reqType {
-	case "run_finished":
-		return model.StateCompleted
-	case "run_failed":
-		return model.StateFailed
-	default:
-		if hasInFlight {
-			return model.StateRunning
-		}
-		if current == "" {
-			return model.StateIdle
-		}
-		return current
+	if terminal := model.StateFromRecordType(reqType); terminal != model.StateIdle {
+		return terminal
 	}
+	if hasInFlight {
+		return model.StateRunning
+	}
+	if current == "" {
+		return model.StateIdle
+	}
+	return current
 }
 
 func (b *Broker) publishAtomicLocked(
@@ -306,14 +302,14 @@ func (b *Broker) appendStreamDeltaLocked(
 	}
 }
 
-func nextFinState(reqType string, recordType string) model.SessionState {
-	if reqType == "run_finished" || recordType == "run_finished" {
-		return model.StateCompleted
+func resolveFinRecordType(baseType string, finType string) string {
+	if model.StateFromRecordType(finType) != model.StateIdle {
+		return finType
 	}
-	if reqType == "run_failed" || recordType == "run_failed" {
-		return model.StateFailed
+	if baseType != "" {
+		return baseType
 	}
-	return model.StateIdle
+	return finType
 }
 
 func (b *Broker) commitFinStreamLocked(
@@ -331,10 +327,7 @@ func (b *Broker) commitFinStreamLocked(
 		return model.PublishResult{}, err
 	}
 
-	recordType := cand.baseType
-	if recordType == "" {
-		recordType = req.Type
-	}
+	recordType := resolveFinRecordType(cand.baseType, req.Type)
 
 	nextOffset := actor.lastOffset + 1
 	rec := model.Record{
@@ -356,7 +349,7 @@ func (b *Broker) commitFinStreamLocked(
 	actor.inFlight = nil
 	actor.lastOffset = nextOffset
 	actor.meta.Epoch = b.epoch
-	actor.meta.State = nextFinState(req.Type, recordType)
+	actor.meta.State = model.StateFromRecordType(recordType)
 	actor.meta.LastOffset = nextOffset
 	actor.meta.UpdatedAt = now
 

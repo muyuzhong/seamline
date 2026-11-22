@@ -211,20 +211,6 @@ func (b *Broker) getPinnedActor(sessionID string) (*sessionActor, error) {
 	return actor, nil
 }
 
-func reconcileStateFromTail(recType string, current model.SessionState) model.SessionState {
-	switch recType {
-	case "run_finished":
-		return model.StateCompleted
-	case "run_failed":
-		return model.StateFailed
-	default:
-		if current == "" || current == model.StateRunning {
-			return model.StateIdle
-		}
-		return current
-	}
-}
-
 func (b *Broker) loadReconciledMeta(ctx context.Context, sessionID string) (model.SessionMeta, bool, bool, error) {
 	meta, exists, err := b.store.LoadMeta(ctx, sessionID)
 	if err != nil {
@@ -249,7 +235,7 @@ func (b *Broker) loadReconciledMeta(ctx context.Context, sessionID string) (mode
 	}
 	meta.LastOffset = lastRec.Offset
 	meta.UpdatedAt = lastRec.CreatedAt
-	meta.State = reconcileStateFromTail(lastRec.Type, model.StateIdle)
+	meta.State = model.StateFromRecordType(lastRec.Type)
 	return meta, true, true, nil
 }
 
