@@ -130,6 +130,32 @@ func stateFromRecordType(typ string, fallback model.SessionState) model.SessionS
 	}
 }
 
+func reconcileMetaWithRecords(meta model.SessionMeta, recs []model.Record) model.SessionMeta {
+	if len(recs) == 0 {
+		return meta
+	}
+	lastRec := recs[len(recs)-1]
+	if lastRec.Offset <= meta.LastOffset {
+		return meta
+	}
+	meta.LastOffset = lastRec.Offset
+	meta.UpdatedAt = lastRec.CreatedAt
+	meta.State = stateFromRecordType(lastRec.Type, model.StateIdle)
+	return meta
+}
+
+func synthesizeMetaFromRecords(id string, recs []model.Record) model.SessionMeta {
+	lastRec := recs[len(recs)-1]
+	return model.SessionMeta{
+		SessionID:  id,
+		Epoch:      lastRec.Epoch,
+		State:      stateFromRecordType(lastRec.Type, model.StateIdle),
+		LastOffset: lastRec.Offset,
+		CreatedAt:  recs[0].CreatedAt,
+		UpdatedAt:  lastRec.CreatedAt,
+	}
+}
+
 func (m *MemoryStorage) ListSessions(ctx context.Context) ([]model.SessionMeta, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -140,27 +166,11 @@ func (m *MemoryStorage) ListSessions(ctx context.Context) ([]model.SessionMeta, 
 
 	seen := make(map[string]model.SessionMeta, len(m.metas))
 	for id, meta := range m.metas {
-		if recs := m.records[id]; len(recs) > 0 {
-			lastRec := recs[len(recs)-1]
-			if lastRec.Offset > meta.LastOffset {
-				meta.LastOffset = lastRec.Offset
-				meta.UpdatedAt = lastRec.CreatedAt
-				meta.State = stateFromRecordType(lastRec.Type, model.StateIdle)
-			}
-		}
-		seen[id] = meta
+		seen[id] = reconcileMetaWithRecords(meta, m.records[id])
 	}
 	for id, recs := range m.records {
 		if _, ok := seen[id]; !ok && len(recs) > 0 {
-			lastRec := recs[len(recs)-1]
-			seen[id] = model.SessionMeta{
-				SessionID:  id,
-				Epoch:      lastRec.Epoch,
-				State:      stateFromRecordType(lastRec.Type, model.StateIdle),
-				LastOffset: lastRec.Offset,
-				CreatedAt:  recs[0].CreatedAt,
-				UpdatedAt:  lastRec.CreatedAt,
-			}
+			seen[id] = synthesizeMetaFromRecords(id, recs)
 		}
 	}
 
