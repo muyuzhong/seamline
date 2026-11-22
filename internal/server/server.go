@@ -28,7 +28,6 @@ type Config struct {
 type handler struct {
 	broker            *broker.Broker
 	keepaliveInterval time.Duration
-	enableDemo        bool
 
 	demoMu      sync.Mutex
 	activeDemos map[string]struct{}
@@ -44,7 +43,6 @@ func NewHandler(b *broker.Broker, cfg Config) http.Handler {
 	h := &handler{
 		broker:            b,
 		keepaliveInterval: keepalive,
-		enableDemo:        cfg.EnableDemo,
 		activeDemos:       make(map[string]struct{}),
 	}
 
@@ -177,8 +175,6 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
 	w.WriteHeader(http.StatusOK)
 
 	if _, err := fmt.Fprintf(w, ": connected epoch=%s\n\n", sub.Epoch); err != nil {
@@ -201,7 +197,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 		case ev, ok := <-sub.Events:
 			if !ok {
 				if errors.Is(sub.Err(), broker.ErrSlowSubscriber) {
-					_, _ = io.WriteString(w, "event: error\ndata: {\"error\":\"slow_subscriber\"}\n\n")
+					_, _ = io.WriteString(w, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n")
 					flusher.Flush()
 				}
 				return

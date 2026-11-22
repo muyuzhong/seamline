@@ -381,6 +381,7 @@
     .wire-line.snapshot { color: var(--amber); font-weight: 600; }
     .wire-line.delta { color: #93c5fd; }
     .wire-line.sys { color: var(--purple); }
+    .wire-line.err { color: var(--red); font-weight: 600; }
   </style>
 </head>
 <body>
@@ -576,12 +577,17 @@
         pane.deltaEl.textContent = String(pane.deltaCount);
 
         if (pane.items.length === 0) {
-          pane.messagesEl.innerHTML = '<div class="empty-hint">Waiting for events on <code>' + currentSession + '</code>...</div>';
+          const hint = document.createElement("div");
+          hint.className = "empty-hint";
+          const code = document.createElement("code");
+          code.textContent = currentSession;
+          hint.append("Waiting for events on ", code, "...");
+          pane.messagesEl.replaceChildren(hint);
           updateParity();
           return;
         }
 
-        pane.messagesEl.innerHTML = "";
+        pane.messagesEl.replaceChildren();
         for (const item of pane.items) {
           const card = document.createElement("div");
           const isUser = item.type === "user_message";
@@ -692,6 +698,14 @@
             logWire(pane, "delta", "event=delta seq=" + ev.seq + (ev.fin ? " [FIN]" : "") + " delta=" + JSON.stringify(ev.delta));
           }
           renderPane(pane);
+        } else if (eventType === "stream_error") {
+          const errCode = ev && ev.error ? ev.error : rawData;
+          logWire(pane, "err", "event=stream_error error=" + errCode);
+          if (pane === clientA) {
+            disconnectClientA();
+          } else {
+            disconnectClientB();
+          }
         }
       }
 
@@ -701,7 +715,7 @@
         pane.recCount = 0;
         pane.snapCount = 0;
         pane.deltaCount = 0;
-        pane.wireEl.innerHTML = "";
+        pane.wireEl.replaceChildren();
         renderPane(pane);
       }
 
@@ -719,7 +733,7 @@
         es.onerror = () => {
           setConnected(clientA, false);
         };
-        ["record", "inflight_snapshot", "delta"].forEach(kind => {
+        ["record", "inflight_snapshot", "delta", "stream_error"].forEach(kind => {
           es.addEventListener(kind, e => handleOutEvent(clientA, kind, e.lastEventId, e.data));
         });
       }

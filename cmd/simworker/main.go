@@ -140,7 +140,9 @@ func createSession(ctx context.Context, client *http.Client, base, sessionID str
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
@@ -166,7 +168,9 @@ func publishEvent(ctx context.Context, client *http.Client, base, sessionID stri
 	if err != nil {
 		return model.PublishResult{}, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
