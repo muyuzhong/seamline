@@ -116,20 +116,6 @@ func (m *MemoryStorage) LoadMeta(ctx context.Context, sessionID string) (model.S
 	return meta, ok, nil
 }
 
-func stateFromRecordType(typ string, fallback model.SessionState) model.SessionState {
-	switch typ {
-	case "run_finished":
-		return model.StateCompleted
-	case "run_failed":
-		return model.StateFailed
-	default:
-		if fallback == "" {
-			return model.StateIdle
-		}
-		return fallback
-	}
-}
-
 func reconcileMetaWithRecords(meta model.SessionMeta, recs []model.Record) model.SessionMeta {
 	if len(recs) == 0 {
 		return meta
@@ -140,7 +126,7 @@ func reconcileMetaWithRecords(meta model.SessionMeta, recs []model.Record) model
 	}
 	meta.LastOffset = lastRec.Offset
 	meta.UpdatedAt = lastRec.CreatedAt
-	meta.State = stateFromRecordType(lastRec.Type, model.StateIdle)
+	meta.State = model.StateFromRecordType(lastRec.Type)
 	return meta
 }
 
@@ -149,7 +135,7 @@ func synthesizeMetaFromRecords(id string, recs []model.Record) model.SessionMeta
 	return model.SessionMeta{
 		SessionID:  id,
 		Epoch:      lastRec.Epoch,
-		State:      stateFromRecordType(lastRec.Type, model.StateIdle),
+		State:      model.StateFromRecordType(lastRec.Type),
 		LastOffset: lastRec.Offset,
 		CreatedAt:  recs[0].CreatedAt,
 		UpdatedAt:  lastRec.CreatedAt,

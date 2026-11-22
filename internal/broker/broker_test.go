@@ -101,7 +101,7 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("expected 500 deltas to compact into 1 single Record, got %d records", len(recs))
 	}
-	if recs[0].Offset != 1 || recs[0].StreamID != "msg-1" || recs[0].Type != "assistant_delta" {
+	if recs[0].Offset != 1 || recs[0].StreamID != "msg-1" || recs[0].Type != "run_finished" {
 		t.Fatalf("unexpected compacted record header: %+v", recs[0])
 	}
 	if got := decodeContent(t, recs[0].Payload); got != wantBuilder.String() {
@@ -1115,15 +1115,15 @@ func TestSaveMetaFailureAfterAppendPreservesCommitAndFanOut(t *testing.T) {
 
 	st.alwaysFailSaveMeta.Store(false)
 
-	// ListSessions and Inspect must recover accurate LastOffset=2 from stored records!
+	// ListSessions and Inspect must recover accurate LastOffset=2 and terminal State=completed from stored records!
 	list, err := b.ListSessions(ctx)
-	if err != nil || len(list) != 1 || list[0].Meta.LastOffset != 2 {
-		t.Fatalf("expected ListSessions LastOffset=2 after eviction, got list=%+v err=%v", list, err)
+	if err != nil || len(list) != 1 || list[0].Meta.LastOffset != 2 || list[0].Meta.State != model.StateCompleted {
+		t.Fatalf("expected ListSessions LastOffset=2 State=completed after eviction, got list=%+v err=%v", list, err)
 	}
 
 	snap, ok, err := b.Inspect(ctx, "s-meta")
-	if err != nil || !ok || snap.Meta.LastOffset != 2 {
-		t.Fatalf("expected Inspect LastOffset=2 after cold reload, got snap=%+v ok=%v err=%v", snap, ok, err)
+	if err != nil || !ok || snap.Meta.LastOffset != 2 || snap.Meta.State != model.StateCompleted {
+		t.Fatalf("expected Inspect LastOffset=2 State=completed after cold reload, got snap=%+v ok=%v err=%v", snap, ok, err)
 	}
 }
 
