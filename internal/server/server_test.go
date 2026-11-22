@@ -613,6 +613,9 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 	if !strings.Contains(idxHTML, "stream_error") {
 		t.Fatalf("expected Playground HTML to listen for stream_error SSE event")
 	}
+	if !strings.Contains(idxHTML, "after_offset=") {
+		t.Fatalf("expected Playground HTML connectClientA to support ?after_offset= cursor fallback")
+	}
 
 	doPostJSON(t, srv.URL+"/v1/demo/simulate", map[string]any{
 		"session_id": "sim-test",
