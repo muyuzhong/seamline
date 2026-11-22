@@ -28,6 +28,12 @@ Traditional chat backends treat every streamed LLM token identically: either the
 2. **Instant Mid-Stream Catch-Up:** When a client reconnects via ` + "`Last-Event-ID: <epoch>:<offset>`" + ` (or reloads from ` + "`offset=0`" + `), Seamline replays finalized ` + "`record`" + ` frames, emits one coalesced ` + "`inflight_snapshot`" + ` containing the exact half-finished text up to ` + "`last_seq`" + `, and seamlessly resumes live ` + "`delta`" + ` tailing without gaps or duplicates.
 3. **Single-Record Compaction (` + "`fin=true`" + `):** Once generation completes, all 100+ chunks collapse into **1 durable ` + "`Record`" + `** advancing the session offset by ` + "`+1`" + `.`
 
+type demoSimulateParams struct {
+	sessionID string
+	prompt    string
+	interval  time.Duration
+}
+
 func (h *handler) handleDemoIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -36,37 +42,13 @@ func (h *handler) handleDemoIndex(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *handler) handleDemoSimulate(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"session_id"`
-		DelayMs   int    `json:"delay_ms,omitempty"`
-		Prompt    string `json:"prompt,omitempty"`
-	}
-	if r.Body != nil && r.Body != http.NoBody {
-		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeError(w, http.StatusBadRequest, "invalid JSON request body")
-			return
-		}
+	params, err := decodeDemoSimulateParams(w, r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return
 	}
 
-	sessionID := strings.TrimSpace(req.SessionID)
-	if sessionID == "" {
-		sessionID = "playground-1"
-	}
-
-	delayMs := req.DelayMs
-	if delayMs <= 0 {
-		delayMs = 35
-	} else if delayMs > 500 {
-		delayMs = 500
-	}
-
-	prompt := strings.TrimSpace(req.Prompt)
-	if prompt == "" {
-		prompt = defaultDemoPrompt
-	}
-
-	snap, exists, err := h.broker.Inspect(r.Context(), sessionID)
+	snap, exists, err := h.broker.Inspect(r.Context(), params.sessionID)
 	if err != nil {
 		h.writeBrokerError(w, err)
 		return
@@ -76,68 +58,114 @@ func (h *handler) handleDemoSimulate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.demoMu.Lock()
-	if _, busy := h.activeDemos[sessionID]; busy {
-		h.demoMu.Unlock()
+	if !h.tryClaimDemoSlot(params.sessionID) {
 		writeError(w, http.StatusConflict, "demo simulation already active for this session")
 		return
 	}
-	h.activeDemos[sessionID] = struct{}{}
-	h.demoMu.Unlock()
 
 	userPayload, _ := json.Marshal(map[string]string{
 		"role":    "user",
-		"content": prompt,
+		"content": params.prompt,
 	})
-	if _, err := h.broker.Publish(r.Context(), sessionID, model.PublishRequest{
+	if _, err := h.broker.Publish(r.Context(), params.sessionID, model.PublishRequest{
 		Type:    "user_message",
 		Payload: userPayload,
 	}); err != nil {
-		h.demoMu.Lock()
-		delete(h.activeDemos, sessionID)
-		h.demoMu.Unlock()
+		h.releaseDemoSlot(params.sessionID)
 		h.writeBrokerError(w, err)
 		return
 	}
 
 	chunks := splitIntoTokenChunks(defaultDemoMarkdown)
 	streamID := generateID("stream_")
-	interval := time.Duration(delayMs) * time.Millisecond
-
-	go func() {
-		defer func() {
-			h.demoMu.Lock()
-			delete(h.activeDemos, sessionID)
-			h.demoMu.Unlock()
-		}()
-
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		ctx := context.Background()
-		for i, chunk := range chunks {
-			if i > 0 {
-				<-ticker.C
-			}
-			_, err := h.broker.Publish(ctx, sessionID, model.PublishRequest{
-				StreamID: streamID,
-				Seq:      uint64(i + 1),
-				Type:     "assistant_message",
-				Delta:    chunk,
-				Fin:      i == len(chunks)-1,
-			})
-			if err != nil {
-				return
-			}
-		}
-	}()
+	go h.streamSimulatedTurn(params.sessionID, streamID, chunks, params.interval)
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":     "started",
-		"session_id": sessionID,
+		"session_id": params.sessionID,
 		"stream_id":  streamID,
 		"chunks":     len(chunks),
 	})
+}
+
+func decodeDemoSimulateParams(w http.ResponseWriter, r *http.Request) (demoSimulateParams, error) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		DelayMs   int    `json:"delay_ms,omitempty"`
+		Prompt    string `json:"prompt,omitempty"`
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			return demoSimulateParams{}, err
+		}
+	}
+
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		sessionID = "playground-1"
+	}
+
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
+		prompt = defaultDemoPrompt
+	}
+
+	return demoSimulateParams{
+		sessionID: sessionID,
+		prompt:    prompt,
+		interval:  time.Duration(clampDelayMs(req.DelayMs)) * time.Millisecond,
+	}, nil
+}
+
+func clampDelayMs(delayMs int) int {
+	if delayMs <= 0 {
+		return 35
+	}
+	if delayMs > 500 {
+		return 500
+	}
+	return delayMs
+}
+
+func (h *handler) tryClaimDemoSlot(sessionID string) bool {
+	h.demoMu.Lock()
+	defer h.demoMu.Unlock()
+	if _, busy := h.activeDemos[sessionID]; busy {
+		return false
+	}
+	h.activeDemos[sessionID] = struct{}{}
+	return true
+}
+
+func (h *handler) releaseDemoSlot(sessionID string) {
+	h.demoMu.Lock()
+	delete(h.activeDemos, sessionID)
+	h.demoMu.Unlock()
+}
+
+func (h *handler) streamSimulatedTurn(sessionID, streamID string, chunks []string, interval time.Duration) {
+	defer h.releaseDemoSlot(sessionID)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	ctx := context.Background()
+	for i, chunk := range chunks {
+		if i > 0 {
+			<-ticker.C
+		}
+		_, err := h.broker.Publish(ctx, sessionID, model.PublishRequest{
+			StreamID: streamID,
+			Seq:      uint64(i + 1),
+			Type:     "assistant_message",
+			Delta:    chunk,
+			Fin:      i == len(chunks)-1,
+		})
+		if err != nil {
+			return
+		}
+	}
 }
 
 // splitIntoTokenChunks divides text into ~100 realistic LLM-like token slices
@@ -149,15 +177,7 @@ func splitIntoTokenChunks(text string) []string {
 
 	for i, r := range runes {
 		cur.WriteRune(r)
-		flush := false
-		if unicode.IsSpace(r) {
-			if i+1 < len(runes) && !unicode.IsSpace(runes[i+1]) {
-				flush = true
-			}
-		} else if cur.Len() >= 9 {
-			flush = true
-		}
-		if flush {
+		if shouldFlushDemoChunk(runes, i, cur.Len()) {
 			chunks = append(chunks, cur.String())
 			cur.Reset()
 		}
@@ -166,4 +186,11 @@ func splitIntoTokenChunks(text string) []string {
 		chunks = append(chunks, cur.String())
 	}
 	return chunks
+}
+
+func shouldFlushDemoChunk(runes []rune, idx, curLen int) bool {
+	if unicode.IsSpace(runes[idx]) {
+		return idx+1 < len(runes) && !unicode.IsSpace(runes[idx+1])
+	}
+	return curLen >= 9
 }

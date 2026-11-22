@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -157,14 +158,13 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID := r.PathValue("id")
 	afterEpoch, afterOffset, err := extractStreamCursor(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	sub, err := h.broker.Subscribe(r.Context(), sessionID, afterOffset, afterEpoch)
+	sub, err := h.broker.Subscribe(r.Context(), r.PathValue("id"), afterOffset, afterEpoch)
 	if err != nil {
 		h.writeBrokerError(w, err)
 		return
@@ -182,12 +182,16 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
+	h.streamSSELoop(r.Context(), w, flusher, sub)
+}
+
+func (h *handler) streamSSELoop(ctx context.Context, w io.Writer, flusher http.Flusher, sub *broker.Subscription) {
 	ticker := time.NewTicker(h.keepaliveInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
@@ -196,38 +200,52 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		case ev, ok := <-sub.Events:
 			if !ok {
-				if errors.Is(sub.Err(), broker.ErrSlowSubscriber) {
-					_, _ = io.WriteString(w, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n")
-					flusher.Flush()
-				}
+				writeSlowSubscriberSSE(w, flusher, sub.Err())
 				return
 			}
-
-			data, err := json.Marshal(ev)
-			if err != nil {
+			if err := writeSSEEvent(w, flusher, ev); err != nil {
 				return
 			}
-
-			switch ev.Kind {
-			case model.EventCommitted:
-				if _, err := fmt.Fprintf(w, "id: %s:%d\nevent: record\ndata: %s\n\n", ev.Epoch, ev.Offset, data); err != nil {
-					return
-				}
-			case model.EventInFlightSnapshot:
-				if _, err := fmt.Fprintf(w, "event: inflight_snapshot\ndata: %s\n\n", data); err != nil {
-					return
-				}
-			case model.EventDelta:
-				if _, err := fmt.Fprintf(w, "event: delta\ndata: %s\n\n", data); err != nil {
-					return
-				}
-			default:
-				if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Kind, data); err != nil {
-					return
-				}
-			}
-			flusher.Flush()
 		}
+	}
+}
+
+func writeSlowSubscriberSSE(w io.Writer, flusher http.Flusher, err error) {
+	if !errors.Is(err, broker.ErrSlowSubscriber) {
+		return
+	}
+	_, _ = io.WriteString(w, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n")
+	flusher.Flush()
+}
+
+func writeSSEEvent(w io.Writer, flusher http.Flusher, ev model.OutEvent) error {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+
+	var writeErr error
+	if ev.Kind == model.EventCommitted {
+		_, writeErr = fmt.Fprintf(w, "id: %s:%d\nevent: record\ndata: %s\n\n", ev.Epoch, ev.Offset, data)
+	} else {
+		_, writeErr = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", sseEventName(ev.Kind), data)
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+
+	flusher.Flush()
+	return nil
+}
+
+func sseEventName(kind model.EventKind) string {
+	switch kind {
+	case model.EventInFlightSnapshot:
+		return "inflight_snapshot"
+	case model.EventDelta:
+		return "delta"
+	default:
+		return string(kind)
 	}
 }
 

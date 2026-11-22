@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,6 +24,8 @@ import (
 )
 
 const defaultSimText = "Seamline streams ephemeral token deltas at memory speed while compacting finalized AI turns into a single durable record. Disconnect mid-stream or hit F5 in your browser: Last-Event-ID plus inflight_snapshot recovers the exact generation state without losing or duplicating a single character."
+
+var errInterrupted = errors.New("interrupted")
 
 func main() {
 	var (
@@ -46,35 +49,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	sid := strings.TrimSpace(*streamID)
-	if sid == "" {
-		sid = newStreamID()
-	}
-
-	bodyText := *text
-	if bodyText == "" {
-		bodyText = defaultSimText
-	}
-	chunks := chunkText(bodyText)
+	sid := defaultString(strings.TrimSpace(*streamID), newStreamID())
+	chunks := chunkText(defaultString(*text, defaultSimText))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	client := &http.Client{Timeout: 10 * time.Second}
-
 	if err := createSession(ctx, client, base, sess); err != nil {
 		logger.Error("failed to initialize session", "error", err)
 		os.Exit(1)
 	}
 
-	userPayload, _ := json.Marshal(map[string]string{
-		"role":    "user",
-		"content": *prompt,
-	})
-	userRes, err := publishEvent(ctx, client, base, sess, model.PublishRequest{
-		Type:    "user_message",
-		Payload: userPayload,
-	})
+	userRes, err := publishUserPrompt(ctx, client, base, sess, *prompt)
 	if err != nil {
 		logger.Error("failed to publish user prompt record", "error", err)
 		os.Exit(1)
@@ -92,31 +79,14 @@ func main() {
 		"delay", delay.String(),
 	)
 
-	var finalRes model.PublishResult
-	for i, delta := range chunks {
-		if i > 0 && *delay > 0 {
-			timer := time.NewTimer(*delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				logger.Warn("simworker interrupted mid-stream", "sent_chunks", i)
-				os.Exit(130)
-			case <-timer.C:
-			}
+	finalRes, sent, err := streamAssistantChunks(ctx, client, base, sess, sid, chunks, *delay)
+	if err != nil {
+		if errors.Is(err, errInterrupted) {
+			logger.Warn("simworker interrupted mid-stream", "sent_chunks", sent)
+			os.Exit(130)
 		}
-
-		res, err := publishEvent(ctx, client, base, sess, model.PublishRequest{
-			StreamID: sid,
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    delta,
-			Fin:      i == len(chunks)-1,
-		})
-		if err != nil {
-			logger.Error("failed to publish delta", "seq", i+1, "error", err)
-			os.Exit(1)
-		}
-		finalRes = res
+		logger.Error("failed to publish delta", "seq", sent+1, "error", err)
+		os.Exit(1)
 	}
 
 	logger.Info("stream completed and compacted",
@@ -126,6 +96,66 @@ func main() {
 		"committed_offset", finalRes.CommittedOffset,
 		"epoch", finalRes.Epoch,
 	)
+}
+
+func defaultString(val, fallback string) string {
+	if val == "" {
+		return fallback
+	}
+	return val
+}
+
+func publishUserPrompt(ctx context.Context, client *http.Client, base, sessionID, prompt string) (model.PublishResult, error) {
+	userPayload, _ := json.Marshal(map[string]string{
+		"role":    "user",
+		"content": prompt,
+	})
+	return publishEvent(ctx, client, base, sessionID, model.PublishRequest{
+		Type:    "user_message",
+		Payload: userPayload,
+	})
+}
+
+func streamAssistantChunks(
+	ctx context.Context,
+	client *http.Client,
+	base, sessionID, streamID string,
+	chunks []string,
+	delay time.Duration,
+) (model.PublishResult, int, error) {
+	var finalRes model.PublishResult
+	for i, delta := range chunks {
+		if i > 0 && !sleepWithContext(ctx, delay) {
+			return model.PublishResult{}, i, errInterrupted
+		}
+		res, err := publishEvent(ctx, client, base, sessionID, model.PublishRequest{
+			StreamID: streamID,
+			Seq:      uint64(i + 1),
+			Type:     "assistant_message",
+			Delta:    delta,
+			Fin:      i == len(chunks)-1,
+		})
+		if err != nil {
+			return model.PublishResult{}, i, err
+		}
+		finalRes = res
+	}
+	return finalRes, len(chunks), nil
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func createSession(ctx context.Context, client *http.Client, base, sessionID string) error {
@@ -189,33 +219,28 @@ func chunkText(text string) []string {
 	if len(runes) == 0 {
 		return []string{""}
 	}
-
 	// For short strings, slice into 2-rune tokens so mid-stream disconnect tests have plenty of chunks.
 	if len(runes) <= 120 {
-		var out []string
-		for i := 0; i < len(runes); i += 2 {
-			end := i + 2
-			if end > len(runes) {
-				end = len(runes)
-			}
-			out = append(out, string(runes[i:end]))
-		}
-		return out
+		return chunkFixedRunes(runes, 2)
 	}
+	return chunkNaturalTokens(runes, 8)
+}
 
+func chunkFixedRunes(runes []rune, width int) []string {
+	out := make([]string, 0, (len(runes)+width-1)/width)
+	for i := 0; i < len(runes); i += width {
+		end := min(i+width, len(runes))
+		out = append(out, string(runes[i:end]))
+	}
+	return out
+}
+
+func chunkNaturalTokens(runes []rune, maxBytes int) []string {
 	var chunks []string
 	var cur strings.Builder
 	for i, r := range runes {
 		cur.WriteRune(r)
-		flush := false
-		if unicode.IsSpace(r) {
-			if i+1 < len(runes) && !unicode.IsSpace(runes[i+1]) {
-				flush = true
-			}
-		} else if cur.Len() >= 8 {
-			flush = true
-		}
-		if flush {
+		if shouldFlushSimChunk(runes, i, cur.Len(), maxBytes) {
 			chunks = append(chunks, cur.String())
 			cur.Reset()
 		}
@@ -224,6 +249,13 @@ func chunkText(text string) []string {
 		chunks = append(chunks, cur.String())
 	}
 	return chunks
+}
+
+func shouldFlushSimChunk(runes []rune, idx, curLen, maxBytes int) bool {
+	if unicode.IsSpace(runes[idx]) {
+		return idx+1 < len(runes) && !unicode.IsSpace(runes[idx+1])
+	}
+	return curLen >= maxBytes
 }
 
 func newStreamID() string {
