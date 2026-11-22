@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    name: Build & Test (Go 1.23)
+    name: Lint, Build & Race Test (Go 1.23)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -23,15 +23,48 @@ jobs:
           go-version: '1.23.x'
           cache: false
 
-      - name: Format, Vet, and Race Test
+      - name: Detect Go source files & linter version
+        id: go-check
         run: |
           if [ -n "$(find . -name '*.go' -not -path './vendor/*')" ]; then
-            unformatted="$(gofmt -l .)"
-            if [ -n "$unformatted" ]; then
-              echo "Go files must be formatted with gofmt:"
-              echo "$unformatted"
-              exit 1
-            fi
-            go vet ./...
-            go test -race -v ./...
+            echo "has_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_go=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f .golangci-lint-version ]; then
+            echo "lint_version=$(tr -d '[:space:]' < .golangci-lint-version)" >> "$GITHUB_OUTPUT"
+          else
+            echo "lint_version=v2.1.6" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check formatting (gofmt)
+        if: steps.go-check.outputs.has_go == 'true'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Go files must be formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run go vet
+        if: steps.go-check.outputs.has_go == 'true'
+        run: go vet ./...
+
+      - name: Run golangci-lint
+        if: steps.go-check.outputs.has_go == 'true'
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: ${{ steps.go-check.outputs.lint_version }}
+          args: --timeout=5m --verbose
+
+      - name: Run race detector tests
+        if: steps.go-check.outputs.has_go == 'true'
+        run: go test -race -count=2 -v ./...
+
+      - name: Build CLI binaries (CGO_ENABLED=0)
+        if: steps.go-check.outputs.has_go == 'true'
+        run: |
+          if [ -d ./cmd ]; then
+            CGO_ENABLED=0 go build -v ./cmd/...
           fi
