@@ -459,8 +459,23 @@ func TestSSEKeepaliveHeartbeat(t *testing.T) {
 	}
 }
 
+func TestActiveRunQuotaAnswers413(t *testing.T) {
+	_, srv := newTestEnv(t, "quota", broker.Config{}, server.Config{}, hotwindow.WithRetention(hotwindow.Retention{MaxActiveRunBytes: 2048}))
+	events := srv.URL + "/v1/sessions/q/events"
+
+	doPostJSON(t, events, ev(model.TypeRunStarted, nil), http.StatusOK, nil)
+	big := `{"type":"assistant_delta","payload":"` + strings.Repeat("y", 900) + `"}`
+	doPostRaw(t, events, big, http.StatusOK)
+	doPostRaw(t, events, big, http.StatusOK)
+	if out := doPostRaw(t, events, big, http.StatusRequestEntityTooLarge); out["code"] != "active_run_quota_exceeded" {
+		t.Fatalf("active run quota: %v", out)
+	}
+	// The run can still be ended.
+	doPostJSON(t, events, ev(model.TypeRunFinished, nil), http.StatusOK, nil)
+}
+
 func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
-	_, srv := newTestEnv(t, "err999", broker.Config{InstanceID: "inst-err999"}, server.Config{EnableDemo: true})
+	_, srv := newTestEnv(t, "err999", broker.Config{InstanceID: "inst-err999", MaxEventBytes: 1024}, server.Config{EnableDemo: true})
 	api := srv.URL + "/v1/sessions"
 
 	var health map[string]string
@@ -491,6 +506,7 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 	}{
 		{"missing type", `{"payload":{}}`, http.StatusBadRequest, "invalid_request"},
 		{"malformed JSON", `{"type":"x","payload":{`, http.StatusBadRequest, "invalid_request"},
+		{"payload over MaxEventBytes", `{"type":"x","payload":"` + strings.Repeat("x", 2000) + `"}`, http.StatusRequestEntityTooLarge, "event_too_large"},
 	}
 	for _, tc := range codes {
 		if out := doPostRaw(t, events, tc.body, tc.status); out["code"] != tc.code {
@@ -524,6 +540,25 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("simulated run did not finish: %+v (want latest_seq %d)", snap.Meta, wantLatest)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+func TestDemoRunEndsWhenPublishFails(t *testing.T) {
+	// The active-run quota is far smaller than the simulated answer, so a publish fails mid-run.
+	_, srv := newTestEnv(t, "demo", broker.Config{}, server.Config{EnableDemo: true}, hotwindow.WithRetention(hotwindow.Retention{MaxActiveRunBytes: 1500}))
+	doPostJSON(t, srv.URL+"/v1/demo/simulate", map[string]any{"session_id": "sim-fail", "delay_ms": 1}, http.StatusAccepted, nil)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var snap model.SessionSnapshot
+		doGetJSON(t, srv.URL+"/v1/sessions/sim-fail", http.StatusOK, &snap)
+		if snap.Meta.State == model.StateFailed && snap.Meta.ActiveRunStartSeq == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a failed demo run must end with run_failed instead of waiting for the idle timeout: %+v", snap.Meta)
 		}
 		time.Sleep(15 * time.Millisecond)
 	}

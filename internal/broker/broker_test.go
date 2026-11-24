@@ -56,7 +56,7 @@ func TestPublishAssignsSeqAndFansOutOpaquePayload(t *testing.T) {
 
 func TestPublishValidation(t *testing.T) {
 	ctx := context.Background()
-	b := New(hotwindow.NewMemoryStorage(), Config{})
+	b := New(hotwindow.NewMemoryStorage(), Config{MaxEventBytes: 64})
 	closeBroker(t, b)
 
 	cases := []struct {
@@ -68,6 +68,7 @@ func TestPublishValidation(t *testing.T) {
 		{"empty session", "", ev("x", ""), ErrInvalidInput},
 		{"empty type", "s", ev("", `{}`), ErrInvalidInput},
 		{"invalid JSON", "s", ev("x", `{broken`), ErrInvalidInput},
+		{"too large", "s", ev("x", `"`+strings.Repeat("x", 63)+`"`), ErrEventTooLarge},
 	}
 	for _, tc := range cases {
 		if _, err := b.Publish(ctx, tc.sid, tc.req); !errors.Is(err, tc.want) {
@@ -76,6 +77,9 @@ func TestPublishValidation(t *testing.T) {
 	}
 	if _, err := b.Subscribe(ctx, "", 0, ""); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("Subscribe with empty session: want ErrInvalidInput, got %v", err)
+	}
+	if res := mustPublish(t, b, "s", ev("x", `"`+strings.Repeat("x", 62)+`"`)); res.Seq != 1 {
+		t.Fatalf("a payload of exactly MaxEventBytes must be accepted: %+v", res)
 	}
 }
 

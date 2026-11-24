@@ -16,13 +16,20 @@ import (
 var (
 	ErrSlowSubscriber = errors.New("subscriber evicted due to slow consumption")
 	ErrInvalidInput   = errors.New("invalid publish request")
-	ErrBrokerClosed   = errors.New("broker closed")
+	ErrEventTooLarge  = errors.New("event payload exceeds the maximum event size")
+	// ErrActiveRunQuotaExceeded is returned when an event would grow the active run beyond
+	// the storage's MaxActiveRunBytes. Terminal events are never rejected by it.
+	ErrActiveRunQuotaExceeded = hotwindow.ErrActiveRunQuotaExceeded
+	ErrBrokerClosed           = errors.New("broker closed")
 )
 
 const (
 	defaultSubscriberBufferSize = 128
 	defaultIdleSessionTTL       = 30 * time.Minute
 	defaultSweepInterval        = 1 * time.Minute
+
+	DefaultMaxEventBytes        = 256 << 10
+	DefaultActiveRunIdleTimeout = 2 * time.Minute
 )
 
 type Config struct {
@@ -32,6 +39,11 @@ type Config struct {
 	// InstanceID identifies this broker process (random 12-char hex if empty). Session
 	// cursors use the per-session stream epoch from storage, not this value.
 	InstanceID string
+	// MaxEventBytes bounds the payload of one publish (default 256 KiB).
+	MaxEventBytes int
+	// ActiveRunIdleTimeout ends an active run with run_failed {"reason":"idle_timeout"} when
+	// no event was published in it for this long (default 2m).
+	ActiveRunIdleTimeout time.Duration
 }
 
 func orDefault[T int | time.Duration](v, def T) T {
@@ -45,6 +57,8 @@ func normalizeConfig(cfg Config) Config {
 	cfg.SubscriberBufferSize = orDefault(cfg.SubscriberBufferSize, defaultSubscriberBufferSize)
 	cfg.IdleSessionTTL = orDefault(cfg.IdleSessionTTL, defaultIdleSessionTTL)
 	cfg.SweepInterval = orDefault(cfg.SweepInterval, defaultSweepInterval)
+	cfg.MaxEventBytes = orDefault(cfg.MaxEventBytes, DefaultMaxEventBytes)
+	cfg.ActiveRunIdleTimeout = orDefault(cfg.ActiveRunIdleTimeout, DefaultActiveRunIdleTimeout)
 	if cfg.InstanceID == "" {
 		cfg.InstanceID = randomHex(6)
 	}

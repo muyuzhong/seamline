@@ -25,6 +25,9 @@ func (b *Broker) validatePublishRequest(sessionID string, req model.PublishReque
 	if sessionID == "" || req.Type == "" || (hasJSON(req.Payload) && !json.Valid(req.Payload)) {
 		return ErrInvalidInput
 	}
+	if len(req.Payload) > b.cfg.MaxEventBytes {
+		return ErrEventTooLarge
+	}
 	return nil
 }
 
@@ -68,7 +71,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 	}
 
 	// Point of no return: the event and its session state are committed.
-	actor.applyCommitLocked(c)
+	actor.applyCommitLocked(c, now)
 	actor.fanOutLocked(eventDelivery(c.Event))
 	return model.PublishResult{Epoch: c.Event.Epoch, Seq: c.Event.Seq}, nil
 }

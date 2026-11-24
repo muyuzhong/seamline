@@ -50,6 +50,7 @@ type sessionActor struct {
 	latestSeq         uint64
 	activeRunStartSeq uint64
 	state             model.SessionState
+	runActiveAt       time.Time // last publish into the active run (ActiveRunIdleTimeout)
 	subscribers       map[*subState]struct{}
 	lastActiveNano    atomic.Int64
 	pins              atomic.Int32
@@ -140,6 +141,7 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string) (*sessionAc
 		latestSeq:         info.LatestSeq,
 		activeRunStartSeq: info.ActiveRunStartSeq,
 		state:             info.State,
+		runActiveAt:       time.Now(),
 		subscribers:       make(map[*subState]struct{}),
 	}
 	candidate.pins.Store(1)

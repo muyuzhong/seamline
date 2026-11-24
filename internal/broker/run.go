@@ -1,12 +1,16 @@
 package broker
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/hotwindow"
 	"github.com/muyuzhong/seamline/internal/model"
 )
+
+// idleTimeoutPayload is the payload of the run_failed event that ends a silent run.
+var idleTimeoutPayload = json.RawMessage(`{"reason":"idle_timeout"}`)
 
 // nextRunState is the run state machine. Only an explicit run_started opens a run (and only when
 // none is active); a terminal event ends the active run. Everything else leaves the run as is.
@@ -35,8 +39,26 @@ func (a *sessionActor) nextCommit(eventType string, payload json.RawMessage, now
 	return hotwindow.Commit{Event: ev, State: state, ActiveRunStartSeq: pin}
 }
 
-func (a *sessionActor) applyCommitLocked(c hotwindow.Commit) {
+func (a *sessionActor) applyCommitLocked(c hotwindow.Commit, now time.Time) {
 	a.latestSeq = c.Event.Seq
 	a.activeRunStartSeq = c.ActiveRunStartSeq
 	a.state = c.State
+	if c.ActiveRunStartSeq != 0 {
+		a.runActiveAt = now
+	}
+}
+
+// sealIdleRunLocked ends an active run whose producer has been silent for ActiveRunIdleTimeout
+// by appending run_failed {"reason":"idle_timeout"} through the normal commit path.
+func (b *Broker) sealIdleRunLocked(actor *sessionActor, now time.Time) error {
+	if actor.activeRunStartSeq == 0 || now.Sub(actor.runActiveAt) < b.cfg.ActiveRunIdleTimeout {
+		return nil
+	}
+	c := actor.nextCommit(model.TypeRunFailed, idleTimeoutPayload, now.UTC())
+	if err := b.store.Append(context.Background(), actor.sessionID, c); err != nil {
+		return err
+	}
+	actor.applyCommitLocked(c, now)
+	actor.fanOutLocked(eventDelivery(c.Event))
+	return nil
 }

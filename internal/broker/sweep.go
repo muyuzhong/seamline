@@ -20,11 +20,40 @@ func (b *Broker) sweepLoop() {
 	}
 }
 
-// sweepOnce runs one maintenance pass: evict idle actors, then keep live sessions' streams alive
-// and let storage apply its retention.
+// sweepOnce runs one maintenance pass: end silent runs, evict idle actors, then keep live
+// sessions' streams alive and let storage apply its retention.
 func (b *Broker) sweepOnce(now time.Time) {
+	b.sealIdleRuns(now)
 	b.evictIdleActors(now)
 	b.maintainStorage(now)
+}
+
+// pinAllActors pins every live actor under b.mu.RLock without touching actor.mu.
+func (b *Broker) pinAllActors() []*sessionActor {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil
+	}
+	out := make([]*sessionActor, 0, len(b.actors))
+	for _, actor := range b.actors {
+		actor.pins.Add(1)
+		out = append(out, actor)
+	}
+	return out
+}
+
+// sealIdleRuns ends silent runs. It runs outside b.mu and skips busy actors (TryLock); a storage
+// failure leaves the run active so the next tick retries.
+func (b *Broker) sealIdleRuns(now time.Time) {
+	for _, actor := range b.pinAllActors() {
+		if actor.mu.TryLock() {
+			_ = b.sealIdleRunLocked(actor, now)
+			actor.mu.Unlock()
+		}
+		// Release the sweeper's pin without touch(): sweeping must not keep sessions alive.
+		actor.pins.Add(-1)
+	}
 }
 
 func (b *Broker) evictIdleActors(now time.Time) {

@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -109,4 +110,75 @@ func replayRunText(t *testing.T, b *Broker, sid string) string {
 		}
 	}
 	return text.String()
+}
+
+func TestActiveRunQuotaExemptsTerminalEvents(t *testing.T) {
+	ctx := context.Background()
+	store := hotwindow.NewMemoryStorage(hotwindow.WithRetention(hotwindow.Retention{MaxActiveRunBytes: 400}))
+	b := New(store, Config{})
+	closeBroker(t, b)
+	const sid = "quota"
+
+	mustPublish(t, b, sid, ev(model.TypeRunStarted, ""))
+	var err error
+	for i := 0; i < 20 && err == nil; i++ {
+		_, err = b.Publish(ctx, sid, ev("assistant_delta", textPayload(strings.Repeat("x", 40))))
+	}
+	if !errors.Is(err, ErrActiveRunQuotaExceeded) {
+		t.Fatalf("want ErrActiveRunQuotaExceeded, got %v", err)
+	}
+	before := mustInspect(t, b, sid)
+	if _, err := b.Publish(ctx, sid, ev("assistant_delta", textPayload("more"))); !errors.Is(err, ErrActiveRunQuotaExceeded) {
+		t.Fatalf("the run must stay over quota: %v", err)
+	}
+	if after := mustInspect(t, b, sid); after.LatestSeq != before.LatestSeq || after.State != model.StateRunning {
+		t.Fatalf("rejected events must not change the session: before=%+v after=%+v", before, after)
+	}
+	// The producer can still end the run.
+	mustPublish(t, b, sid, ev(model.TypeRunFailed, `{"reason":"quota"}`))
+	if meta := mustInspect(t, b, sid); meta.State != model.StateFailed || meta.ActiveRunStartSeq != 0 {
+		t.Fatalf("terminal event must end the run: %+v", meta)
+	}
+}
+
+func TestIdleRunIsSealedWithRunFailed(t *testing.T) {
+	ctx := context.Background()
+	b := New(hotwindow.NewMemoryStorage(), Config{ActiveRunIdleTimeout: 80 * time.Millisecond, SweepInterval: 5 * time.Millisecond})
+	closeBroker(t, b)
+	const sid = "seal"
+
+	sub, err := b.Subscribe(ctx, sid, 0, "")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Cancel()
+
+	mustPublish(t, b, sid, ev(model.TypeRunStarted, ""))
+	// Events inside the run keep it alive well past the timeout.
+	for i := 0; i < 20; i++ {
+		mustPublish(t, b, sid, ev("assistant_delta", textPayload(".")))
+		time.Sleep(10 * time.Millisecond)
+	}
+	if meta := mustInspect(t, b, sid); meta.State != model.StateRunning || meta.LatestSeq != 21 {
+		t.Fatalf("an active producer must not be sealed: %+v", meta)
+	}
+
+	// Then the producer goes silent: the sweeper ends the run with run_failed {"reason":"idle_timeout"}.
+	var sealed model.Event
+	for sealed.Type != model.TypeRunFailed {
+		sealed = recvEvent(t, sub)
+	}
+	if sealed.Seq != 22 || string(sealed.Payload) != `{"reason":"idle_timeout"}` {
+		t.Fatalf("unexpected sealing event: %+v (%s)", sealed, sealed.Payload)
+	}
+	if meta := mustInspect(t, b, sid); meta.State != model.StateFailed || meta.ActiveRunStartSeq != 0 {
+		t.Fatalf("sealed run must be failed: %+v", meta)
+	}
+
+	// Events outside a run never start the idle timer.
+	mustPublish(t, b, sid, ev("note", ""))
+	time.Sleep(200 * time.Millisecond)
+	if meta := mustInspect(t, b, sid); meta.LatestSeq != 23 || meta.State != model.StateFailed {
+		t.Fatalf("an event outside a run must not be sealed: %+v", meta)
+	}
 }
