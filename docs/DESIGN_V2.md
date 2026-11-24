@@ -36,15 +36,17 @@
                 └────── 受 HistoryTTL + MaxHistoryBytes ───┘└────────── 受 MaxActiveRunBytes 保护 ─────────┘
 ```
 
-1. **活跃轮起始水位 `active_run_start_seq`（免淘汰锁定）**：
-   - 当会话处于非运行态（`idle` / `completed` / `failed`）并收到新一轮首个非终态事件（或显式 `type == "run_started"`）时，记录 `active_run_start_seq = event.Seq`，会话状态置为 `running`；
-   - 当收到终态事件（`type == "run_finished"` 或 `"run_failed"`，以及 Phase 2 控制面的 `"run_interrupted"`）提交成功时，重置 `active_run_start_seq = 0`，本轮全部事件转入可淘汰历史区；
-   - **淘汰铁律**：`HistoryTTL` 与 `MaxHistoryBytes` **仅允许淘汰 `seq < active_run_start_seq` 的已完结轮次事件**（当 `active_run_start_seq == 0` 时可淘汰全部事件）。因此只要当前轮仍在运行，始终满足 **`earliest_seq <= active_run_start_seq`**——中途任意时刻刷新或重连，未落主库的当前轮事件 100% 完整在位。
+1. **活跃轮起始水位 `active_run_start_seq`（免淘汰锁定，显式开轮）**：
+   - **只有显式 `run_started` 才开新轮**：会话处于非运行态（`idle` / `completed` / `failed` / `interrupted`）且收到 `type == "run_started"` 时，记录 `active_run_start_seq = event.Seq`，会话状态置为 `running`，并开始活跃轮锁定与 `ActiveRunIdleTimeout` 空闲计时。运行中再次收到 `run_started` 时保持原起点不变。生产者在一轮开始时必须先发 `run_started`。
+   - 非运行态下收到的其他事件（包括轮外的终态事件）直接分配 `seq` 进入历史区，不开新轮，也不会触发 `idle_timeout` 封存。
+   - 当运行中收到终态事件（`type == "run_finished"` 或 `"run_failed"`，以及 Phase 2 控制面的 `"run_interrupted"`）提交成功时，重置 `active_run_start_seq = 0`，本轮全部事件转入历史区；
+   - **淘汰铁律**：`HistoryTTL` 与 `MaxHistoryBytes` **仅允许淘汰 `seq < active_run_start_seq` 的已完结轮次事件**（当 `active_run_start_seq == 0` 时可淘汰全部历史事件）。因此只要当前轮仍在运行，始终满足 **`earliest_seq <= active_run_start_seq`**——中途任意时刻刷新或重连，未落主库的当前轮事件 100% 完整在位。
+   - **最近一轮保护**：最近一个已完结轮次（`[last_run_start_seq .. last_run_end_seq]`）**不参与 `MaxHistoryBytes` 字节淘汰**，且它的 `HistoryTTL` **从该轮结束时刻开始计算**；直到下一轮完结、它不再是"最近一轮"后，才按普通历史事件处理。否则一轮超过 `MaxHistoryBytes` 或运行超过 `HistoryTTL` 时，会在 `run_finished` 提交的同一刻被淘汰大半，破坏 §2.3 情形 B（客户端在主库事务提交前读主库，需要从热窗口补发 `(S_prev, S]`）。
 2. **静默僵尸轮自动封存（`ActiveRunIdleTimeout`，默认 `2m`）**：
    - 每次成功发布事件均续期活跃轮空闲期限。若生产者崩溃或静默超过 `ActiveRunIdleTimeout` 仍未发终态事件（控制面 Worker Lease 上线前的最小兜底，上线后与租约机制复用同一路径），后台清扫器自动追加一条终态事件（`type: "run_failed"`, `payload: {"reason":"idle_timeout"}`），扇出给订阅者并将 `active_run_start_seq` 归零，防止死流永久锁死内存。生产者空闲等待下游慢工具时可发送轻量心跳或状态事件续期。
 3. **三层硬字节配额（封死大包与内存膨胀）**：
    - `MaxEventBytes`（默认 `256 KiB`）：限制单次 `PublishRequest` 的载荷字节数，入口处拦截，超限返回 `413`（`ErrEventTooLarge`）；
-   - `MaxActiveRunBytes`（默认 `16 MiB` / 会话）：限制当前锁定活跃区（`seq >= active_run_start_seq`）累计保留字节数（足以容纳 **50,000+ 条**流式 Token / 工具 JSON 碎片事件，同时在异常 Worker 死循环狂吐事件时以 `413 ErrActiveRunQuotaExceeded` 熔断防 OOM）；
+   - `MaxActiveRunBytes`（默认 `16 MiB` / 会话）：限制当前锁定活跃区（`seq >= active_run_start_seq`）累计保留字节数（足以容纳 **50,000+ 条**流式 Token / 工具 JSON 碎片事件，同时在异常 Worker 死循环狂吐事件时以 `413 ErrActiveRunQuotaExceeded` 熔断防 OOM）。**终态事件（`run_finished` / `run_failed` / `run_interrupted`）豁免此配额检查**（自身仍受 `MaxEventBytes` 限制），保证超限后生产者仍能正常结束本轮；
    - `MaxHistoryBytes`（默认 `8 MiB` / 会话）+ `HistoryTTL`（默认 `15m`）：仅对已完结历史区事件执行 FIFO 淘汰，推进 `earliest_seq`。
 
 ### 1.4 每会话独立 `epoch` 与 `MetaTTL`
@@ -64,6 +66,7 @@
 当客户端首次打开历史会话，或收到断层通知回源业务主库同步历史时，通过因果水位线消除漏读与重复：
 
 ### 2.1 写入侧顺序约定（Worker $\rightarrow$ Seamline $\rightarrow$ 业务主库）
+0. **一轮开始时先发 `run_started`**：这一轮之后的事件才会进入活跃区锁定（§1.3）。
 1. **先发布定稿终态至 Seamline**：一轮 Run 完成时，Worker 发布 `run_finished` 事件至 Seamline，获取返回的会话水位线 `seamline_cursor = "<epoch>:<seq>"`（例如 `"9f8e7d6c5b4a:520"`）。
 2. **携带游标同事务落业务主库**：Worker（或业务后端）将该轮完整消息/工具记录写入主数据库时，在**同一数据库事务**中更新会话的 `last_seamline_cursor = "9f8e7d6c5b4a:520"`。
 
