@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -98,9 +95,6 @@ func newRunID() string {
 // run_interrupted so the session does not wait for the idle timeout.
 func runSimulation(ctx context.Context, cfg simConfig, logger *slog.Logger) (model.PublishResult, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	if err := createSession(ctx, client, cfg.base, cfg.session); err != nil {
-		return model.PublishResult{}, fmt.Errorf("create session: %w", err)
-	}
 	pub := &publisher{client: client, endpoint: eventsURL(cfg.base, cfg.session), runID: cfg.runID, attempts: cfg.attempts}
 
 	if _, err := pub.publish(ctx, model.TypeRunStarted, map[string]string{"run_id": cfg.runID}); err != nil {
@@ -178,27 +172,6 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 
 func eventsURL(base, sessionID string) string {
 	return fmt.Sprintf("%s/v1/sessions/%s/events", base, url.PathEscape(sessionID))
-}
-
-func createSession(ctx context.Context, client *http.Client, base, sessionID string) error {
-	payload, _ := json.Marshal(map[string]string{"session_id": sessionID})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/sessions", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		return &statusError{code: resp.StatusCode, body: strings.TrimSpace(string(raw))}
-	}
-	return nil
 }
 
 func chunkText(text string) []string {
