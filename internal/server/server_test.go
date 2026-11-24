@@ -179,9 +179,10 @@ func (c *sseClient) nextEvent(t *testing.T, timeout time.Duration) (sseFrame, mo
 	}
 }
 
-func newTestEnv(t *testing.T, bCfg broker.Config, sCfg server.Config) (*broker.Broker, *httptest.Server) {
+// newTestEnv starts a server whose session streams all get the given epoch.
+func newTestEnv(t *testing.T, epoch string, bCfg broker.Config, sCfg server.Config) (*broker.Broker, *httptest.Server) {
 	t.Helper()
-	store := storage.NewMemoryStorage()
+	store := storage.NewMemoryStorage(storage.WithEpochSource(func() string { return epoch }))
 	brk := broker.New(store, bCfg)
 	srv := httptest.NewServer(server.NewHandler(brk, sCfg))
 	t.Cleanup(func() {
@@ -272,7 +273,7 @@ func extractPayloadContent(t *testing.T, raw json.RawMessage) string {
 }
 
 func TestMidStreamDisconnectAndReconnectWithLastEventID(t *testing.T) {
-	brk, srv := newTestEnv(t, broker.Config{Epoch: "ep1234"}, server.Config{
+	_, srv := newTestEnv(t, "ep1234", broker.Config{}, server.Config{
 		KeepaliveInterval: 5 * time.Second,
 		EnableDemo:        true,
 	})
@@ -400,8 +401,8 @@ func TestMidStreamDisconnectAndReconnectWithLastEventID(t *testing.T) {
 	if compactedFrame.Event != "record" {
 		t.Fatalf("expected finalized record frame, got %q", compactedFrame.Event)
 	}
-	if compactedFrame.ID != fmt.Sprintf("%s:2", brk.Epoch()) {
-		t.Fatalf("expected SSE id=%s:2, got %q", brk.Epoch(), compactedFrame.ID)
+	if compactedFrame.ID != "ep1234:2" {
+		t.Fatalf("expected SSE id=ep1234:2, got %q", compactedFrame.ID)
 	}
 	if compactedEv.Offset != 2 || compactedEv.StreamID != "turn-1" {
 		t.Fatalf("unexpected compacted record metadata: %+v", compactedEv)
@@ -416,7 +417,7 @@ func TestMidStreamDisconnectAndReconnectWithLastEventID(t *testing.T) {
 }
 
 func TestFullPageReloadMidStreamAndCompactionInspect(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "f5epoch"}, server.Config{
+	_, srv := newTestEnv(t, "f5epoch", broker.Config{}, server.Config{
 		KeepaliveInterval: 5 * time.Second,
 	})
 
@@ -507,7 +508,7 @@ func TestFullPageReloadMidStreamAndCompactionInspect(t *testing.T) {
 }
 
 func TestSSEKeepaliveHeartbeat(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "hb0001"}, server.Config{
+	_, srv := newTestEnv(t, "hb0001", broker.Config{}, server.Config{
 		KeepaliveInterval: 30 * time.Millisecond,
 	})
 
@@ -533,14 +534,14 @@ func TestSSEKeepaliveHeartbeat(t *testing.T) {
 }
 
 func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "err999"}, server.Config{
+	_, srv := newTestEnv(t, "err999", broker.Config{InstanceID: "inst-err999"}, server.Config{
 		EnableDemo: true,
 	})
 
-	// 1. Healthz check.
+	// 1. Healthz reports the broker instance (session cursors carry per-session epochs).
 	var hBody map[string]string
 	doGetJSON(t, srv.URL+"/healthz", http.StatusOK, &hBody)
-	if hBody["status"] != "ok" || hBody["epoch"] != "err999" {
+	if hBody["status"] != "ok" || hBody["instance_id"] != "inst-err999" {
 		t.Fatalf("unexpected /healthz response: %+v", hBody)
 	}
 
@@ -670,7 +671,6 @@ func TestSlowSubscriberEmitsSSEErrorFrame(t *testing.T) {
 	store := storage.NewMemoryStorage()
 	brk := broker.New(store, broker.Config{
 		SubscriberBufferSize: 2,
-		Epoch:                "slow01",
 	})
 	defer func() {
 		_ = brk.Close()
@@ -725,7 +725,7 @@ func TestSlowSubscriberEmitsSSEErrorFrame(t *testing.T) {
 }
 
 func TestEpochMismatchResetsCursorToZero(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "newepoch"}, server.Config{
+	_, srv := newTestEnv(t, "newepoch", broker.Config{}, server.Config{
 		KeepaliveInterval: 5 * time.Second,
 	})
 

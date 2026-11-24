@@ -15,9 +15,16 @@ func (b *Broker) sweepLoop() {
 		case <-b.doneCh:
 			return
 		case <-ticker.C:
-			b.evictIdleActors(time.Now())
+			b.sweepOnce(time.Now())
 		}
 	}
+}
+
+// sweepOnce runs one maintenance pass: evict idle actors, then keep live sessions' streams
+// alive and let storage apply its retention.
+func (b *Broker) sweepOnce(now time.Time) {
+	b.evictIdleActors(now)
+	b.maintainStorage(now)
 }
 
 func (b *Broker) evictIdleActors(now time.Time) {
@@ -71,4 +78,24 @@ func (b *Broker) flushDirtyActorMeta(actor *sessionActor) {
 	if err := b.store.SaveMeta(context.Background(), actor.meta); err == nil {
 		actor.metaPersisted = true
 	}
+}
+
+func (b *Broker) liveSessionIDs() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	ids := make([]string, 0, len(b.actors))
+	for id := range b.actors {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// maintainStorage refreshes the idle deadline of every live session's stream (so a stream with
+// attached subscribers never expires underneath them) and then lets storage apply retention.
+func (b *Broker) maintainStorage(now time.Time) {
+	ctx := context.Background()
+	for _, id := range b.liveSessionIDs() {
+		_ = b.store.Touch(ctx, id)
+	}
+	_ = b.store.Sweep(ctx, now)
 }

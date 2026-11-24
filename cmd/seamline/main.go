@@ -54,7 +54,7 @@ func main() {
 	go func() {
 		logger.Info("seamline server listening",
 			"addr", *addr,
-			"epoch", brk.Epoch(),
+			"instance_id", brk.InstanceID(),
 			"demo", *demo,
 			"sub_buffer", *subBuffer,
 			"idle_ttl", idleTTL.String(),

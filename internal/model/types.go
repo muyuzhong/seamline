@@ -81,12 +81,15 @@ type InFlightView struct {
 }
 
 type SessionMeta struct {
-	SessionID  string       `json:"session_id"`
-	Epoch      string       `json:"epoch"`
-	State      SessionState `json:"state"`
-	LastOffset uint64       `json:"last_offset"`
-	CreatedAt  time.Time    `json:"created_at"`
-	UpdatedAt  time.Time    `json:"updated_at"`
+	SessionID string       `json:"session_id"`
+	Epoch     string       `json:"epoch"`
+	State     SessionState `json:"state"`
+	// LastOffset is the highest offset ever committed in this epoch; it survives history eviction.
+	LastOffset uint64 `json:"last_offset"`
+	// EarliestOffset is the first offset still retained in the hot window (LastOffset+1 when empty).
+	EarliestOffset uint64    `json:"earliest_offset"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type SessionSnapshot struct {

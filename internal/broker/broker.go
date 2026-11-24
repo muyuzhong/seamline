@@ -32,7 +32,9 @@ type Config struct {
 	SubscriberBufferSize int           // default 128 if <= 0
 	IdleSessionTTL       time.Duration // default 30m if <= 0
 	SweepInterval        time.Duration // default 1m if <= 0
-	Epoch                string        // random 12-char hex generated on New if empty
+	// InstanceID identifies this broker process (random 12-char hex if empty). Session
+	// cursors use the per-session stream epoch from Storage, not this value.
+	InstanceID string
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -45,8 +47,8 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = defaultSweepInterval
 	}
-	if cfg.Epoch == "" {
-		cfg.Epoch = randomHex(6)
+	if cfg.InstanceID == "" {
+		cfg.InstanceID = randomHex(6)
 	}
 	return cfg
 }
@@ -54,7 +56,6 @@ func normalizeConfig(cfg Config) Config {
 type Broker struct {
 	store   storage.Storage
 	cfg     Config
-	epoch   string
 	mu      sync.RWMutex
 	closed  bool
 	doneCh  chan struct{}
@@ -67,12 +68,9 @@ func New(store storage.Storage, cfg Config) *Broker {
 	if store == nil {
 		store = storage.NewMemoryStorage()
 	}
-	cfg = normalizeConfig(cfg)
-
 	b := &Broker{
 		store:  store,
-		cfg:    cfg,
-		epoch:  cfg.Epoch,
+		cfg:    normalizeConfig(cfg),
 		doneCh: make(chan struct{}),
 		actors: make(map[string]*sessionActor),
 	}
@@ -90,8 +88,9 @@ func randomHex(numBytes int) string {
 	return hex.EncodeToString(buf)
 }
 
-func (b *Broker) Epoch() string {
-	return b.epoch
+// InstanceID identifies this broker process. It is not a session cursor epoch.
+func (b *Broker) InstanceID() string {
+	return b.cfg.InstanceID
 }
 
 func (b *Broker) isClosed() bool {
@@ -133,7 +132,18 @@ func (b *Broker) CreateSession(ctx context.Context, sessionID string) (model.Ses
 		}
 		actor.metaPersisted = true
 	}
-	return actor.meta, nil
+	meta := actor.meta
+	meta.EarliestOffset = b.earliestOffset(ctx, sessionID, meta.LastOffset)
+	return meta, nil
+}
+
+// earliestOffset reads the first retained offset from storage, falling back to an empty window.
+func (b *Broker) earliestOffset(ctx context.Context, sessionID string, lastOffset uint64) uint64 {
+	info, ok, err := b.store.Stream(ctx, sessionID)
+	if err != nil || !ok {
+		return lastOffset + 1
+	}
+	return info.EarliestOffset
 }
 
 func (b *Broker) Inspect(ctx context.Context, sessionID string) (model.SessionSnapshot, bool, error) {
@@ -164,6 +174,8 @@ func (b *Broker) Inspect(ctx context.Context, sessionID string) (model.SessionSn
 	}
 	snap := actor.snapshotLocked()
 	actor.mu.Unlock()
+
+	snap.Meta.EarliestOffset = b.earliestOffset(ctx, sessionID, snap.Meta.LastOffset)
 	return snap, true, nil
 }
 
@@ -185,11 +197,12 @@ func (b *Broker) snapshotActorPointers() ([]namedActor, error) {
 	return active, nil
 }
 
-func (b *Broker) normalizeStoredMeta(meta model.SessionMeta) model.SessionMeta {
-	if meta.Epoch != b.epoch && meta.State == model.StateRunning {
+// normalizeStoredMeta fixes metadata of sessions without a live actor: in-flight streams only
+// live inside actors, so a stored "running" state is stale.
+func normalizeStoredMeta(meta model.SessionMeta) model.SessionMeta {
+	if meta.State == model.StateRunning {
 		meta.State = model.StateIdle
 	}
-	meta.Epoch = b.epoch
 	return meta
 }
 
@@ -217,19 +230,10 @@ func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, err
 
 	byID := make(map[string]model.SessionSnapshot, len(metas))
 	for _, meta := range metas {
-		byID[meta.SessionID] = model.SessionSnapshot{
-			Meta: b.normalizeStoredMeta(meta),
-		}
+		byID[meta.SessionID] = model.SessionSnapshot{Meta: normalizeStoredMeta(meta)}
 	}
-
-	active, err := b.snapshotActorPointers()
-	if err != nil {
+	if err := b.overlayLiveActors(byID); err != nil {
 		return nil, err
-	}
-	for _, item := range active {
-		item.actor.mu.Lock()
-		byID[item.id] = item.actor.snapshotLocked()
-		item.actor.mu.Unlock()
 	}
 
 	out := make([]model.SessionSnapshot, 0, len(byID))
@@ -238,6 +242,26 @@ func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, err
 	}
 	sortSessionSnapshots(out)
 	return out, nil
+}
+
+// overlayLiveActors replaces stored snapshots with live actor state, keeping the stored window
+// start because only storage knows which records were evicted.
+func (b *Broker) overlayLiveActors(byID map[string]model.SessionSnapshot) error {
+	active, err := b.snapshotActorPointers()
+	if err != nil {
+		return err
+	}
+	for _, item := range active {
+		item.actor.mu.Lock()
+		snap := item.actor.snapshotLocked()
+		item.actor.mu.Unlock()
+		snap.Meta.EarliestOffset = snap.Meta.LastOffset + 1
+		if stored, ok := byID[item.id]; ok {
+			snap.Meta.EarliestOffset = stored.Meta.EarliestOffset
+		}
+		byID[item.id] = snap
+	}
+	return nil
 }
 
 func (b *Broker) Close() error {

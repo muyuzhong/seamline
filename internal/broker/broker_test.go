@@ -43,8 +43,8 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 	b := New(store, Config{})
 	closeBroker(t, b)
 
-	if len(b.Epoch()) != 12 {
-		t.Fatalf("expected 12-char random hex epoch, got %q", b.Epoch())
+	if len(b.InstanceID()) != 12 {
+		t.Fatalf("expected 12-char random hex instance id, got %q", b.InstanceID())
 	}
 
 	const totalChunks = 500
@@ -94,7 +94,7 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 	}
 
 	// Storage must contain EXACTLY 1 compacted Record (NOT 500!).
-	recs, err := store.ReadFrom(ctx, "session-500", 0)
+	recs, _, err := store.ReadFrom(ctx, "session-500", 0)
 	if err != nil {
 		t.Fatalf("store.ReadFrom: %v", err)
 	}
@@ -393,7 +393,7 @@ func Test50ConcurrentSubscribersZeroGapZeroDuplicate(t *testing.T) {
 	allSubsDone.Wait()
 
 	// Also verify storage compacted everything into exactly 4 records!
-	recs, err := store.ReadFrom(ctx, sessionID, 0)
+	recs, _, err := store.ReadFrom(ctx, sessionID, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
@@ -522,8 +522,8 @@ func TestIdempotentSeqRetryAndValidationErrors(t *testing.T) {
 
 func TestEpochMismatchResetsAfterOffset(t *testing.T) {
 	ctx := context.Background()
-	store := storage.NewMemoryStorage()
-	b := New(store, Config{Epoch: "epoch-curr12"})
+	store := storage.NewMemoryStorage(storage.WithEpochSource(func() string { return "epoch-curr12" }))
+	b := New(store, Config{})
 	closeBroker(t, b)
 
 	for i := 1; i <= 3; i++ {
@@ -930,7 +930,7 @@ func TestFinAppendFailureThenRetryCommits(t *testing.T) {
 		t.Fatalf("m2 Seq=0 retry must commit Offset=2 Seq=2, got res=%+v err=%v", res2, err)
 	}
 
-	recs, err := st.ReadFrom(ctx, "s", 0)
+	recs, _, err := st.ReadFrom(ctx, "s", 0)
 	if err != nil || len(recs) != 2 {
 		t.Fatalf("expected 2 committed records, got len=%d err=%v", len(recs), err)
 	}

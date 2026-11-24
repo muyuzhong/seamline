@@ -78,8 +78,8 @@ func withCORS(next http.Handler) http.Handler {
 
 func (h *handler) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status": "ok",
-		"epoch":  h.broker.Epoch(),
+		"status":      "ok",
+		"instance_id": h.broker.InstanceID(),
 	})
 }
 

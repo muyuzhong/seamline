@@ -7,10 +7,18 @@ import (
 )
 
 type Subscription struct {
+	// Epoch is the session stream epoch that every committed offset in this subscription belongs to.
 	Epoch  string
 	Events <-chan model.OutEvent
 	Cancel func()
 	Err    func() error
+}
+
+// subSnapshot is captured in the same actor.mu critical section that registers liveCh.
+type subSnapshot struct {
+	epoch    string
+	offset   uint64
+	inFlight *model.InFlightView
 }
 
 func (b *Broker) reserveSubSlot() error {
@@ -23,18 +31,21 @@ func (b *Broker) reserveSubSlot() error {
 	return nil
 }
 
-func (b *Broker) registerSubscriber(ctx context.Context, actor *sessionActor, sub *subState) (uint64, *model.InFlightView, error) {
+func (b *Broker) registerSubscriber(ctx context.Context, actor *sessionActor, sub *subState) (subSnapshot, error) {
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 
 	if err := b.checkActorPublishReady(ctx); err != nil {
-		return 0, nil, err
+		return subSnapshot{}, err
 	}
 	actor.subscribers[sub] = struct{}{}
-	snapOffset := actor.lastOffset
-	inFlightSnap := actor.inFlightViewLocked()
+	snap := subSnapshot{
+		epoch:    actor.meta.Epoch,
+		offset:   actor.lastOffset,
+		inFlight: actor.inFlightViewLocked(),
+	}
 	actor.touch()
-	return snapOffset, inFlightSnap, nil
+	return snap, nil
 }
 
 func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset uint64, afterEpoch string) (*Subscription, error) {
@@ -46,9 +57,6 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset ui
 	}
 	if sessionID == "" {
 		return nil, ErrInvalidInput
-	}
-	if afterEpoch != "" && afterEpoch != b.epoch {
-		afterOffset = 0
 	}
 
 	actor, _, err := b.acquireActor(ctx, sessionID, true, true)
@@ -67,17 +75,23 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset ui
 		evictedCh: make(chan struct{}),
 	}
 
-	snapOffset, inFlightSnap, err := b.registerSubscriber(ctx, actor, sub)
+	snap, err := b.registerSubscriber(ctx, actor, sub)
 	if err != nil {
 		b.subWg.Done()
 		return nil, err
 	}
 
+	// A cursor from another epoch of this session is replayed from the start of the retained
+	// window. An explicit cursor_reset notification replaces this in a follow-up change.
+	if afterEpoch != "" && afterEpoch != snap.epoch {
+		afterOffset = 0
+	}
+
 	outCh := make(chan model.OutEvent)
-	go b.runSubscriberPump(ctx, sessionID, actor, sub, outCh, afterOffset, snapOffset, inFlightSnap)
+	go b.runSubscriberPump(ctx, sessionID, actor, sub, outCh, afterOffset, snap)
 
 	return &Subscription{
-		Epoch:  b.epoch,
+		Epoch:  snap.epoch,
 		Events: outCh,
 		Cancel: sub.cancel,
 		Err:    sub.getErr,
@@ -101,17 +115,16 @@ func (b *Broker) runSubscriberPump(
 	sub *subState,
 	outCh chan<- model.OutEvent,
 	afterOffset uint64,
-	snapOffset uint64,
-	inFlightSnap *model.InFlightView,
+	snap subSnapshot,
 ) {
 	defer b.subWg.Done()
 	defer close(outCh)
 	defer detachSubscriber(actor, sub)
 
-	if !b.replayCatchUp(ctx, sessionID, sub, outCh, afterOffset, snapOffset, inFlightSnap) {
+	if !b.replayCatchUp(ctx, sessionID, sub, outCh, afterOffset, snap) {
 		return
 	}
-	b.drainLiveStream(ctx, sub, outCh, snapOffset, inFlightSnap)
+	b.drainLiveStream(ctx, sub, outCh, snap)
 }
 
 func (b *Broker) replayCatchUp(
@@ -120,20 +133,20 @@ func (b *Broker) replayCatchUp(
 	sub *subState,
 	outCh chan<- model.OutEvent,
 	afterOffset uint64,
-	snapOffset uint64,
-	inFlightSnap *model.InFlightView,
+	snap subSnapshot,
 ) bool {
-	if snapOffset > afterOffset {
-		if !b.replayStoredRecords(ctx, sessionID, sub, outCh, afterOffset, snapOffset) {
+	if snap.offset > afterOffset {
+		if !b.replayStoredRecords(ctx, sessionID, sub, outCh, afterOffset, snap.offset) {
 			return false
 		}
 	}
+	inFlightSnap := snap.inFlight
 	if inFlightSnap == nil || inFlightSnap.LastSeq == 0 {
 		return true
 	}
 	return b.sendOutEvent(ctx, sub, outCh, model.OutEvent{
 		Kind:      model.EventInFlightSnapshot,
-		Epoch:     b.epoch,
+		Epoch:     snap.epoch,
 		StreamID:  inFlightSnap.StreamID,
 		Seq:       inFlightSnap.LastSeq,
 		Type:      inFlightSnap.Type,
@@ -150,7 +163,7 @@ func (b *Broker) replayStoredRecords(
 	afterOffset uint64,
 	snapOffset uint64,
 ) bool {
-	recs, err := b.store.ReadFrom(ctx, sessionID, afterOffset)
+	recs, _, err := b.store.ReadFrom(ctx, sessionID, afterOffset)
 	if err != nil {
 		sub.setErr(err)
 		return false
@@ -229,9 +242,9 @@ func (b *Broker) drainLiveStream(
 	ctx context.Context,
 	sub *subState,
 	outCh chan<- model.OutEvent,
-	snapOffset uint64,
-	inFlightSnap *model.InFlightView,
+	snap subSnapshot,
 ) {
+	inFlightSnap := snap.inFlight
 	for {
 		if b.checkPumpStop(ctx, sub) {
 			return
@@ -241,7 +254,7 @@ func (b *Broker) drainLiveStream(
 			return
 		}
 		var covered bool
-		covered, inFlightSnap = isCoveredBySnapshot(ev, snapOffset, inFlightSnap)
+		covered, inFlightSnap = isCoveredBySnapshot(ev, snap.offset, inFlightSnap)
 		if covered {
 			continue
 		}

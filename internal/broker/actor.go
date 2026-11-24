@@ -143,55 +143,25 @@ func (b *Broker) getPinnedActor(sessionID string) (*sessionActor, error) {
 	return actor, nil
 }
 
-func (b *Broker) loadReconciledMeta(ctx context.Context, sessionID string) (model.SessionMeta, bool, bool, error) {
-	meta, exists, err := b.store.LoadMeta(ctx, sessionID)
-	if err != nil {
-		return model.SessionMeta{}, false, false, err
+// openStream makes sure the session stream exists in storage (creating it with a fresh epoch
+// when allowed) and reports whether it exists.
+func (b *Broker) openStream(ctx context.Context, sessionID string, create bool) (bool, error) {
+	if create {
+		_, err := b.store.EnsureStream(ctx, sessionID)
+		return err == nil, err
 	}
-
-	tailRecs, err := b.store.ReadFrom(ctx, sessionID, meta.LastOffset)
-	if err != nil {
-		return model.SessionMeta{}, false, false, err
-	}
-	if len(tailRecs) == 0 {
-		return meta, exists, false, nil
-	}
-
-	lastRec := tailRecs[len(tailRecs)-1]
-	if !exists {
-		meta = model.SessionMeta{
-			SessionID: sessionID,
-			Epoch:     b.epoch,
-			CreatedAt: tailRecs[0].CreatedAt,
-		}
-	}
-	meta.LastOffset = lastRec.Offset
-	meta.UpdatedAt = lastRec.CreatedAt
-	meta.State = model.StateFromRecordType(lastRec.Type)
-	return meta, true, true, nil
+	_, ok, err := b.store.Stream(ctx, sessionID)
+	return ok, err
 }
 
-func (b *Broker) newCandidateActor(sessionID string, meta model.SessionMeta, exists bool, needsHeal bool) *sessionActor {
-	if exists {
-		meta.Epoch = b.epoch
-		if meta.State == model.StateRunning {
-			meta.State = model.StateIdle
-		}
-	} else {
-		now := time.Now().UTC()
-		meta = model.SessionMeta{
-			SessionID:  sessionID,
-			Epoch:      b.epoch,
-			State:      model.StateIdle,
-			LastOffset: 0,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}
+func (b *Broker) newCandidateActor(meta model.SessionMeta, saved bool) *sessionActor {
+	// In-flight streams only live inside actors, so a freshly hydrated actor is never running.
+	if meta.State == model.StateRunning {
+		meta.State = model.StateIdle
 	}
-
 	actor := &sessionActor{
 		meta:          meta,
-		metaPersisted: exists && !needsHeal,
+		metaPersisted: saved,
 		lastOffset:    meta.LastOffset,
 		subscribers:   make(map[*subState]struct{}),
 	}
@@ -237,26 +207,23 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string, createIfMis
 		return actor, true, nil
 	}
 
-	// Load from storage outside b.mu so storage I/O never blocks other sessions.
-	meta, exists, needsHeal, err := b.loadReconciledMeta(ctx, sessionID)
+	// Storage I/O happens outside b.mu so it never blocks other sessions.
+	exists, err := b.openStream(ctx, sessionID, createIfMissing)
+	if err != nil || !exists {
+		return nil, false, err
+	}
+	meta, saved, err := b.store.LoadMeta(ctx, sessionID)
 	if err != nil {
 		return nil, false, err
 	}
-	if !exists && !createIfMissing {
-		return nil, false, nil
-	}
 
-	candidate := b.newCandidateActor(sessionID, meta, exists, needsHeal)
+	candidate := b.newCandidateActor(meta, saved)
 	actor, isNewCandidate, err := b.registerOrPinActor(sessionID, candidate)
 	if err != nil {
 		return nil, false, err
 	}
-	if !isNewCandidate {
-		return actor, true, nil
-	}
-
-	if persistInitialMeta || needsHeal {
+	if isNewCandidate && persistInitialMeta {
 		candidate.ensureInitialMetaPersisted(ctx, b.store)
 	}
-	return candidate, true, nil
+	return actor, true, nil
 }

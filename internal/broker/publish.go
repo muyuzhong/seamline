@@ -130,7 +130,7 @@ func (b *Broker) publishAtomicLocked(
 	nextOffset := actor.lastOffset + 1
 	rec := model.Record{
 		Offset:    nextOffset,
-		Epoch:     b.epoch,
+		Epoch:     actor.meta.Epoch,
 		Type:      req.Type,
 		Payload:   payload,
 		CreatedAt: now,
@@ -141,7 +141,6 @@ func (b *Broker) publishAtomicLocked(
 
 	// Point of no return: record is committed in storage. Advance memory state and fan out first.
 	actor.lastOffset = nextOffset
-	actor.meta.Epoch = b.epoch
 	actor.meta.LastOffset = nextOffset
 	actor.meta.UpdatedAt = now
 	actor.meta.State = nextAtomicState(req.Type, actor.inFlight != nil, actor.meta.State)
@@ -158,7 +157,7 @@ func (b *Broker) publishAtomicLocked(
 
 	return model.PublishResult{
 		CommittedOffset: rec.Offset,
-		Epoch:           b.epoch,
+		Epoch:           actor.meta.Epoch,
 	}, nil
 }
 
@@ -178,13 +177,13 @@ func (b *Broker) isCompactedDuplicateLocked(actor *sessionActor, req model.Publi
 	}
 	return model.PublishResult{
 		CommittedOffset: actor.lastCompactedOffset,
-		Epoch:           b.epoch,
+		Epoch:           actor.meta.Epoch,
 		InFlightSeq:     actor.lastCompactedSeq,
 		Deduplicated:    true,
 	}, true
 }
 
-func (b *Broker) resolveStreamSeqLocked(inFlight *inFlightState, reqSeq uint64) (uint64, *model.PublishResult, error) {
+func resolveStreamSeq(epoch string, inFlight *inFlightState, reqSeq uint64) (uint64, *model.PublishResult, error) {
 	if inFlight == nil {
 		if reqSeq > 1 {
 			return 0, nil, ErrSequenceGap
@@ -196,7 +195,7 @@ func (b *Broker) resolveStreamSeqLocked(inFlight *inFlightState, reqSeq uint64) 
 	}
 	if reqSeq <= inFlight.lastSeq {
 		return 0, &model.PublishResult{
-			Epoch:        b.epoch,
+			Epoch:        epoch,
 			InFlightSeq:  inFlight.lastSeq,
 			Deduplicated: true,
 		}, nil
@@ -234,7 +233,7 @@ func (b *Broker) publishStreamLocked(
 		return model.PublishResult{}, ErrStreamConflict
 	}
 
-	seq, dupInFlight, err := b.resolveStreamSeqLocked(actor.inFlight, req.Seq)
+	seq, dupInFlight, err := resolveStreamSeq(actor.meta.Epoch, actor.inFlight, req.Seq)
 	if err != nil {
 		return model.PublishResult{}, err
 	}
@@ -279,12 +278,11 @@ func (b *Broker) appendStreamDeltaLocked(
 
 	needMetaSave := !actor.metaPersisted || actor.meta.State != model.StateRunning
 	actor.meta.State = model.StateRunning
-	actor.meta.Epoch = b.epoch
 	actor.meta.UpdatedAt = now
 
 	actor.fanOutLocked(model.OutEvent{
 		Kind:      model.EventDelta,
-		Epoch:     b.epoch,
+		Epoch:     actor.meta.Epoch,
 		StreamID:  req.StreamID,
 		Seq:       cand.seq,
 		Type:      cand.evType,
@@ -297,7 +295,7 @@ func (b *Broker) appendStreamDeltaLocked(
 	}
 
 	return model.PublishResult{
-		Epoch:       b.epoch,
+		Epoch:       actor.meta.Epoch,
 		InFlightSeq: cand.seq,
 	}
 }
@@ -332,7 +330,7 @@ func (b *Broker) commitFinStreamLocked(
 	nextOffset := actor.lastOffset + 1
 	rec := model.Record{
 		Offset:    nextOffset,
-		Epoch:     b.epoch,
+		Epoch:     actor.meta.Epoch,
 		StreamID:  req.StreamID,
 		Type:      recordType,
 		Payload:   recordPayload,
@@ -348,14 +346,13 @@ func (b *Broker) commitFinStreamLocked(
 	actor.lastCompactedOffset = rec.Offset
 	actor.inFlight = nil
 	actor.lastOffset = nextOffset
-	actor.meta.Epoch = b.epoch
 	actor.meta.State = model.StateFromRecordType(recordType)
 	actor.meta.LastOffset = nextOffset
 	actor.meta.UpdatedAt = now
 
 	actor.fanOutLocked(model.OutEvent{
 		Kind:      model.EventDelta,
-		Epoch:     b.epoch,
+		Epoch:     actor.meta.Epoch,
 		StreamID:  req.StreamID,
 		Seq:       cand.seq,
 		Type:      cand.evType,
@@ -376,7 +373,7 @@ func (b *Broker) commitFinStreamLocked(
 
 	return model.PublishResult{
 		CommittedOffset: rec.Offset,
-		Epoch:           b.epoch,
+		Epoch:           actor.meta.Epoch,
 		InFlightSeq:     cand.seq,
 	}, nil
 }
