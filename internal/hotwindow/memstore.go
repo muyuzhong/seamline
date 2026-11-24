@@ -63,13 +63,6 @@ func randomEpoch() string {
 	return hex.EncodeToString(buf[:])
 }
 
-func cloneEvent(ev model.Event) model.Event {
-	if ev.Payload != nil {
-		ev.Payload = append(json.RawMessage(nil), ev.Payload...)
-	}
-	return ev
-}
-
 func checkArgs(ctx context.Context, sessionID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -113,26 +106,26 @@ func (m *MemoryStorage) Stream(ctx context.Context, sessionID string) (StreamInf
 	return s.info(sessionID), true, nil
 }
 
-func (m *MemoryStorage) Append(ctx context.Context, sessionID string, c Commit) error {
+func (m *MemoryStorage) Append(ctx context.Context, sessionID, eventType string, payload json.RawMessage, now time.Time) (model.Event, StreamInfo, error) {
 	if err := checkArgs(ctx, sessionID); err != nil {
-		return err
+		return model.Event{}, StreamInfo{}, err
 	}
-	now := m.clock()
+	touched := m.clock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	s, ok := m.streams[sessionID]
 	if !ok {
-		return ErrStreamNotFound
+		return model.Event{}, StreamInfo{}, ErrStreamNotFound
 	}
-	if err := s.check(c, m.retention); err != nil {
-		return err
+	ev, err := s.appendEvent(eventType, payload, now, m.retention)
+	if err != nil {
+		return model.Event{}, StreamInfo{}, err
 	}
-	s.apply(c)
-	s.touchedAt = now
-	s.evict(c.Event.CreatedAt, m.retention)
-	return nil
+	s.touchedAt = touched
+	s.evict(now, m.retention)
+	return ev, s.info(sessionID), nil
 }
 
 func (m *MemoryStorage) ReadAfter(ctx context.Context, sessionID string, afterSeq uint64) ([]model.Event, StreamInfo, error) {
@@ -149,10 +142,8 @@ func (m *MemoryStorage) ReadAfter(ctx context.Context, sessionID string, afterSe
 	idx := sort.Search(len(s.events), func(i int) bool {
 		return s.events[i].Seq > afterSeq
 	})
-	out := make([]model.Event, len(s.events)-idx)
-	for i, ev := range s.events[idx:] {
-		out[i] = cloneEvent(ev)
-	}
+	// Stored events are immutable (Append keeps a private payload copy), so readers share them.
+	out := append([]model.Event(nil), s.events[idx:]...)
 	return out, s.info(sessionID), nil
 }
 

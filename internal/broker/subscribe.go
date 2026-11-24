@@ -195,7 +195,7 @@ func (b *Broker) sendOut(ctx context.Context, sub *subState, outCh chan<- model.
 	if b.checkPumpStop(ctx, sub) {
 		return false
 	}
-	d.Event.Payload = normalizeRaw(d.Event.Payload)
+	d.Event.Payload = payloadOrNil(d.Event.Payload)
 	select {
 	case outCh <- d:
 		return true

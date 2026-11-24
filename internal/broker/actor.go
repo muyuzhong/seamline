@@ -49,7 +49,6 @@ type sessionActor struct {
 	epoch             string
 	latestSeq         uint64
 	activeRunStartSeq uint64
-	state             model.SessionState
 	subscribers       map[*subState]struct{}
 	lastActiveNano    atomic.Int64
 	pins              atomic.Int32
@@ -139,7 +138,6 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string) (*sessionAc
 		epoch:             info.Epoch,
 		latestSeq:         info.LatestSeq,
 		activeRunStartSeq: info.ActiveRunStartSeq,
-		state:             info.State,
 		subscribers:       make(map[*subState]struct{}),
 	}
 	candidate.pins.Store(1)
