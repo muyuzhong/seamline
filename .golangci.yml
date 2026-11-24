@@ -1,0 +1,61 @@
+# Seamline golangci-lint v2 configuration
+# Modeled after centrifugal/centrifugo & entireio/cli: practical, high-signal
+# concurrency, HTTP/SSE resource safety, and error-handling checks with zero
+# pedantic whitespace/naming false positives.
+version: "2"
+
+run:
+  timeout: 5m
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    - bodyclose    # Ensure all HTTP response bodies are closed (prod & tests)
+    - errcheck     # Catch unhandled error returns
+    - errorlint    # Enforce %w wrapping and errors.Is / errors.As (Go 1.13+)
+    - gocognit     # Enforce human-readable cognitive complexity (<= 15 per prod func)
+    - govet        # Official Go vet static analyzer suite
+    - ineffassign  # Detect ineffectual variable assignments
+    - misspell     # Catch common English typos in comments and strings
+    - staticcheck  # Includes SA* bug checks + S1* (gosimple) simplifications in v2
+    - unconvert    # Remove redundant type conversions
+    - unused       # Flag dead types, constants, functions, and struct fields
+  settings:
+    errcheck:
+      check-type-assertions: true
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    gocognit:
+      min-complexity: 15
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST1000" # Package doc comments not required on internal packages
+        - "-ST1003" # Avoid noisy identifier initialismbikeshedding
+        - "-ST1016" # Receiver naming flexibility
+        - "-ST1020" # Exported method comment prefix phrasing
+        - "-ST1021" # Exported type comment prefix phrasing
+        - "-ST1022" # Exported var/const comment prefix phrasing
+        - "-QF*"    # Disable IDE quickfix style hints while keeping SA* & S1* (gosimple)
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      - path: "_test\\.go$"
+        linters:
+          - gocognit
+      - path: "_test\\.go$"
+        linters:
+          - errorlint
+        text: "non-wrapping format verb for fmt.Errorf"
+
+formatters:
+  enable:
+    - gofmt
