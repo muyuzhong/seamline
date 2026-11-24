@@ -118,7 +118,7 @@ func randomEpoch() string {
 }
 
 func recordSize(r model.Record) int64 {
-	return int64(len(r.Payload)+len(r.Meta)+len(r.Type)+len(r.StreamID)) + recordOverheadBytes
+	return int64(len(r.Payload)+len(r.Meta)+len(r.Type)+len(r.StreamID)+len(r.Sealed)) + recordOverheadBytes
 }
 
 func cloneRaw(raw json.RawMessage) json.RawMessage {

@@ -26,6 +26,10 @@ func StateFromRecordType(recordType string) SessionState {
 	}
 }
 
+// SealedIdleTimeout marks a Record that the broker compacted on its own because the
+// in-flight stream received no chunk within the configured idle timeout.
+const SealedIdleTimeout = "idle_timeout"
+
 type Record struct {
 	Offset    uint64          `json:"offset"`
 	Epoch     string          `json:"epoch"`
@@ -33,6 +37,7 @@ type Record struct {
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
 	Meta      json.RawMessage `json:"meta,omitempty"`
+	Sealed    string          `json:"sealed,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
@@ -91,6 +96,7 @@ type OutEvent struct {
 	Delta     string          `json:"delta,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	Meta      json.RawMessage `json:"meta,omitempty"`
+	Sealed    string          `json:"sealed,omitempty"`
 	Fin       bool            `json:"fin,omitempty"`
 	Reset     *CursorReset    `json:"reset,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`

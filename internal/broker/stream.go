@@ -268,3 +268,32 @@ func (b *Broker) commitFinStreamLocked(
 		InFlightSeq:     cand.seq,
 	}, nil
 }
+
+// sealStreamLocked compacts an in-flight stream whose producer went silent into a Record marked
+// Sealed=idle_timeout, so the partial text is kept and its slot and quota are released.
+func (b *Broker) sealStreamLocked(actor *sessionActor, f *inFlightState, now time.Time) error {
+	payload, err := marshalContentPayload(f.mergedBuf.String())
+	if err != nil {
+		return err
+	}
+	rec := model.Record{
+		Offset:    actor.lastOffset + 1,
+		Epoch:     actor.meta.Epoch,
+		StreamID:  f.streamID,
+		Type:      f.typ,
+		Payload:   payload,
+		Meta:      f.meta,
+		Sealed:    model.SealedIdleTimeout,
+		CreatedAt: now.UTC(),
+	}
+	ctx := context.Background()
+	if err := b.store.Append(ctx, actor.meta.SessionID, rec); err != nil {
+		return err
+	}
+
+	// Point of no return.
+	b.finishStreamLocked(actor, f.streamID, f.lastSeq, rec, now)
+	actor.fanOutLocked(committedEvent(rec))
+	actor.saveMetaBestEffortLocked(ctx, b.store)
+	return nil
+}

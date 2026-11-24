@@ -37,6 +37,7 @@ const (
 	DefaultMaxConcurrentStreams = 8
 	DefaultMaxEventBytes        = 256 << 10
 	DefaultMaxInFlightBytes     = 2 << 20
+	DefaultInFlightIdleTimeout  = 2 * time.Minute
 	DefaultIdempotencyWindow    = 5 * time.Minute
 )
 
@@ -53,6 +54,8 @@ type Config struct {
 	MaxEventBytes int
 	// MaxInFlightBytes bounds the merged text + meta of all in-flight streams of a session (default 2 MiB).
 	MaxInFlightBytes int
+	// InFlightIdleTimeout seals an in-flight stream that received no chunk for this long (default 2m).
+	InFlightIdleTimeout time.Duration
 	// IdempotencyWindow is how long a finalized stream keeps deduplicating retries (default 5m).
 	IdempotencyWindow time.Duration
 }
@@ -71,6 +74,7 @@ func normalizeConfig(cfg Config) Config {
 	cfg.MaxConcurrentStreams = orDefault(cfg.MaxConcurrentStreams, DefaultMaxConcurrentStreams)
 	cfg.MaxEventBytes = orDefault(cfg.MaxEventBytes, DefaultMaxEventBytes)
 	cfg.MaxInFlightBytes = orDefault(cfg.MaxInFlightBytes, DefaultMaxInFlightBytes)
+	cfg.InFlightIdleTimeout = orDefault(cfg.InFlightIdleTimeout, DefaultInFlightIdleTimeout)
 	cfg.IdempotencyWindow = orDefault(cfg.IdempotencyWindow, DefaultIdempotencyWindow)
 	if cfg.InstanceID == "" {
 		cfg.InstanceID = randomHex(6)

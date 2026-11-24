@@ -58,6 +58,7 @@ func committedEvent(rec model.Record) model.OutEvent {
 		Type:      rec.Type,
 		Payload:   rec.Payload,
 		Meta:      rec.Meta,
+		Sealed:    rec.Sealed,
 		CreatedAt: rec.CreatedAt,
 	}
 }
