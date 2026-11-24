@@ -59,22 +59,3 @@ func TestIdempotencyKey(t *testing.T) {
 		t.Fatalf("expected 4 stored events, got %d", len(events))
 	}
 }
-
-func TestWindowIndexReinsertSurvivesPrune(t *testing.T) {
-	w := newWindowIndex[int](10 * time.Second)
-	t0 := time.Unix(1000, 0)
-	w.put("k", 1, t0)
-	w.put("k", 2, t0.Add(5*time.Second))      // re-insert extends the deadline to t0+15s
-	w.put("other", 3, t0.Add(11*time.Second)) // prunes k's first, stale order slot
-
-	if v, ok := w.get("k", t0.Add(12*time.Second)); !ok || v != 2 {
-		t.Fatalf("re-inserted key must survive pruning of its stale slot: v=%d ok=%v", v, ok)
-	}
-	if _, ok := w.get("k", t0.Add(15*time.Second)); ok {
-		t.Fatalf("key must expire at its latest deadline")
-	}
-	w.put("x", 0, t0.Add(30*time.Second))
-	if w.len() != 1 {
-		t.Fatalf("expired entries must be pruned, len=%d", w.len())
-	}
-}

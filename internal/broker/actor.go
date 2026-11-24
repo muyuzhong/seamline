@@ -48,11 +48,18 @@ type sessionActor struct {
 	epoch             string
 	latestSeq         uint64
 	activeRunStartSeq uint64
-	runActiveAt       time.Time // last publish into the active run (ActiveRunIdleTimeout)
-	idempotent        *windowIndex[uint64]
+	runActiveAt       time.Time            // last publish into the active run (ActiveRunIdleTimeout)
+	idempotent        map[string]idemEntry // committed idempotency keys; created on first use
+	idemPruneAt       time.Time            // when expired keys are swept next
 	subscribers       map[*subState]struct{}
 	lastActiveNano    atomic.Int64
 	pins              atomic.Int32
+}
+
+// idemEntry is the seq an idempotency_key committed, remembered until expiresAt.
+type idemEntry struct {
+	seq       uint64
+	expiresAt time.Time
 }
 
 func (a *sessionActor) touch() {
@@ -141,7 +148,6 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string) (*sessionAc
 		latestSeq:         info.LatestSeq,
 		activeRunStartSeq: info.ActiveRunStartSeq,
 		runActiveAt:       time.Now(),
-		idempotent:        newWindowIndex[uint64](b.cfg.IdempotencyWindow),
 		subscribers:       make(map[*subState]struct{}),
 	}
 	candidate.pins.Store(1)
