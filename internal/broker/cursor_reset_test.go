@@ -148,3 +148,50 @@ func TestReplayGapEndsWithInsufficientState(t *testing.T) {
 		})
 	}
 }
+
+// evictingStore runs a hook once, at the start of the next ReadAfter, to publish between the
+// subscription snapshot and the catch-up read.
+type evictingStore struct {
+	*hotwindow.MemoryStorage
+	beforeRead atomic.Pointer[func()]
+}
+
+func (s *evictingStore) ReadAfter(ctx context.Context, id string, after uint64) ([]model.Event, hotwindow.StreamInfo, error) {
+	if hook := s.beforeRead.Swap(nil); hook != nil {
+		(*hook)()
+	}
+	return s.MemoryStorage.ReadAfter(ctx, id, after)
+}
+
+// A caught-up cursor must not be reported as expired when publishes after the snapshot evicted
+// snapSeq+1 from storage before the catch-up read: those events arrive through liveCh.
+func TestCaughtUpCursorNotExpiredByPublishesAfterSnapshot(t *testing.T) {
+	payload := textPayload(strings.Repeat("x", 300))
+	size := int64(len(payload) + len("msg") + 64)
+	st := &evictingStore{MemoryStorage: hotwindow.NewMemoryStorage(
+		hotwindow.WithEpochSource(fixedEpochs("ep-A")),
+		hotwindow.WithRetention(hotwindow.Retention{MaxHistoryBytes: size + size/2}),
+	)}
+	b := New(st, Config{})
+	closeBroker(t, b)
+	const sid = "caught-up"
+	mustPublish(t, b, sid, ev("msg", payload))
+	mustPublish(t, b, sid, ev("msg", payload))
+
+	hook := func() {
+		// Seqs 3 and 4 evict 2 and 3, so the window is [4, 4] when the replay reads it.
+		mustPublish(t, b, sid, ev("msg", payload))
+		mustPublish(t, b, sid, ev("msg", payload))
+	}
+	st.beforeRead.Store(&hook)
+	sub, err := b.Subscribe(context.Background(), sid, 2, "ep-A")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Cancel()
+	for _, want := range []uint64{3, 4} {
+		if got := recvEvent(t, sub); got.Seq != want {
+			t.Fatalf("got seq %d, want %d", got.Seq, want)
+		}
+	}
+}

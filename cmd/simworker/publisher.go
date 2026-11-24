@@ -24,14 +24,18 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("status %d: %s", e.code, e.body)
 }
 
-// retryable reports whether a publish may be retried: transport errors and 5xx responses are,
-// 4xx responses (invalid event, quota) are not.
-func retryable(err error) bool {
+// retryable reports whether a publish may be retried: nothing is once the caller's context is
+// done; otherwise transport errors (including http.Client.Timeout, which also matches
+// context.DeadlineExceeded) and 5xx responses are, 4xx responses (invalid event, quota) are not.
+func retryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	var se *statusError
 	if errors.As(err, &se) {
 		return se.code >= http.StatusInternalServerError
 	}
-	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+	return true
 }
 
 // publisher posts the events of one run. Every event gets the idempotency key <run_id>:<n>, so a
@@ -54,7 +58,7 @@ func (p *publisher) publish(ctx context.Context, eventType string, payload any) 
 
 	for attempt := 1; ; attempt++ {
 		res, err := postEvent(ctx, p.client, p.endpoint, req)
-		if err == nil || attempt >= p.attempts || !retryable(err) {
+		if err == nil || attempt >= p.attempts || !retryable(ctx, err) {
 			return res, err
 		}
 		if !sleepWithContext(ctx, time.Duration(attempt)*100*time.Millisecond) {
