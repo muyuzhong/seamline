@@ -57,16 +57,36 @@ type PublishResult struct {
 	Deduplicated bool   `json:"deduplicated,omitempty"`
 }
 
+// Cursor reset reasons carried by CursorReset.
+const (
+	ResetEpochMismatch = "epoch_mismatch"
+	ResetCursorExpired = "cursor_expired"
+	ResetCursorAhead   = "cursor_ahead"
+)
+
+// CursorReset tells a resuming subscriber that its cursor cannot be continued gaplessly.
+type CursorReset struct {
+	Reason            string `json:"reason"`
+	RequestedEpoch    string `json:"requested_epoch"`
+	RequestedSeq      uint64 `json:"requested_seq"`
+	CurrentEpoch      string `json:"current_epoch"`
+	EarliestSeq       uint64 `json:"earliest_seq"`
+	LatestSeq         uint64 `json:"latest_seq"`
+	ActiveRunStartSeq uint64 `json:"active_run_start_seq"`
+}
+
 type DeliveryKind string
 
 const (
-	DeliveryEvent DeliveryKind = "event"
+	DeliveryEvent       DeliveryKind = "event"
+	DeliveryCursorReset DeliveryKind = "cursor_reset"
 )
 
-// Delivery is one item of a subscription.
+// Delivery is one item of a subscription: a business event or a cursor reset notice.
 type Delivery struct {
 	Kind  DeliveryKind
 	Event Event
+	Reset *CursorReset
 }
 
 type SessionMeta struct {

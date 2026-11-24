@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/hotwindow"
+	"github.com/muyuzhong/seamline/internal/model"
 )
 
 func TestSessionEpochSurvivesHistoryTTLButRotatesAfterMetaTTL(t *testing.T) {
@@ -30,12 +31,21 @@ func TestSessionEpochSurvivesHistoryTTLButRotatesAfterMetaTTL(t *testing.T) {
 	if err := store.Sweep(ctx, t0.Add(2*time.Minute)); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if meta := mustInspect(t, b, sid); meta.Epoch != "ep-1" || meta.EarliestSeq != 3 || meta.LatestSeq != 2 {
-		t.Fatalf("after HistoryTTL want an empty window of ep-1 at seq 2, got %+v", meta)
+	sub, err := b.Subscribe(ctx, sid, 1, "ep-1")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	want := model.CursorReset{Reason: model.ResetCursorExpired, RequestedEpoch: "ep-1", RequestedSeq: 1, CurrentEpoch: "ep-1", EarliestSeq: 3, LatestSeq: 2}
+	if d := recv(t, sub, 2*time.Second); d.Kind != model.DeliveryCursorReset || *d.Reset != want {
+		t.Fatalf("after HistoryTTL want reset %+v, got %+v (%+v)", want, d, d.Reset)
 	}
 	if res := mustPublish(t, b, sid, ev("msg", textPayload("three"))); res.Seq != 3 || res.Epoch != "ep-1" {
 		t.Fatalf("seq must continue after history eviction: %+v", res)
 	}
+	if got := recvEvent(t, sub); got.Seq != 3 {
+		t.Fatalf("want live event 3, got %+v", got)
+	}
+	sub.Cancel()
 
 	waitFor(t, "idle actor eviction", func() bool { return b.activeActorCount() == 0 })
 
@@ -45,6 +55,18 @@ func TestSessionEpochSurvivesHistoryTTLButRotatesAfterMetaTTL(t *testing.T) {
 	}
 	if res := mustPublish(t, b, sid, ev("msg", textPayload("new life"))); res.Epoch != "ep-2" || res.Seq != 1 {
 		t.Fatalf("recreated session must start a new epoch at seq 1: %+v", res)
+	}
+	sub2, err := b.Subscribe(ctx, sid, 3, "ep-1")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub2.Cancel()
+	want = model.CursorReset{Reason: model.ResetEpochMismatch, RequestedEpoch: "ep-1", RequestedSeq: 3, CurrentEpoch: "ep-2", EarliestSeq: 1, LatestSeq: 1}
+	if d := recv(t, sub2, 2*time.Second); d.Kind != model.DeliveryCursorReset || *d.Reset != want {
+		t.Fatalf("after MetaTTL want reset %+v, got %+v (%+v)", want, d, d.Reset)
+	}
+	if got := recvEvent(t, sub2); got.Seq != 1 || got.Epoch != "ep-2" {
+		t.Fatalf("want event ep-2:1 after the reset, got %+v", got)
 	}
 }
 

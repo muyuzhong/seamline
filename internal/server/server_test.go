@@ -551,3 +551,28 @@ func TestSlowSubscriberEmitsSSEErrorFrame(t *testing.T) {
 		t.Fatalf("must not emit a colliding event: error frame:\n%s", wire)
 	}
 }
+
+func TestCursorResetFrameOnEpochMismatch(t *testing.T) {
+	_, srv := newTestEnv(t, "newepoch", broker.Config{}, server.Config{KeepaliveInterval: 5 * time.Second})
+	doPostJSON(t, srv.URL+"/v1/sessions/ep-sess/events", ev("user_message", map[string]string{"content": "kept"}), http.StatusOK, nil)
+
+	sc := openSSEStream(t, srv.URL+"/v1/sessions/ep-sess/stream?after_seq=old_stale_epoch:99", nil)
+	if f := sc.nextFrame(t, 2*time.Second); !strings.Contains(f.Comment, "connected epoch=newepoch") {
+		t.Fatalf("expected connected comment with the session epoch, got %+v", f)
+	}
+	reset := sc.nextFrame(t, 2*time.Second)
+	if reset.Event != "cursor_reset" || reset.ID != "" {
+		t.Fatalf("expected cursor_reset frame without id, got %+v", reset)
+	}
+	var got model.CursorReset
+	if err := json.Unmarshal([]byte(reset.Data), &got); err != nil {
+		t.Fatalf("decode cursor_reset data %q: %v", reset.Data, err)
+	}
+	want := model.CursorReset{Reason: model.ResetEpochMismatch, RequestedEpoch: "old_stale_epoch", RequestedSeq: 99, CurrentEpoch: "newepoch", EarliestSeq: 1, LatestSeq: 1}
+	if got != want {
+		t.Fatalf("cursor_reset data = %+v, want %+v", got, want)
+	}
+	if f, e := sc.nextEvent(t, 2*time.Second); f.ID != "newepoch:1" || e.Seq != 1 {
+		t.Fatalf("expected event newepoch:1 after the reset, got %+v / %+v", f, e)
+	}
+}
