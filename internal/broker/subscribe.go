@@ -21,6 +21,12 @@ type subSnapshot struct {
 	inFlights []model.InFlightView
 }
 
+// cursor is the client's resume position ("" epoch and 0 offset mean a fresh subscription).
+type cursor struct {
+	epoch  string
+	offset uint64
+}
+
 func (b *Broker) reserveSubSlot() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -48,6 +54,10 @@ func (b *Broker) registerSubscriber(ctx context.Context, actor *sessionActor, su
 	return snap, nil
 }
 
+// Subscribe resumes the session after (afterEpoch, afterOffset). An empty epoch with offset 0 is a
+// fresh subscription. Any other cursor that cannot be continued gaplessly (different epoch,
+// offset evicted from the hot window, or offset ahead of the stream) first receives one
+// EventCursorReset and then the retained window, in-flight snapshots and live events.
 func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset uint64, afterEpoch string) (*Subscription, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -81,14 +91,9 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterOffset ui
 		return nil, err
 	}
 
-	// A cursor from another epoch of this session is replayed from the start of the retained
-	// window. An explicit cursor_reset notification replaces this in a follow-up change.
-	if afterEpoch != "" && afterEpoch != snap.epoch {
-		afterOffset = 0
-	}
-
 	outCh := make(chan model.OutEvent)
-	go b.runSubscriberPump(ctx, sessionID, actor, sub, outCh, afterOffset, snap)
+	cur := cursor{epoch: afterEpoch, offset: afterOffset}
+	go b.runSubscriberPump(ctx, sessionID, actor, sub, outCh, cur, snap)
 
 	return &Subscription{
 		Epoch:  snap.epoch,
@@ -114,57 +119,17 @@ func (b *Broker) runSubscriberPump(
 	actor *sessionActor,
 	sub *subState,
 	outCh chan<- model.OutEvent,
-	afterOffset uint64,
+	cur cursor,
 	snap subSnapshot,
 ) {
 	defer b.subWg.Done()
 	defer close(outCh)
 	defer detachSubscriber(actor, sub)
 
-	if !b.replayCatchUp(ctx, sessionID, sub, outCh, afterOffset, snap) {
+	if !b.replayCatchUp(ctx, sessionID, sub, outCh, cur, snap) {
 		return
 	}
 	b.drainLiveStream(ctx, sub, outCh, snap)
-}
-
-// replayCatchUp sends the committed records in (afterOffset, snap.offset] and then one
-// inflight_snapshot per stream that was active at subscription time.
-func (b *Broker) replayCatchUp(
-	ctx context.Context,
-	sessionID string,
-	sub *subState,
-	outCh chan<- model.OutEvent,
-	afterOffset uint64,
-	snap subSnapshot,
-) bool {
-	if snap.offset > afterOffset && !b.replayStoredRecords(ctx, sessionID, sub, outCh, afterOffset, snap.offset) {
-		return false
-	}
-	return b.replayInFlightSnapshots(ctx, sub, outCh, snap)
-}
-
-func (b *Broker) replayStoredRecords(
-	ctx context.Context,
-	sessionID string,
-	sub *subState,
-	outCh chan<- model.OutEvent,
-	afterOffset uint64,
-	snapOffset uint64,
-) bool {
-	recs, _, err := b.store.ReadFrom(ctx, sessionID, afterOffset)
-	if err != nil {
-		sub.setErr(err)
-		return false
-	}
-	for _, rec := range recs {
-		if rec.Offset > snapOffset {
-			break
-		}
-		if !b.sendOutEvent(ctx, sub, outCh, committedEvent(rec)) {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *Broker) replayInFlightSnapshots(ctx context.Context, sub *subState, outCh chan<- model.OutEvent, snap subSnapshot) bool {

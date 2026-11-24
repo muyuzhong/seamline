@@ -61,7 +61,25 @@ const (
 	EventCommitted        EventKind = "record"
 	EventInFlightSnapshot EventKind = "inflight_snapshot"
 	EventDelta            EventKind = "delta"
+	EventCursorReset      EventKind = "cursor_reset"
 )
+
+// Cursor reset reasons carried by EventCursorReset.
+const (
+	ResetEpochMismatch = "epoch_mismatch"
+	ResetCursorExpired = "cursor_expired"
+	ResetCursorAhead   = "cursor_ahead"
+)
+
+// CursorReset tells a resuming subscriber that its cursor cannot be continued gaplessly.
+type CursorReset struct {
+	Reason          string `json:"reason"`
+	RequestedEpoch  string `json:"requested_epoch"`
+	RequestedOffset uint64 `json:"requested_offset"`
+	CurrentEpoch    string `json:"current_epoch"`
+	EarliestOffset  uint64 `json:"earliest_offset"`
+	LatestOffset    uint64 `json:"latest_offset"`
+}
 
 type OutEvent struct {
 	Kind      EventKind       `json:"kind"`
@@ -74,6 +92,7 @@ type OutEvent struct {
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	Meta      json.RawMessage `json:"meta,omitempty"`
 	Fin       bool            `json:"fin,omitempty"`
+	Reset     *CursorReset    `json:"reset,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 

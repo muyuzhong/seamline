@@ -31,12 +31,22 @@ func TestSessionEpochSurvivesHistoryTTLButRotatesAfterMetaTTL(t *testing.T) {
 	if err := store.Sweep(ctx, t0.Add(2*time.Minute)); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if info, ok, err := store.Stream(ctx, sid); err != nil || !ok || info.Epoch != "ep-1" || info.EarliestOffset != 3 || info.LatestOffset != 2 {
-		t.Fatalf("after HistoryTTL want empty window of ep-1 at offset 2, got ok=%v %+v err=%v", ok, info, err)
+	sub, err := b.Subscribe(ctx, sid, 1, "ep-1")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	ev := recvEvent(t, sub, 2*time.Second)
+	want := model.CursorReset{Reason: model.ResetCursorExpired, RequestedEpoch: "ep-1", RequestedOffset: 1, CurrentEpoch: "ep-1", EarliestOffset: 3, LatestOffset: 2}
+	if ev.Kind != model.EventCursorReset || *ev.Reset != want {
+		t.Fatalf("after HistoryTTL want %+v, got %+v (%+v)", want, ev, ev.Reset)
 	}
 	if res := mustPublish(t, b, sid, model.PublishRequest{Type: "msg", Delta: "three"}); res.CommittedOffset != 3 || res.Epoch != "ep-1" {
 		t.Fatalf("offsets must continue after history eviction: %+v", res)
 	}
+	if ev := recvEvent(t, sub, 2*time.Second); ev.Offset != 3 {
+		t.Fatalf("want live record 3, got %+v", ev)
+	}
+	sub.Cancel()
 
 	waitFor(t, "idle actor eviction", func() bool { return b.activeActorCount() == 0 })
 
@@ -48,9 +58,18 @@ func TestSessionEpochSurvivesHistoryTTLButRotatesAfterMetaTTL(t *testing.T) {
 	if res.Epoch != "ep-2" || res.CommittedOffset != 1 {
 		t.Fatalf("recreated session must start a new epoch at offset 1: %+v", res)
 	}
-	snap, ok, err := b.Inspect(ctx, sid)
-	if err != nil || !ok || snap.Meta.Epoch != "ep-2" || snap.Meta.LastOffset != 1 || snap.Meta.EarliestOffset != 1 {
-		t.Fatalf("Inspect after recreation: ok=%v meta=%+v err=%v", ok, snap.Meta, err)
+	sub2, err := b.Subscribe(ctx, sid, 3, "ep-1")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub2.Cancel()
+	ev = recvEvent(t, sub2, 2*time.Second)
+	want = model.CursorReset{Reason: model.ResetEpochMismatch, RequestedEpoch: "ep-1", RequestedOffset: 3, CurrentEpoch: "ep-2", EarliestOffset: 1, LatestOffset: 1}
+	if ev.Kind != model.EventCursorReset || *ev.Reset != want {
+		t.Fatalf("after MetaTTL want %+v, got %+v (%+v)", want, ev, ev.Reset)
+	}
+	if ev := recvEvent(t, sub2, 2*time.Second); ev.Offset != 1 || ev.Epoch != "ep-2" {
+		t.Fatalf("want record ep-2:1 after reset, got %+v", ev)
 	}
 }
 

@@ -522,52 +522,6 @@ func TestIdempotentSeqRetryAndValidationErrors(t *testing.T) {
 	}
 }
 
-func TestEpochMismatchResetsAfterOffset(t *testing.T) {
-	ctx := context.Background()
-	store := storage.NewMemoryStorage(storage.WithEpochSource(func() string { return "epoch-curr12" }))
-	b := New(store, Config{})
-	closeBroker(t, b)
-
-	for i := 1; i <= 3; i++ {
-		if _, err := b.Publish(ctx, "sess-ep", model.PublishRequest{
-			Type:  "msg",
-			Delta: fmt.Sprintf("m-%d", i),
-		}); err != nil {
-			t.Fatalf("Publish %d: %v", i, err)
-		}
-	}
-
-	// Matching epoch with afterOffset=2 -> receives ONLY offset 3.
-	subMatch, err := b.Subscribe(ctx, "sess-ep", 2, "epoch-curr12")
-	if err != nil {
-		t.Fatalf("Subscribe matching epoch: %v", err)
-	}
-	defer subMatch.Cancel()
-
-	ev := <-subMatch.Events
-	if ev.Kind != model.EventCommitted || ev.Offset != 3 {
-		t.Fatalf("expected offset 3 on matching epoch, got %+v", ev)
-	}
-
-	// Stale epoch with afterOffset=3 -> resets afterOffset to 0 and replays offsets 1, 2, 3!
-	subStale, err := b.Subscribe(ctx, "sess-ep", 3, "epoch-old000")
-	if err != nil {
-		t.Fatalf("Subscribe stale epoch: %v", err)
-	}
-	defer subStale.Cancel()
-
-	for wantOff := uint64(1); wantOff <= 3; wantOff++ {
-		select {
-		case got := <-subStale.Events:
-			if got.Kind != model.EventCommitted || got.Offset != wantOff {
-				t.Fatalf("stale epoch replay expected offset %d, got %+v", wantOff, got)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for offset %d on stale epoch replay", wantOff)
-		}
-	}
-}
-
 func TestSlowSubscriberEviction(t *testing.T) {
 	ctx := context.Background()
 	b := New(storage.NewMemoryStorage(), Config{

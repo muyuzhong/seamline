@@ -15,12 +15,15 @@ import (
 )
 
 var (
-	ErrSlowSubscriber  = errors.New("subscriber evicted due to slow consumption")
-	ErrInvalidInput    = errors.New("invalid publish request")
-	ErrSequenceGap     = errors.New("out-of-order stream sequence")
-	ErrTooManyStreams  = errors.New("too many concurrent in-flight streams for this session")
-	ErrStreamFinalized = errors.New("stream already finalized")
-	ErrBrokerClosed    = errors.New("broker closed")
+	ErrSlowSubscriber = errors.New("subscriber evicted due to slow consumption")
+	// ErrInsufficientState ends a subscription whose catch-up replay found a hole in the
+	// committed history; the client must reconnect with its last cursor to get a cursor_reset.
+	ErrInsufficientState = errors.New("subscriber evicted: committed history has a gap")
+	ErrInvalidInput      = errors.New("invalid publish request")
+	ErrSequenceGap       = errors.New("out-of-order stream sequence")
+	ErrTooManyStreams    = errors.New("too many concurrent in-flight streams for this session")
+	ErrStreamFinalized   = errors.New("stream already finalized")
+	ErrBrokerClosed      = errors.New("broker closed")
 
 	ErrEventTooLarge         = errors.New("event exceeds the maximum event size")
 	ErrInFlightQuotaExceeded = errors.New("in-flight stream buffers would exceed the session quota")

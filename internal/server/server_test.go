@@ -740,20 +740,95 @@ func TestSlowSubscriberEmitsSSEErrorFrame(t *testing.T) {
 	}
 }
 
-func TestEpochMismatchResetsCursorToZero(t *testing.T) {
+func TestCursorResetFrameOnEpochMismatch(t *testing.T) {
 	_, srv := newTestEnv(t, "newepoch", broker.Config{}, server.Config{
 		KeepaliveInterval: 5 * time.Second,
 	})
 
 	doPostJSON(t, srv.URL+"/v1/sessions/ep-sess/events", model.PublishRequest{
 		Type:  "user_message",
-		Delta: "persisted across epoch check",
+		Delta: "retained in the hot window",
 	}, http.StatusOK, nil)
 
-	// Reconnect with stale epoch and high offset; broker must reset after_offset to 0 and replay offset 1.
+	// A cursor from another epoch gets an explicit cursor_reset (no id:) before the window replay.
 	sc := openSSEStream(t, srv.URL+"/v1/sessions/ep-sess/stream?after_offset=99&epoch=old_stale_epoch", nil)
+	if f := sc.nextFrame(t, 2*time.Second); !strings.Contains(f.Comment, "connected epoch=newepoch") {
+		t.Fatalf("expected connected comment with the session epoch, got %+v", f)
+	}
+	resetFrame := sc.nextFrame(t, 2*time.Second)
+	if resetFrame.Event != "cursor_reset" || resetFrame.ID != "" {
+		t.Fatalf("expected cursor_reset frame without id, got %+v", resetFrame)
+	}
+	var reset model.CursorReset
+	if err := json.Unmarshal([]byte(resetFrame.Data), &reset); err != nil {
+		t.Fatalf("decode cursor_reset data %q: %v", resetFrame.Data, err)
+	}
+	want := model.CursorReset{
+		Reason:          model.ResetEpochMismatch,
+		RequestedEpoch:  "old_stale_epoch",
+		RequestedOffset: 99,
+		CurrentEpoch:    "newepoch",
+		EarliestOffset:  1,
+		LatestOffset:    1,
+	}
+	if reset != want {
+		t.Fatalf("cursor_reset data = %+v, want %+v", reset, want)
+	}
+
 	f, ev := sc.nextEvent(t, 2*time.Second)
-	if f.Event != "record" || ev.Offset != 1 {
-		t.Fatalf("expected stale epoch cursor reset to replay offset 1, got %+v / %+v", f, ev)
+	if f.Event != "record" || f.ID != "newepoch:1" || ev.Offset != 1 {
+		t.Fatalf("expected record newepoch:1 after the reset, got %+v / %+v", f, ev)
+	}
+}
+
+// gappyStore loses one record on reads so the broker detects a hole during catch-up replay.
+type gappyStore struct {
+	*storage.MemoryStorage
+	drop uint64
+}
+
+func (g *gappyStore) ReadFrom(ctx context.Context, id string, after uint64) ([]model.Record, storage.StreamInfo, error) {
+	recs, info, err := g.MemoryStorage.ReadFrom(ctx, id, after)
+	out := recs[:0]
+	for _, r := range recs {
+		if r.Offset != g.drop {
+			out = append(out, r)
+		}
+	}
+	return out, info, err
+}
+
+func TestInsufficientStateEmitsStreamErrorFrame(t *testing.T) {
+	store := &gappyStore{MemoryStorage: storage.NewMemoryStorage(), drop: 2}
+	brk := broker.New(store, broker.Config{})
+	srv := httptest.NewServer(server.NewHandler(brk, server.Config{KeepaliveInterval: 5 * time.Second}))
+	t.Cleanup(func() {
+		_ = brk.Close()
+		srv.Close()
+	})
+
+	for i := 1; i <= 3; i++ {
+		doPostJSON(t, srv.URL+"/v1/sessions/gap/events", model.PublishRequest{
+			Type:  "user_message",
+			Delta: fmt.Sprintf("m%d", i),
+		}, http.StatusOK, nil)
+	}
+
+	sc := openSSEStream(t, srv.URL+"/v1/sessions/gap/stream", nil)
+	var events []string
+	deadline := time.After(2 * time.Second)
+	for open := true; open; {
+		select {
+		case f, ok := <-sc.frames:
+			if ok && f.Event != "" {
+				events = append(events, f.Event+" "+f.Data)
+			}
+			open = ok
+		case <-deadline:
+			t.Fatalf("stream must end after insufficient_state; still open after %q", events)
+		}
+	}
+	if len(events) != 2 || !strings.HasPrefix(events[0], "record ") || events[1] != `stream_error {"error":"insufficient_state"}` {
+		t.Fatalf("expected one record then stream_error insufficient_state, got %q", events)
 	}
 }

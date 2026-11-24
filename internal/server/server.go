@@ -200,7 +200,7 @@ func (h *handler) streamSSELoop(ctx context.Context, w io.Writer, flusher http.F
 			flusher.Flush()
 		case ev, ok := <-sub.Events:
 			if !ok {
-				writeSlowSubscriberSSE(w, flusher, sub.Err())
+				writeTerminalStreamError(w, flusher, sub.Err())
 				return
 			}
 			if err := writeSSEEvent(w, flusher, ev); err != nil {
@@ -210,16 +210,31 @@ func (h *handler) streamSSELoop(ctx context.Context, w io.Writer, flusher http.F
 	}
 }
 
-func writeSlowSubscriberSSE(w io.Writer, flusher http.Flusher, err error) {
-	if !errors.Is(err, broker.ErrSlowSubscriber) {
+// writeTerminalStreamError tells the client why the broker ended its subscription. The native
+// EventSource then reconnects with Last-Event-ID; for insufficient_state that reconnect receives
+// a cursor_reset because the cursor fell out of the retained window.
+func writeTerminalStreamError(w io.Writer, flusher http.Flusher, err error) {
+	var code string
+	switch {
+	case errors.Is(err, broker.ErrSlowSubscriber):
+		code = "slow_subscriber"
+	case errors.Is(err, broker.ErrInsufficientState):
+		code = "insufficient_state"
+	default:
 		return
 	}
-	_, _ = io.WriteString(w, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n")
+	_, _ = fmt.Fprintf(w, "event: stream_error\ndata: {\"error\":%q}\n\n", code)
 	flusher.Flush()
 }
 
 func writeSSEEvent(w io.Writer, flusher http.Flusher, ev model.OutEvent) error {
-	data, err := json.Marshal(ev)
+	var data []byte
+	var err error
+	if ev.Kind == model.EventCursorReset {
+		data, err = json.Marshal(ev.Reset)
+	} else {
+		data, err = json.Marshal(ev)
+	}
 	if err != nil {
 		return err
 	}
