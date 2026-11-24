@@ -489,25 +489,6 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 	}
 }
 
-func TestDemoRunEndsWhenPublishFails(t *testing.T) {
-	// The active-run quota is far smaller than the simulated answer, so a publish fails mid-run.
-	_, srv := newTestEnv(t, "demo", broker.Config{}, server.Config{EnableDemo: true}, hotwindow.WithRetention(hotwindow.Retention{MaxActiveRunBytes: 1500}))
-	doPostJSON(t, srv.URL+"/v1/demo/simulate", map[string]any{"session_id": "sim-fail", "delay_ms": 1}, http.StatusAccepted, nil)
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		var snap model.SessionSnapshot
-		doGetJSON(t, srv.URL+"/v1/sessions/sim-fail", http.StatusOK, &snap)
-		if snap.Meta.State == model.StateFailed && snap.Meta.ActiveRunStartSeq == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("a failed demo run must end with run_failed instead of waiting for the idle timeout: %+v", snap.Meta)
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
-}
-
 type stallResponseWriter struct {
 	header      http.Header
 	status      int

@@ -31,31 +31,22 @@ func (b *Broker) sweepOnce(now time.Time) {
 	_ = b.store.Sweep(ctx, now)
 }
 
-// pinAllActors pins every live actor under b.mu.RLock without touching actor.mu.
-func (b *Broker) pinAllActors() []*sessionActor {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.closed {
-		return nil
-	}
-	out := make([]*sessionActor, 0, len(b.actors))
-	for _, actor := range b.actors {
-		actor.pins.Add(1)
-		out = append(out, actor)
-	}
-	return out
-}
-
-// sealIdleRuns ends silent runs. It runs outside b.mu and skips busy actors (TryLock); a storage
-// failure leaves the run active so the next tick retries.
+// sealIdleRuns ends silent runs. It works on a snapshot of the actors outside b.mu and skips busy
+// ones (TryLock). It needs no pins: eviction runs after it in the same pass, and an actor is only
+// evicted without an active run, so there is nothing to seal on it anyway.
 func (b *Broker) sealIdleRuns(now time.Time) {
-	for _, actor := range b.pinAllActors() {
+	b.mu.RLock()
+	actors := make([]*sessionActor, 0, len(b.actors))
+	for _, actor := range b.actors {
+		actors = append(actors, actor)
+	}
+	b.mu.RUnlock()
+
+	for _, actor := range actors {
 		if actor.mu.TryLock() {
-			_ = b.sealIdleRunLocked(actor, now)
+			b.sealIdleRunLocked(actor, now)
 			actor.mu.Unlock()
 		}
-		// Release the sweeper's pin without touch(): sweeping must not keep sessions alive.
-		actor.pins.Add(-1)
 	}
 }
 

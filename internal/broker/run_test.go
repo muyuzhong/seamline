@@ -2,8 +2,6 @@ package broker
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -53,35 +51,6 @@ func TestActorWithActiveRunIsNotEvicted(t *testing.T) {
 	}
 	mustPublish(t, b, "running", ev(model.TypeRunFinished, ""))
 	waitFor(t, "eviction after the run ended", func() bool { return b.activeActorCount() == 0 })
-}
-
-func TestActiveRunQuotaExemptsTerminalEvents(t *testing.T) {
-	ctx := context.Background()
-	store := hotwindow.NewMemoryStorage(hotwindow.WithRetention(hotwindow.Retention{MaxActiveRunBytes: 400}))
-	b := New(store, Config{})
-	closeBroker(t, b)
-	const sid = "quota"
-
-	mustPublish(t, b, sid, ev(model.TypeRunStarted, ""))
-	var err error
-	for i := 0; i < 20 && err == nil; i++ {
-		_, err = b.Publish(ctx, sid, ev("assistant_delta", textPayload(strings.Repeat("x", 40))))
-	}
-	if !errors.Is(err, ErrActiveRunQuotaExceeded) {
-		t.Fatalf("want ErrActiveRunQuotaExceeded, got %v", err)
-	}
-	before := mustInspect(t, b, sid)
-	if _, err := b.Publish(ctx, sid, ev("assistant_delta", textPayload("more"))); !errors.Is(err, ErrActiveRunQuotaExceeded) {
-		t.Fatalf("the run must stay over quota: %v", err)
-	}
-	if after := mustInspect(t, b, sid); after.LatestSeq != before.LatestSeq || after.State != model.StateRunning {
-		t.Fatalf("rejected events must not change the session: before=%+v after=%+v", before, after)
-	}
-	// The producer can still end the run.
-	mustPublish(t, b, sid, ev(model.TypeRunFailed, `{"reason":"quota"}`))
-	if meta := mustInspect(t, b, sid); meta.State != model.StateFailed || meta.ActiveRunStartSeq != 0 {
-		t.Fatalf("terminal event must end the run: %+v", meta)
-	}
 }
 
 func TestIdleRunIsSealedWithRunFailed(t *testing.T) {

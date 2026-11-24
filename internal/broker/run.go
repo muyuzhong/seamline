@@ -12,11 +12,11 @@ import (
 var idleTimeoutPayload = json.RawMessage(`{"reason":"idle_timeout"}`)
 
 // sealIdleRunLocked ends an active run whose producer has been silent for ActiveRunIdleTimeout
-// by appending run_failed {"reason":"idle_timeout"} through the normal commit path.
-func (b *Broker) sealIdleRunLocked(actor *sessionActor, now time.Time) error {
+// by appending run_failed {"reason":"idle_timeout"} through the normal commit path. A failed
+// append leaves the run active, so the next sweep retries.
+func (b *Broker) sealIdleRunLocked(actor *sessionActor, now time.Time) {
 	if actor.activeRunStartSeq == 0 || now.Sub(actor.runActiveAt) < b.cfg.ActiveRunIdleTimeout {
-		return nil
+		return
 	}
-	_, err := b.appendLocked(context.Background(), actor, model.TypeRunFailed, idleTimeoutPayload, now.UTC())
-	return err
+	_, _ = b.appendLocked(context.Background(), actor, model.TypeRunFailed, idleTimeoutPayload, now.UTC())
 }
