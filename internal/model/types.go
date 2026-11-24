@@ -12,6 +12,8 @@ const (
 	StateRunning   SessionState = "running"
 	StateCompleted SessionState = "completed"
 	StateFailed    SessionState = "failed"
+	// StateInterrupted is set by a run_interrupted event.
+	StateInterrupted SessionState = "interrupted"
 )
 
 // StateFromRecordType derives the SessionState implied by a committed Record's Type.
@@ -24,6 +26,37 @@ func StateFromRecordType(recordType string) SessionState {
 	default:
 		return StateIdle
 	}
+}
+
+// Event types the broker interprets. Every other type is opaque to Seamline.
+const (
+	TypeRunStarted     = "run_started"
+	TypeRunFinished    = "run_finished"
+	TypeRunFailed      = "run_failed"
+	TypeRunInterrupted = "run_interrupted"
+)
+
+// TerminalState returns the state a terminal event type ends a run in.
+func TerminalState(eventType string) (SessionState, bool) {
+	switch eventType {
+	case TypeRunFinished:
+		return StateCompleted, true
+	case TypeRunFailed:
+		return StateFailed, true
+	case TypeRunInterrupted:
+		return StateInterrupted, true
+	default:
+		return "", false
+	}
+}
+
+// Event is the single, payload-opaque unit of a session stream. Its cursor is <Epoch>:<Seq>.
+type Event struct {
+	Seq       uint64          `json:"seq"`
+	Epoch     string          `json:"epoch"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 type Record struct {
