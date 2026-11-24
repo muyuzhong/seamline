@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Seamline — Resumable Dual-Speed AI Stream Playground</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #121826;
+      --panel-alt: #182033;
+      --border: #26324d;
+      --text: #e6edf7;
+      --muted: #8fa1c2;
+      --accent: #38bdf8;
+      --accent-strong: #0284c7;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --purple: #a78bfa;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.5;
+    }
+
+    .container {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 18px 22px 32px;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo {
+      width: 36px;
+      height: 36px;
+      border-radius: 9px;
+      background: linear-gradient(135deg, var(--accent), var(--purple));
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      color: #07101d;
+      font-family: var(--mono);
+      font-size: 18px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 19px;
+      letter-spacing: -0.01em;
+    }
+
+    .brand p {
+      margin: 0;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .session-box {
+      display: flex;
+      align-items: center;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 4px 10px;
+      gap: 6px;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+
+    .session-box input {
+      background: transparent;
+      border: none;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      width: 145px;
+      outline: none;
+    }
+
+    button {
+      background: var(--panel-alt);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 7px 13px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+    }
+
+    button:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: #1e2942;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    button.primary {
+      background: var(--accent-strong);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    button.primary:hover:not(:disabled) {
+      background: #0369a1;
+    }
+
+    button.warn {
+      border-color: rgba(251, 191, 36, 0.45);
+      color: var(--amber);
+    }
+
+    button.small {
+      padding: 4px 9px;
+      font-size: 11.5px;
+    }
+
+    .f5-callout {
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      border-radius: 8px;
+      font-size: 13px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .f5-callout kbd {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent);
+    }
+
+    .metrics-grid {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }
+
+    .metric-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 11px 14px;
+    }
+
+    .metric-label {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+
+    .metric-value {
+      margin-top: 4px;
+      font-size: 22px;
+      font-weight: 700;
+      font-family: var(--mono);
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+
+    .metric-sub {
+      font-size: 11.5px;
+      color: var(--muted);
+      font-family: var(--sans);
+      font-weight: 400;
+    }
+
+    .panes {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 980px) {
+      .panes { grid-template-columns: 1fr; }
+    }
+
+    .pane {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      min-height: 510px;
+      overflow: hidden;
+    }
+
+    .pane-header {
+      padding: 11px 14px;
+      background: var(--panel-alt);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .pane-title {
+      font-weight: 700;
+      font-size: 13.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--muted);
+      display: inline-block;
+    }
+
+    .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.dropped { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+    .pane-meta {
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      background: rgba(11, 15, 23, 0.45);
+    }
+
+    .pane-meta span b {
+      color: var(--text);
+    }
+
+    .messages {
+      flex: 1;
+      padding: 14px;
+      overflow-y: auto;
+      max-height: 330px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .empty-hint {
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+      margin: auto;
+      padding: 28px 12px;
+    }
+
+    .msg {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 12px;
+      background: #0e1421;
+    }
+
+    .msg.user {
+      border-left: 3px solid var(--purple);
+    }
+
+    .msg.assistant {
+      border-left: 3px solid var(--accent);
+    }
+
+    .msg.streaming {
+      border-color: rgba(56, 189, 248, 0.55);
+    }
+
+    .msg-head {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+
+    .badge {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10.5px;
+      font-family: var(--mono);
+    }
+
+    .badge.committed {
+      background: rgba(52, 211, 153, 0.14);
+      color: var(--green);
+    }
+
+    .badge.inflight {
+      background: rgba(251, 191, 36, 0.15);
+      color: var(--amber);
+    }
+
+    .msg-body {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .cursor-blink::after {
+      content: "▋";
+      color: var(--accent);
+      animation: blink 0.9s steps(2, start) infinite;
+      margin-left: 2px;
+    }
+
+    @keyframes blink {
+      to { visibility: hidden; }
+    }
+
+    .wire-log {
+      border-top: 1px solid var(--border);
+      background: #080b12;
+      padding: 8px 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      height: 118px;
+      overflow-y: auto;
+      color: var(--muted);
+    }
+
+    .wire-line {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      padding: 1px 0;
+    }
+
+    .wire-line.record { color: var(--green); }
+    .wire-line.snapshot { color: var(--amber); font-weight: 600; }
+    .wire-line.delta { color: #93c5fd; }
+    .wire-line.sys { color: var(--purple); }
+    .wire-line.err { color: var(--red); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="logo">S</div>
+        <div>
+          <h1>Seamline Live Playground</h1>
+          <p>Dual-Speed Resumable AI Stream Broker &bull; Ephemeral Delta Coalescing + Committed WAL Offset</p>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="session-box">
+          <span>Session:</span>
+          <input id="sessionInput" type="text" value="playground-1" spellcheck="false" />
+          <button class="small" id="applySessionBtn" title="Switch to session">Connect</button>
+        </div>
+        <button id="newSessionBtn">New Session</button>
+        <button class="primary" id="simulateBtn">&#9654; Stream 100+ AI Tokens</button>
+      </div>
+    </header>
+
+    <div class="f5-callout">
+      <div>
+        <strong>Resilience Test:</strong> Start a stream, then click <strong>Drop 1.2s &amp; Resume (Last-Event-ID)</strong> on Client B <em>or</em> press <kbd>F5</kbd> / <kbd>Cmd+R</kbd> mid-stream! Watch <code>inflight_snapshot</code> + live <code>delta</code>s reconstruct the exact output with zero lost tokens.
+      </div>
+      <div id="parityBadge" class="badge committed">A == B Parity: Waiting</div>
+    </div>
+
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">Committed Records (WAL Offset)</div>
+        <div class="metric-value">
+          <span id="metricOffset" style="color: var(--green);">0</span>
+          <span class="metric-sub" id="metricEpoch">epoch: -</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">In-Flight Chunks Coalesced</div>
+        <div class="metric-value">
+          <span id="metricInFlight" style="color: var(--amber);">0</span>
+          <span class="metric-sub" id="metricCompacted">compacts N deltas &rarr; 1 record</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Session State</div>
+        <div class="metric-value">
+          <span id="metricState" style="color: var(--accent);">idle</span>
+          <span class="metric-sub" id="metricStreamId">no active stream</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Live SSE Subscribers</div>
+        <div class="metric-value">
+          <span id="metricSubs">0</span>
+          <span class="metric-sub">active fan-out channels</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panes">
+      <!-- Client A -->
+      <div class="pane">
+        <div class="pane-header">
+          <div class="pane-title">
+            <span class="dot" id="dotA"></span>
+            Client A &mdash; Native Browser EventSource
+          </div>
+          <div>
+            <button class="small" id="reloadZeroABtn" title="Reconnect from offset 0">Replay from Offset 0</button>
+          </div>
+        </div>
+        <div class="pane-meta">
+          <span>Cursor: <b id="cursorA">(none)</b></span>
+          <span>Records: <b id="recCountA">0</b></span>
+          <span>Snapshots: <b id="snapCountA">0</b></span>
+          <span>Deltas: <b id="deltaCountA">0</b></span>
+        </div>
+        <div class="messages" id="messagesA">
+          <div class="empty-hint">Click <b>Stream 100+ AI Tokens</b> above to watch dual-speed streaming.</div>
+        </div>
+        <div class="wire-log" id="wireA"></div>
+      </div>
+
+      <!-- Client B -->
+      <div class="pane">
+        <div class="pane-header">
+          <div class="pane-title">
+            <span class="dot" id="dotB"></span>
+            Client B &mdash; Chaos / Last-Event-ID Resumption
+          </div>
+          <div style="display:flex; gap:6px;">
+            <button class="small warn" id="chaosDropBtn">Drop 1.2s &amp; Resume (Last-Event-ID)</button>
+            <button class="small" id="toggleConnBBtn">Disconnect</button>
+          </div>
+        </div>
+        <div class="pane-meta">
+          <span>Last-Event-ID: <b id="cursorB">(none)</b></span>
+          <span>Records: <b id="recCountB">0</b></span>
+          <span>Snapshots: <b id="snapCountB">0</b></span>
+          <span>Deltas: <b id="deltaCountB">0</b></span>
+        </div>
+        <div class="messages" id="messagesB">
+          <div class="empty-hint">Client B mirrors Client A and tests mid-stream disconnects &amp; <code>Last-Event-ID</code> recovery.</div>
+        </div>
+        <div class="wire-log" id="wireB"></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      const params = new URLSearchParams(window.location.search);
+      const initialSession = params.get("session") || (window.location.hash ? window.location.hash.slice(1) : "playground-1");
+      const sessionInput = document.getElementById("sessionInput");
+      sessionInput.value = initialSession;
+
+      let currentSession = initialSession;
+      let peakInFlightSeq = 0;
+      let lastCompactedChunks = 0;
+
+      function syncUrlSession(id) {
+        const url = new URL(window.location.href);
+        url.searchParams.set("session", id);
+        window.history.replaceState({}, "", url.toString());
+      }
+      syncUrlSession(currentSession);
+
+      function extractContent(payload) {
+        if (payload == null) return "";
+        let obj = payload;
+        if (typeof payload === "string") {
+          try { obj = JSON.parse(payload); } catch (_) { return payload; }
+        }
+        if (typeof obj === "object" && obj !== null) {
+          if (typeof obj.content === "string") return obj.content;
+          return JSON.stringify(obj);
+        }
+        return String(obj);
+      }
+
+      function createPaneState(suffix) {
+        return {
+          suffix,
+          cursor: "",
+          items: [],
+          recCount: 0,
+          snapCount: 0,
+          deltaCount: 0,
+          es: null,
+          abortCtrl: null,
+          connected: false,
+          reconnectTimer: null,
+          dotEl: document.getElementById("dot" + suffix),
+          cursorEl: document.getElementById("cursor" + suffix),
+          recEl: document.getElementById("recCount" + suffix),
+          snapEl: document.getElementById("snapCount" + suffix),
+          deltaEl: document.getElementById("deltaCount" + suffix),
+          messagesEl: document.getElementById("messages" + suffix),
+          wireEl: document.getElementById("wire" + suffix),
+        };
+      }
+
+      const clientA = createPaneState("A");
+      const clientB = createPaneState("B");
+
+      function logWire(pane, cls, text) {
+        const div = document.createElement("div");
+        div.className = "wire-line " + cls;
+        const ts = new Date().toISOString().slice(11, 23);
+        div.textContent = "[" + ts + "] " + text;
+        pane.wireEl.appendChild(div);
+        while (pane.wireEl.childNodes.length > 60) {
+          pane.wireEl.removeChild(pane.wireEl.firstChild);
+        }
+        pane.wireEl.scrollTop = pane.wireEl.scrollHeight;
+      }
+
+      function setConnected(pane, isConn) {
+        pane.connected = isConn;
+        pane.dotEl.className = "dot " + (isConn ? "live" : "dropped");
+        if (pane === clientB) {
+          document.getElementById("toggleConnBBtn").textContent = isConn ? "Disconnect" : "Resume (Last-Event-ID)";
+        }
+      }
+
+      function renderPane(pane) {
+        pane.cursorEl.textContent = pane.cursor || "(none)";
+        pane.recEl.textContent = String(pane.recCount);
+        pane.snapEl.textContent = String(pane.snapCount);
+        pane.deltaEl.textContent = String(pane.deltaCount);
+
+        if (pane.items.length === 0) {
+          const hint = document.createElement("div");
+          hint.className = "empty-hint";
+          const code = document.createElement("code");
+          code.textContent = currentSession;
+          hint.append("Waiting for events on ", code, "...");
+          pane.messagesEl.replaceChildren(hint);
+          updateParity();
+          return;
+        }
+
+        pane.messagesEl.replaceChildren();
+        for (const item of pane.items) {
+          const card = document.createElement("div");
+          const isUser = item.type === "user_message";
+          card.className = "msg " + (isUser ? "user" : "assistant") + (item.committed ? "" : " streaming");
+
+          const head = document.createElement("div");
+          head.className = "msg-head";
+          const roleSpan = document.createElement("span");
+          roleSpan.textContent = (isUser ? "USER" : "ASSISTANT") + (item.streamId ? " [" + item.streamId + "]" : "");
+
+          const badge = document.createElement("span");
+          badge.className = "badge " + (item.committed ? "committed" : "inflight");
+          badge.textContent = item.committed
+            ? "COMMITTED #" + item.offset
+            : (item.viaSnapshot ? "SNAPSHOT+LIVE seq=" + item.lastSeq : "STREAMING seq=" + item.lastSeq);
+
+          head.appendChild(roleSpan);
+          head.appendChild(badge);
+
+          const body = document.createElement("div");
+          body.className = "msg-body" + (item.committed ? "" : " cursor-blink");
+          body.textContent = item.text;
+
+          card.appendChild(head);
+          card.appendChild(body);
+          pane.messagesEl.appendChild(card);
+        }
+        pane.messagesEl.scrollTop = pane.messagesEl.scrollHeight;
+        updateParity();
+      }
+
+      function handleOutEvent(pane, eventType, lastId, rawData) {
+        let ev;
+        try { ev = JSON.parse(rawData); } catch (_) { return; }
+
+        if (eventType === "record") {
+          pane.recCount++;
+          const cursor = lastId || (ev.epoch + ":" + ev.offset);
+          pane.cursor = cursor;
+          const text = extractContent(ev.payload);
+
+          let existing = null;
+          if (ev.stream_id) {
+            existing = pane.items.find(x => x.streamId === ev.stream_id);
+          }
+          if (!existing) {
+            existing = pane.items.find(x => x.committed && x.offset === ev.offset);
+          }
+          if (existing) {
+            existing.committed = true;
+            existing.offset = ev.offset;
+            existing.type = ev.type || existing.type;
+            existing.text = text;
+          } else {
+            pane.items.push({
+              offset: ev.offset,
+              streamId: ev.stream_id || "",
+              type: ev.type || "record",
+              text: text,
+              lastSeq: 0,
+              committed: true,
+              viaSnapshot: false,
+            });
+          }
+          logWire(pane, "record", "id=" + cursor + " event=record type=" + ev.type + " (" + text.length + " chars)");
+          renderPane(pane);
+        } else if (eventType === "inflight_snapshot") {
+          pane.snapCount++;
+          let existing = pane.items.find(x => x.streamId === ev.stream_id);
+          if (!existing) {
+            existing = {
+              offset: 0,
+              streamId: ev.stream_id,
+              type: ev.type || "assistant_message",
+              text: "",
+              lastSeq: 0,
+              committed: false,
+              viaSnapshot: true,
+            };
+            pane.items.push(existing);
+          }
+          existing.text = ev.delta || "";
+          existing.lastSeq = ev.seq || 0;
+          existing.committed = false;
+          existing.viaSnapshot = true;
+          logWire(pane, "snapshot", "event=inflight_snapshot seq=" + ev.seq + " coalesced_chars=" + existing.text.length);
+          renderPane(pane);
+        } else if (eventType === "delta") {
+          pane.deltaCount++;
+          let existing = pane.items.find(x => x.streamId === ev.stream_id);
+          if (!existing) {
+            existing = {
+              offset: 0,
+              streamId: ev.stream_id,
+              type: ev.type || "assistant_message",
+              text: "",
+              lastSeq: 0,
+              committed: false,
+              viaSnapshot: false,
+            };
+            pane.items.push(existing);
+          }
+          if (!existing.committed && (!ev.seq || ev.seq > existing.lastSeq)) {
+            existing.text += (ev.delta || "");
+            existing.lastSeq = ev.seq || (existing.lastSeq + 1);
+          }
+          if (ev.seq <= 3 || ev.fin || ev.seq % 15 === 0) {
+            logWire(pane, "delta", "event=delta seq=" + ev.seq + (ev.fin ? " [FIN]" : "") + " delta=" + JSON.stringify(ev.delta));
+          }
+          renderPane(pane);
+        } else if (eventType === "stream_error") {
+          const errCode = ev && ev.error ? ev.error : rawData;
+          setConnected(pane, false);
+          if (pane === clientA) {
+            // Leave native EventSource open so the browser auto-reconnects with Last-Event-ID.
+            logWire(pane, "err", "event=stream_error error=" + errCode + " (waiting for native EventSource Last-Event-ID reconnect)");
+          } else {
+            logWire(pane, "err", "event=stream_error error=" + errCode + " (resuming from saved cursor in 500ms)");
+            disconnectClientB();
+            clientB.reconnectTimer = setTimeout(() => {
+              connectClientB(false);
+            }, 500);
+          }
+        }
+      }
+
+      function resetPaneData(pane) {
+        pane.cursor = "";
+        pane.items = [];
+        pane.recCount = 0;
+        pane.snapCount = 0;
+        pane.deltaCount = 0;
+        pane.wireEl.replaceChildren();
+        renderPane(pane);
+      }
+
+      // Client A uses native browser EventSource
+      function connectClientA(fromZero) {
+        disconnectClientA();
+        if (fromZero) resetPaneData(clientA);
+        let url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
+        if (!fromZero && clientA.cursor) {
+          url += "?after_offset=" + encodeURIComponent(clientA.cursor);
+        }
+        const es = new EventSource(url);
+        clientA.es = es;
+        es.onopen = () => {
+          setConnected(clientA, true);
+          logWire(clientA, "sys", "EventSource connected to " + url);
+        };
+        es.onerror = () => {
+          setConnected(clientA, false);
+        };
+        ["record", "inflight_snapshot", "delta", "stream_error"].forEach(kind => {
+          es.addEventListener(kind, e => handleOutEvent(clientA, kind, e.lastEventId, e.data));
+        });
+      }
+
+      function disconnectClientA() {
+        if (clientA.es) {
+          clientA.es.close();
+          clientA.es = null;
+        }
+        setConnected(clientA, false);
+      }
+
+      // Client B uses fetch + ReadableStream with explicit Last-Event-ID HTTP header
+      async function connectClientB(resetAll) {
+        disconnectClientB();
+        if (resetAll) resetPaneData(clientB);
+
+        const ctrl = new AbortController();
+        clientB.abortCtrl = ctrl;
+        const headers = { "Accept": "text/event-stream" };
+        if (clientB.cursor) {
+          headers["Last-Event-ID"] = clientB.cursor;
+        }
+        const url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
+        logWire(clientB, "sys", "GET " + url + (clientB.cursor ? " [Last-Event-ID: " + clientB.cursor + "]" : " [offset=0]"));
+
+        try {
+          const resp = await fetch(url, { headers, signal: ctrl.signal });
+          if (!resp.ok || !resp.body) {
+            setConnected(clientB, false);
+            return;
+          }
+          setConnected(clientB, true);
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf("\n\n")) !== -1) {
+              const block = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              parseSSEBlock(clientB, block);
+            }
+          }
+        } catch (err) {
+          if (err.name !== "AbortError") {
+            logWire(clientB, "sys", "stream closed: " + err.message);
+          }
+        } finally {
+          if (clientB.abortCtrl === ctrl) {
+            setConnected(clientB, false);
+          }
+        }
+      }
+
+      function parseSSEBlock(pane, block) {
+        const lines = block.split("\n");
+        let evType = "message";
+        let evId = "";
+        const dataLines = [];
+        for (const line of lines) {
+          if (line.startsWith(":")) {
+            if (line.includes("connected")) {
+              logWire(pane, "sys", line);
+            }
+            continue;
+          }
+          if (line.startsWith("id:")) {
+            evId = line.slice(3).trim();
+          } else if (line.startsWith("event:")) {
+            evType = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+        if (dataLines.length > 0) {
+          handleOutEvent(pane, evType, evId, dataLines.join("\n"));
+        }
+      }
+
+      function disconnectClientB() {
+        if (clientB.reconnectTimer) {
+          clearTimeout(clientB.reconnectTimer);
+          clientB.reconnectTimer = null;
+        }
+        if (clientB.abortCtrl) {
+          clientB.abortCtrl.abort();
+          clientB.abortCtrl = null;
+        }
+        setConnected(clientB, false);
+      }
+
+      function updateParity() {
+        const badge = document.getElementById("parityBadge");
+        if (clientA.items.length === 0 && clientB.items.length === 0) {
+          badge.className = "badge committed";
+          badge.textContent = "A == B Parity: Ready";
+          return;
+        }
+        const sigA = clientA.items.map(i => i.type + ":" + i.text).join("\n---\n");
+        const sigB = clientB.items.map(i => i.type + ":" + i.text).join("\n---\n");
+        if (sigA === sigB) {
+          badge.className = "badge committed";
+          badge.textContent = "A == B Exact Byte Match (" + sigA.length + " chars)";
+        } else {
+          badge.className = "badge inflight";
+          badge.textContent = "Syncing In-Flight (" + sigA.length + " vs " + sigB.length + " chars)";
+        }
+      }
+
+      async function pollSessionMetrics() {
+        try {
+          const resp = await fetch("/v1/sessions/" + encodeURIComponent(currentSession));
+          if (!resp.ok) {
+            document.getElementById("metricOffset").textContent = "0";
+            document.getElementById("metricInFlight").textContent = "0";
+            document.getElementById("metricState").textContent = "idle";
+            document.getElementById("metricSubs").textContent = "0";
+            return;
+          }
+          const snap = await resp.json();
+          document.getElementById("metricOffset").textContent = String(snap.meta.last_offset);
+          document.getElementById("metricEpoch").textContent = "epoch: " + snap.meta.epoch;
+          document.getElementById("metricState").textContent = snap.meta.state;
+          document.getElementById("metricSubs").textContent = String(snap.subscriber_count);
+
+          if (snap.in_flight) {
+            peakInFlightSeq = Math.max(peakInFlightSeq, snap.in_flight.last_seq);
+            document.getElementById("metricInFlight").textContent = String(snap.in_flight.last_seq);
+            document.getElementById("metricCompacted").textContent = snap.in_flight.merged.length + " chars buffered in RAM";
+            document.getElementById("metricStreamId").textContent = snap.in_flight.stream_id;
+          } else {
+            if (peakInFlightSeq > 0) {
+              lastCompactedChunks = peakInFlightSeq;
+              peakInFlightSeq = 0;
+            }
+            document.getElementById("metricInFlight").textContent = "0";
+            document.getElementById("metricCompacted").textContent = lastCompactedChunks > 0
+              ? "compacted " + lastCompactedChunks + " chunks \u2192 1 WAL record!"
+              : "compacts N deltas \u2192 1 record";
+            document.getElementById("metricStreamId").textContent = "no active stream";
+          }
+        } catch (_) {}
+      }
+
+      document.getElementById("simulateBtn").addEventListener("click", async () => {
+        const btn = document.getElementById("simulateBtn");
+        btn.disabled = true;
+        try {
+          const resp = await fetch("/v1/demo/simulate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: currentSession, delay_ms: 35 }),
+          });
+          if (resp.status === 409) {
+            logWire(clientA, "sys", "Stream already in-flight for session " + currentSession);
+          }
+          await pollSessionMetrics();
+        } finally {
+          setTimeout(() => { btn.disabled = false; }, 600);
+        }
+      });
+
+      document.getElementById("chaosDropBtn").addEventListener("click", () => {
+        disconnectClientB();
+        logWire(clientB, "sys", "*** SIMULATED NETWORK DROP (offline for 1.2s...) ***");
+        clientB.reconnectTimer = setTimeout(() => {
+          connectClientB(false);
+        }, 1200);
+      });
+
+      document.getElementById("toggleConnBBtn").addEventListener("click", () => {
+        if (clientB.connected) {
+          disconnectClientB();
+          logWire(clientB, "sys", "Manually disconnected Client B (cursor saved: " + (clientB.cursor || "0") + ")");
+        } else {
+          connectClientB(false);
+        }
+      });
+
+      document.getElementById("reloadZeroABtn").addEventListener("click", () => {
+        connectClientA(true);
+      });
+
+      function switchSession(id) {
+        currentSession = id.trim() || "playground-1";
+        sessionInput.value = currentSession;
+        peakInFlightSeq = 0;
+        lastCompactedChunks = 0;
+        syncUrlSession(currentSession);
+        connectClientA(true);
+        connectClientB(true);
+        pollSessionMetrics();
+      }
+
+      document.getElementById("applySessionBtn").addEventListener("click", () => {
+        switchSession(sessionInput.value);
+      });
+
+      sessionInput.addEventListener("keydown", e => {
+        if (e.key === "Enter") switchSession(sessionInput.value);
+      });
+
+      document.getElementById("newSessionBtn").addEventListener("click", () => {
+        const suffix = Math.random().toString(36).slice(2, 7);
+        switchSession("demo-" + suffix);
+      });
+
+      // Connect both independent SSE panes immediately on load (handles F5 mid-stream!)
+      connectClientA(true);
+      connectClientB(true);
+      pollSessionMetrics();
+      setInterval(pollSessionMetrics, 250);
+    })();
+  </script>
+</body>
+</html>
