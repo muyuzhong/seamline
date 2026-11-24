@@ -24,11 +24,24 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("status %d: %s", e.code, e.body)
 }
 
-// publisher posts the events of one run.
+// retryable reports whether a publish may be retried: transport errors and 5xx responses are,
+// 4xx responses (invalid event, quota) are not.
+func retryable(err error) bool {
+	var se *statusError
+	if errors.As(err, &se) {
+		return se.code >= http.StatusInternalServerError
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// publisher posts the events of one run. Every event gets the idempotency key <run_id>:<n>, so a
+// retry after a timeout can never create a duplicate event.
 type publisher struct {
 	client   *http.Client
 	endpoint string
 	runID    string
+	attempts int
+	n        int
 }
 
 func (p *publisher) publish(ctx context.Context, eventType string, payload any) (model.PublishResult, error) {
@@ -36,7 +49,18 @@ func (p *publisher) publish(ctx context.Context, eventType string, payload any) 
 	if err != nil {
 		return model.PublishResult{}, err
 	}
-	return postEvent(ctx, p.client, p.endpoint, model.PublishRequest{Type: eventType, Payload: raw})
+	p.n++
+	req := model.PublishRequest{Type: eventType, Payload: raw, IdempotencyKey: fmt.Sprintf("%s:%d", p.runID, p.n)}
+
+	for attempt := 1; ; attempt++ {
+		res, err := postEvent(ctx, p.client, p.endpoint, req)
+		if err == nil || attempt >= p.attempts || !retryable(err) {
+			return res, err
+		}
+		if !sleepWithContext(ctx, time.Duration(attempt)*100*time.Millisecond) {
+			return model.PublishResult{}, errInterrupted
+		}
+	}
 }
 
 // abort ends the run after a failure so subscribers see a terminal event right away.

@@ -111,6 +111,11 @@ func (b *Broker) InstanceID() string {
 	return b.cfg.InstanceID
 }
 
+// MaxEventBytes is the largest accepted event payload.
+func (b *Broker) MaxEventBytes() int {
+	return b.cfg.MaxEventBytes
+}
+
 func (b *Broker) isClosed() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

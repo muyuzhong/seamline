@@ -28,13 +28,14 @@ const defaultSimText = "Seamline gives every event the next monotonic cursor <ep
 var errInterrupted = errors.New("interrupted")
 
 type simConfig struct {
-	base    string
-	session string
-	runID   string
-	prompt  string
-	text    string
-	tools   int
-	delay   time.Duration
+	base     string
+	session  string
+	runID    string
+	prompt   string
+	text     string
+	tools    int
+	delay    time.Duration
+	attempts int
 }
 
 func main() {
@@ -44,20 +45,22 @@ func main() {
 		delay     = flag.Duration("delay", 30*time.Millisecond, "delay between streamed rounds of events")
 		text      = flag.String("text", defaultSimText, "assistant text to stream as assistant_delta events")
 		prompt    = flag.String("prompt", "Simulate a resumable AI assistant run.", "user_message content")
-		runID     = flag.String("run-id", "", "run ID used in event payloads (auto-generated if empty)")
+		runID     = flag.String("run-id", "", "run ID used in payloads and idempotency keys (auto-generated if empty)")
 		tools     = flag.Int("tools", 0, "number of parallel tool calls whose JSON arguments stream interleaved with the text")
+		attempts  = flag.Int("attempts", 3, "attempts per publish; retries reuse the idempotency key")
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := simConfig{
-		base:    strings.TrimRight(strings.TrimSpace(*serverURL), "/"),
-		session: strings.TrimSpace(*sessionID),
-		runID:   defaultString(strings.TrimSpace(*runID), newRunID()),
-		prompt:  *prompt,
-		text:    defaultString(*text, defaultSimText),
-		tools:   max(*tools, 0),
-		delay:   *delay,
+		base:     strings.TrimRight(strings.TrimSpace(*serverURL), "/"),
+		session:  strings.TrimSpace(*sessionID),
+		runID:    defaultString(strings.TrimSpace(*runID), newRunID()),
+		prompt:   *prompt,
+		text:     defaultString(*text, defaultSimText),
+		tools:    max(*tools, 0),
+		delay:    *delay,
+		attempts: max(*attempts, 1),
 	}
 	if cfg.session == "" {
 		logger.Error("session ID must not be empty")
@@ -98,7 +101,7 @@ func runSimulation(ctx context.Context, cfg simConfig, logger *slog.Logger) (mod
 	if err := createSession(ctx, client, cfg.base, cfg.session); err != nil {
 		return model.PublishResult{}, fmt.Errorf("create session: %w", err)
 	}
-	pub := &publisher{client: client, endpoint: eventsURL(cfg.base, cfg.session), runID: cfg.runID}
+	pub := &publisher{client: client, endpoint: eventsURL(cfg.base, cfg.session), runID: cfg.runID, attempts: cfg.attempts}
 
 	if _, err := pub.publish(ctx, model.TypeRunStarted, map[string]string{"run_id": cfg.runID}); err != nil {
 		return model.PublishResult{}, err

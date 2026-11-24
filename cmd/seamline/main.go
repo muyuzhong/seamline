@@ -23,6 +23,13 @@ func main() {
 		subBuffer = flag.Int("sub-buffer", 128, "per-subscriber live event channel buffer size")
 		idleTTL   = flag.Duration("idle-ttl", 30*time.Minute, "idle session actor eviction TTL")
 		keepalive = flag.Duration("keepalive", 15*time.Second, "SSE keepalive comment interval")
+
+		maxEventBytes  = flag.Int("max-event-bytes", broker.DefaultMaxEventBytes, "maximum payload bytes of one published event")
+		runIdleTimeout = flag.Duration("run-idle-timeout", broker.DefaultActiveRunIdleTimeout, "end an active run with run_failed after this long without events")
+		historyTTL     = flag.Duration("history-ttl", hotwindow.DefaultHistoryTTL, "evict finished-run history older than this")
+		maxHistory     = flag.Int64("max-history-bytes", hotwindow.DefaultMaxHistoryBytes, "per-session byte limit of finished-run history")
+		maxActiveRun   = flag.Int64("max-active-run-bytes", hotwindow.DefaultMaxActiveRunBytes, "per-session byte limit of the active run")
+		metaTTL        = flag.Duration("meta-ttl", hotwindow.DefaultMetaTTL, "drop a session stream (and its epoch) after this long idle")
 	)
 	flag.Parse()
 
@@ -30,10 +37,17 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	store := hotwindow.NewMemoryStorage()
+	store := hotwindow.NewMemoryStorage(hotwindow.WithRetention(hotwindow.Retention{
+		HistoryTTL:        *historyTTL,
+		MaxHistoryBytes:   *maxHistory,
+		MaxActiveRunBytes: *maxActiveRun,
+		MetaTTL:           *metaTTL,
+	}))
 	brk := broker.New(store, broker.Config{
 		SubscriberBufferSize: *subBuffer,
 		IdleSessionTTL:       *idleTTL,
+		MaxEventBytes:        *maxEventBytes,
+		ActiveRunIdleTimeout: *runIdleTimeout,
 	})
 
 	httpHandler := server.NewHandler(brk, server.Config{
