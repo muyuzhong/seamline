@@ -94,11 +94,22 @@ func resolveStreamSeq(epoch string, inFlight *inFlightState, reqSeq uint64) (uin
 	return reqSeq, nil, nil
 }
 
-// checkStreamCapacityLocked enforces MaxConcurrentStreams before any state changes. A
-// single-chunk stream (fin on its first chunk) never occupies a slot.
-func (b *Broker) checkStreamCapacityLocked(actor *sessionActor, inFlight *inFlightState, req model.PublishRequest) error {
+// checkStreamCapacityLocked enforces MaxConcurrentStreams and MaxInFlightBytes before any
+// state changes. A single-chunk stream (fin on its first chunk) never occupies a slot, and a
+// fin chunk with an explicit payload does not grow the merged buffer.
+func (b *Broker) checkStreamCapacityLocked(actor *sessionActor, inFlight *inFlightState, req model.PublishRequest, hasPayload bool) error {
 	if inFlight == nil && !req.Fin && len(actor.inFlights) >= b.cfg.MaxConcurrentStreams {
 		return ErrTooManyStreams
+	}
+	if req.Fin && hasPayload {
+		return nil
+	}
+	growth := len(req.Delta)
+	if inFlight == nil {
+		growth += len(normalizeRaw(req.Meta))
+	}
+	if actor.inFlightBytes+growth > b.cfg.MaxInFlightBytes {
+		return ErrInFlightQuotaExceeded
 	}
 	return nil
 }
@@ -124,7 +135,7 @@ func (b *Broker) publishStreamLocked(
 	if dup != nil {
 		return *dup, nil
 	}
-	if err := b.checkStreamCapacityLocked(actor, inFlight, req); err != nil {
+	if err := b.checkStreamCapacityLocked(actor, inFlight, req, hasPayload); err != nil {
 		return model.PublishResult{}, err
 	}
 
@@ -151,9 +162,11 @@ func (b *Broker) appendStreamDeltaLocked(
 			startedAt: now,
 		}
 		actor.inFlights[req.StreamID] = inFlight
+		actor.inFlightBytes += len(cand.meta)
 	}
 	inFlight.typ = cand.baseType
 	_, _ = inFlight.mergedBuf.WriteString(req.Delta)
+	actor.inFlightBytes += len(req.Delta)
 	inFlight.lastSeq = cand.seq
 	inFlight.updatedAt = now
 
@@ -200,7 +213,10 @@ func settledState(recordType string, hasInFlight bool) model.SessionState {
 // finishStreamLocked applies the in-memory effects of a committed stream Record. It must only
 // run after store.Append succeeded (point of no return).
 func (b *Broker) finishStreamLocked(actor *sessionActor, streamID string, lastSeq uint64, rec model.Record, now time.Time) {
-	delete(actor.inFlights, streamID)
+	if f := actor.inFlights[streamID]; f != nil {
+		actor.inFlightBytes -= f.bytes()
+		delete(actor.inFlights, streamID)
+	}
 	actor.finalized.put(streamID, finalizedStream{lastSeq: lastSeq, offset: rec.Offset}, now)
 	actor.lastOffset = rec.Offset
 	actor.meta.LastOffset = rec.Offset

@@ -76,6 +76,9 @@ func (b *Broker) validatePublishRequest(sessionID string, req model.PublishReque
 	if sessionID == "" || !validOptionalJSON(req.Payload) || !validOptionalJSON(req.Meta) {
 		return false, ErrInvalidInput
 	}
+	if len(req.Delta)+len(req.Payload)+len(req.Meta) > b.cfg.MaxEventBytes {
+		return false, ErrEventTooLarge
+	}
 	hasPayload := hasJSON(req.Payload)
 	if !validPublishShape(req, hasPayload) {
 		return false, ErrInvalidInput

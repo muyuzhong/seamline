@@ -21,6 +21,9 @@ var (
 	ErrTooManyStreams  = errors.New("too many concurrent in-flight streams for this session")
 	ErrStreamFinalized = errors.New("stream already finalized")
 	ErrBrokerClosed    = errors.New("broker closed")
+
+	ErrEventTooLarge         = errors.New("event exceeds the maximum event size")
+	ErrInFlightQuotaExceeded = errors.New("in-flight stream buffers would exceed the session quota")
 )
 
 const (
@@ -29,6 +32,8 @@ const (
 	defaultSweepInterval        = 1 * time.Minute
 
 	DefaultMaxConcurrentStreams = 8
+	DefaultMaxEventBytes        = 256 << 10
+	DefaultMaxInFlightBytes     = 2 << 20
 	DefaultIdempotencyWindow    = 5 * time.Minute
 )
 
@@ -41,6 +46,10 @@ type Config struct {
 	InstanceID string
 	// MaxConcurrentStreams bounds in-flight streams per session (default 8).
 	MaxConcurrentStreams int
+	// MaxEventBytes bounds delta + payload + meta of a single publish (default 256 KiB).
+	MaxEventBytes int
+	// MaxInFlightBytes bounds the merged text + meta of all in-flight streams of a session (default 2 MiB).
+	MaxInFlightBytes int
 	// IdempotencyWindow is how long a finalized stream keeps deduplicating retries (default 5m).
 	IdempotencyWindow time.Duration
 }
@@ -57,6 +66,8 @@ func normalizeConfig(cfg Config) Config {
 	cfg.IdleSessionTTL = orDefault(cfg.IdleSessionTTL, defaultIdleSessionTTL)
 	cfg.SweepInterval = orDefault(cfg.SweepInterval, defaultSweepInterval)
 	cfg.MaxConcurrentStreams = orDefault(cfg.MaxConcurrentStreams, DefaultMaxConcurrentStreams)
+	cfg.MaxEventBytes = orDefault(cfg.MaxEventBytes, DefaultMaxEventBytes)
+	cfg.MaxInFlightBytes = orDefault(cfg.MaxInFlightBytes, DefaultMaxInFlightBytes)
 	cfg.IdempotencyWindow = orDefault(cfg.IdempotencyWindow, DefaultIdempotencyWindow)
 	if cfg.InstanceID == "" {
 		cfg.InstanceID = randomHex(6)

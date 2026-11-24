@@ -301,6 +301,8 @@ func (h *handler) writeBrokerError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, broker.ErrTooManyStreams), errors.Is(err, broker.ErrStreamFinalized):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, broker.ErrEventTooLarge), errors.Is(err, broker.ErrInFlightQuotaExceeded):
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
 	case errors.Is(err, broker.ErrBrokerClosed):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:

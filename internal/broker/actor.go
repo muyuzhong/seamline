@@ -23,6 +23,11 @@ type inFlightState struct {
 	updatedAt time.Time
 }
 
+// bytes is this stream's contribution to the session's MaxInFlightBytes quota.
+func (f *inFlightState) bytes() int {
+	return f.mergedBuf.Len() + len(f.meta)
+}
+
 func (f *inFlightState) view() model.InFlightView {
 	return model.InFlightView{
 		StreamID:  f.streamID,
@@ -80,6 +85,7 @@ type sessionActor struct {
 	metaFlushTried bool
 	lastOffset     uint64
 	inFlights      map[string]*inFlightState
+	inFlightBytes  int
 	finalized      *windowIndex[finalizedStream]
 	subscribers    map[*subState]struct{}
 	lastActiveNano atomic.Int64

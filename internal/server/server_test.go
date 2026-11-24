@@ -537,6 +537,7 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 	_, srv := newTestEnv(t, "err999", broker.Config{
 		InstanceID:           "inst-err999",
 		MaxConcurrentStreams: 2,
+		MaxEventBytes:        1024,
 	}, server.Config{
 		EnableDemo: true,
 	})
@@ -606,6 +607,12 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 		Type:     "assistant_message",
 		Delta:    "one too many",
 	}, http.StatusConflict, nil)
+
+	// 6b. An event larger than MaxEventBytes gets 413.
+	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
+		Type:  "user_message",
+		Delta: strings.Repeat("x", 2000),
+	}, http.StatusRequestEntityTooLarge, nil)
 
 	// 7. Malformed Last-Event-ID returns 400 Bad Request.
 	_ = doGet(t, srv.URL+"/v1/sessions/s-err/stream", http.StatusBadRequest, map[string]string{
