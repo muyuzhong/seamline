@@ -56,7 +56,7 @@ type Config struct {
 	MaxInFlightBytes int
 	// InFlightIdleTimeout seals an in-flight stream that received no chunk for this long (default 2m).
 	InFlightIdleTimeout time.Duration
-	// IdempotencyWindow is how long a finalized stream keeps deduplicating retries (default 5m).
+	// IdempotencyWindow is how long finalized streams and idempotency keys deduplicate retries (default 5m).
 	IdempotencyWindow time.Duration
 }
 

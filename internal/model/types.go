@@ -51,6 +51,9 @@ type PublishRequest struct {
 	// {"tool_name":"exec_sql","call_id":"call_1"}). It is ignored on later chunks.
 	Meta json.RawMessage `json:"meta,omitempty"`
 	Fin  bool            `json:"fin"`
+	// IdempotencyKey deduplicates retries of atomic (stream_id == "") publishes within the
+	// broker's idempotency window. Streams deduplicate by (stream_id, seq) instead.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type PublishResult struct {

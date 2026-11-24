@@ -68,9 +68,13 @@ func validOptionalJSON(raw json.RawMessage) bool {
 	return !hasJSON(raw) || json.Valid(raw)
 }
 
-// validPublishShape rejects an atomic event that carries neither payload nor delta.
+// validPublishShape rejects an atomic event that carries neither payload nor delta, and an
+// idempotency key on a stream chunk (streams deduplicate by (stream_id, seq)).
 func validPublishShape(req model.PublishRequest, hasPayload bool) bool {
-	return req.StreamID != "" || hasPayload || req.Delta != ""
+	if req.StreamID == "" {
+		return hasPayload || req.Delta != ""
+	}
+	return req.IdempotencyKey == ""
 }
 
 func (b *Broker) validatePublishRequest(sessionID string, req model.PublishRequest) (bool, error) {
@@ -144,6 +148,22 @@ func nextAtomicState(reqType string, hasInFlight bool, current model.SessionStat
 	return current
 }
 
+// idempotentReplayLocked returns the original result for a retried atomic publish.
+func (b *Broker) idempotentReplayLocked(actor *sessionActor, key string, now time.Time) (model.PublishResult, bool) {
+	if key == "" {
+		return model.PublishResult{}, false
+	}
+	offset, ok := actor.idempotent.get(key, now)
+	if !ok {
+		return model.PublishResult{}, false
+	}
+	return model.PublishResult{
+		CommittedOffset: offset,
+		Epoch:           actor.meta.Epoch,
+		Deduplicated:    true,
+	}, true
+}
+
 func (b *Broker) publishAtomicLocked(
 	ctx context.Context,
 	actor *sessionActor,
@@ -151,6 +171,10 @@ func (b *Broker) publishAtomicLocked(
 	hasPayload bool,
 	now time.Time,
 ) (model.PublishResult, error) {
+	if res, ok := b.idempotentReplayLocked(actor, req.IdempotencyKey, now); ok {
+		return res, nil
+	}
+
 	payload, err := resolveRecordPayload(hasPayload, req.Payload, req.Delta)
 	if err != nil {
 		return model.PublishResult{}, err
@@ -173,6 +197,9 @@ func (b *Broker) publishAtomicLocked(
 	actor.meta.LastOffset = rec.Offset
 	actor.meta.UpdatedAt = now
 	actor.meta.State = nextAtomicState(req.Type, len(actor.inFlights) > 0, actor.meta.State)
+	if req.IdempotencyKey != "" {
+		actor.idempotent.put(req.IdempotencyKey, rec.Offset, now)
+	}
 
 	actor.fanOutLocked(committedEvent(rec))
 	actor.saveMetaBestEffortLocked(ctx, b.store)

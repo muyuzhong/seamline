@@ -87,6 +87,7 @@ type sessionActor struct {
 	inFlights      map[string]*inFlightState
 	inFlightBytes  int
 	finalized      *windowIndex[finalizedStream]
+	idempotent     *windowIndex[uint64]
 	subscribers    map[*subState]struct{}
 	lastActiveNano atomic.Int64
 	pins           atomic.Int32
@@ -193,6 +194,7 @@ func (b *Broker) newCandidateActor(meta model.SessionMeta, saved bool) *sessionA
 		lastOffset:    meta.LastOffset,
 		inFlights:     make(map[string]*inFlightState),
 		finalized:     newWindowIndex[finalizedStream](b.cfg.IdempotencyWindow),
+		idempotent:    newWindowIndex[uint64](b.cfg.IdempotencyWindow),
 		subscribers:   make(map[*subState]struct{}),
 	}
 	actor.pins.Store(1)
