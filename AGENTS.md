@@ -1,6 +1,6 @@
 # Seamline — Repository Instructions (`AGENTS.md`)
 
-**Seamline** is a zero-dependency, resumable dual-speed AI stream broker written in pure Go (`go 1.23`, standard library only). It decouples high-frequency ephemeral LLM token deltas (in-memory coalescing + non-blocking SSE fan-out) from low-frequency durable state (`fin=true` single-record compaction), enabling zero-gap mid-stream `Last-Event-ID` recovery and F5 page reloads.
+**Seamline** is a zero-dependency, resumable AI stream broker written in pure Go (`go 1.23`, standard library only). Every published event is payload-opaque and gets the next per-session cursor `<epoch>:<seq>`; events live in a short TTL hot window where the active run (`run_started` … terminal event) is never evicted, and every SSE event frame carries `id: <epoch>:<seq>`, enabling exact `Last-Event-ID` recovery, F5 reloads in the middle of a run, and an explicit `cursor_reset` whenever a cursor cannot be continued.
 
 This file is the **single source of truth** for AI coding agents (Claude Code, Codex, Cursor, Gemini, Antigravity) and human contributors. Keep rules actionable, verifiable, and grounded in Seamline's invariants.
 
@@ -8,13 +8,13 @@ This file is the **single source of truth** for AI coding agents (Claude Code, C
 
 ## Project Map
 
-- `cmd/seamline/`: HTTP/SSE server entrypoint, CLI flags, and deterministic graceful shutdown (`brk.Close()` before `httpServer.Shutdown()`).
-- `cmd/simworker/`: Standalone CLI worker simulator streaming realistic token deltas over HTTP.
-- `internal/model/`: Canonical domain and wire structs (`Record`, `PublishRequest`, `PublishResult`, `OutEvent`, `InFlightView`, `SessionMeta`, `SessionSnapshot`).
-- `internal/storage/`: `Storage` interface and `MemoryStorage` reference implementation (`sync.RWMutex`, deep-copied `Payload` slices, strictly monotonic `Offset >= 1`).
-- `internal/broker/`: Core `Broker` (`broker.go`), per-session `sessionActor` & idle sweeper (`actor.go`), dual-speed `Publish` state machine (`publish.go`), and zero-gap `Subscribe` catch-up/live pump (`subscribe.go`).
-- `internal/server/`: Standard-library `http.ServeMux` REST + W3C SSE transport (`server.go`) and embedded F5 Live Playground (`demo.go`, `demo.html`).
-- `docs/ARCHITECTURE.md`: Formal specification of the currently implemented Phase 1 baseline on `main`, storage failure consistency model, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
+- `cmd/seamline/`: HTTP/SSE server entrypoint, CLI flags and graceful shutdown.
+- `cmd/simworker/`: CLI worker that publishes one simulated run with idempotency keys and retries.
+- `internal/model/`: Domain and wire types shared by every layer.
+- `internal/hotwindow/`: The hot-window `Storage` interface (shaped for Redis) and the in-memory `MemoryStorage`: seq allocation, the run state machine, retention and byte quotas.
+- `internal/broker/`: Per-session actors: publish and fan-out, subscriptions with cursor classification and catch-up replay, idle run sealing, idempotency keys and the sweeper.
+- `internal/server/`: REST + W3C SSE transport, error codes and the embedded F5 Live Playground.
+- `docs/ARCHITECTURE.md`: Specification of the implemented data plane, down to files and internal functions: event model, hot window, commit consistency, zero-gap handoff proof sketch, lock hierarchy and SSE wire protocol.
 - `docs/DESIGN_V2.md`: **Authoritative Phase 2 / Phase 3 blueprint** — payload-opaque **pure monotonic event cursor (`<epoch>:<seq>`)**, per-session `epoch` + `MetaTTL`, pinned active-run byte ring buffer (`active_run_start_seq` + three-tier byte quotas), `idempotency_key`, `seamline_cursor` DB alignment, `event: cursor_reset`, and stateful Agent session control plane.
 
 ---
@@ -25,11 +25,11 @@ Consult the corresponding specification **before** modifying that subsystem:
 
 | Area Being Changed | Required Reference |
 | :--- | :--- |
-| Phase 2 / Phase 3 features (TTL retention, byte quotas, `cursor_reset`, control plane, Redis) | [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md) |
-| `internal/broker/` state transitions, retries, `inFlight` lifecycle, or `Storage` calls | [State & Storage Failure Consistency](docs/ARCHITECTURE.md#4-state--storage-failure-consistency-model) |
-| `Broker.Subscribe`, `runSubscriberPump`, `Last-Event-ID`, or epoch cursor handling | [Zero-Gap Catch-Up to Live Handoff](docs/ARCHITECTURE.md#5-catch-up-to-live-tailing-zero-gap-proof-sketch) |
-| Locks (`b.mu`, `actor.mu`, `sub.errMu`), `pins`, `evictIdleActors`, or `ListSessions` | [Concurrency, Lock Hierarchy & Pinning](docs/ARCHITECTURE.md#6-concurrency-lock-hierarchy--actor-pinning-model) |
-| `internal/server/`, SSE frame formatting, CORS, or `demo.html` Playground UI | [SSE Wire Protocol Specification](docs/ARCHITECTURE.md#7-sse-wire-protocol-specification) |
+| Retention, runs, quotas, epochs, idempotency, `cursor_reset`, DB alignment, control plane, Redis | [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md) |
+| The publish path, run state, idle sealing, or `Storage` | [Commit & Failure Consistency](docs/ARCHITECTURE.md#4-commit--failure-consistency-model) |
+| Subscriptions, `Last-Event-ID`, or cursor handling | [Zero-Gap Catch-Up to Live Handoff](docs/ARCHITECTURE.md#5-catch-up-to-live-tailing-zero-gap-proof-sketch) |
+| Locks, actor lifetime, or the sweeper | [Concurrency, Lock Hierarchy & Pinning](docs/ARCHITECTURE.md#6-concurrency-lock-hierarchy--actor-pinning-model) |
+| `internal/server/`, SSE frames, CORS, or the Playground UI | [SSE Wire Protocol Specification](docs/ARCHITECTURE.md#7-sse-wire-protocol-specification) |
 | Linter rules, Makefile targets, or GitHub Actions CI | [`Makefile`](Makefile), [`.golangci.yml`](.golangci.yml), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
 ---
@@ -54,69 +54,53 @@ Formatting rewrites files; always re-run `make check` and `make lint` **after** 
 
 ## Hard Engineering Invariants
 
-Every change to Seamline **must** preserve the permanent invariants below. Note the **Phase Scope** markers: rules marked **[Phase 1 Baseline — Evolves in Phase 2]** describe the currently compiled Phase 1 code and **must be updated in lockstep** (never treated as blockers) when implementing the corresponding Phase 2 items in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
+Every change to Seamline **must** preserve the invariants below. When a change intentionally evolves one of them (for example a Phase 2b/3 item from [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)), update this file and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) in the same PR instead of treating the old rule as a blocker.
 
 ### 1. Dependency Discipline & No `cgo`
-- **[Phase 1 & 2 Core]:** Core runtime packages (`internal/model`, `internal/broker`, `internal/server`, `MemoryStorage`) use **100% Go 1.23+ standard library** (`go 1.23` in `go.mod`). Optional external drivers (such as Phase 3 `RedisStorage`) require explicit approval before adding dependencies.
+- Core runtime packages (`internal/model`, `internal/hotwindow`, `internal/broker`, `internal/server`) use **100% Go 1.23+ standard library** (`go 1.23` in `go.mod`). Optional external drivers (such as a Phase 3 `RedisStorage`) require explicit approval before adding dependencies.
 - Never run `go mod init` or `go mod tidy` with an experimental host toolchain that rewrites the `go 1.23` directive in `go.mod`.
 - Production binaries (`./cmd/seamline`, `./cmd/simworker`) must build cleanly with `CGO_ENABLED=0`. (Note: `go test -race` requires `CGO_ENABLED=1` on the test runner; never set global `CGO_ENABLED=0` across race-test steps.)
 
 ### 2. Strict Lock Hierarchy & Cross-Session Isolation
-- Lock acquisition order is strictly one-way:
+- Lock order is strictly one-way; the storage lock is a leaf taken only inside `Storage` calls:
   ```text
-  Broker.mu (b.mu)  ──►  sessionActor.mu (actor.mu)  ──►  subState.errMu (sub.errMu)
+  broker lock  ──►  session actor lock  ──►  subscription error lock
   ```
-- **Never** acquire `b.mu` while holding `actor.mu` or `sub.errMu`.
-- **Never block waiting on `actor.mu` while holding `b.mu`:**
-  - `Publish` performs `Storage` I/O while holding `actor.mu`. If any caller holds `b.mu` and calls blocking `actor.mu.Lock()`, a single slow disk/WAL write on Session A will freeze `acquireActor` for every other session in the process.
-  - **Sweeper rule (`evictIdleActors`):** While holding `b.mu`, always probe actors with `if !actor.mu.TryLock() { continue }`. A locked actor is actively serving a request and is ineligible for idle eviction anyway.
-  - **Snapshot listing rule (`ListSessions`):** Copy actor pointers out of `b.actors` under `b.mu.RLock()`, release `b.mu.RUnlock()` **immediately**, and then lock/snapshot each `sessionActor` individually outside `b.mu`.
-  - **Hydration rule (`acquireActor`):** Lookup cached actors under `b.mu.RLock()` using atomic pinning (`actor.pins.Add(1)` without locking `actor.mu`); perform cold `store.LoadMeta` and `store.ReadFrom` outside `b.mu`, using double-checked insertion under `b.mu.Lock()`.
-- Prevent actor eviction during active operations exclusively via atomic reference counting (`actor.pins.Add(1)` before releasing `b.mu`, paired with `defer actor.unpin()`). Do not introduce dead/unread boolean eviction flags.
+- **Never** take the broker lock while holding a session lock, and **never** block on a session lock while holding the broker lock: storage I/O runs under the session lock, so a slow write on one session must not freeze the others. Background maintenance only try-locks sessions.
+- Storage is authoritative for session state: reads (`Inspect`, `ListSessions`, `CreateSession`) go to storage, not to in-memory actors.
+- An API call pins its session actor so idle eviction cannot drop it; an actor with an active run or with subscribers is never evicted. Background maintenance must never count as session activity.
 
-### 3. Storage Failure & State Mutation Invariant (`store.Append` Is the Point of No Return)
-- **Pre-Commit Immutability:** Validate inputs, check `ctx.Err()`, and compute candidate values (next sequence number, merged text, marshaled JSON payload, candidate `inFlightState`) in **local variables** before touching storage or mutating `actor`.
-  - **Never** mutate `actor.inFlight`, `mergedBuf`, `lastSeq`, `lastOffset`, or `lastCompacted*` **before** `store.Append` succeeds (or before pre-flight checks pass on non-`fin` chunks).
-  - Why: If `store.Append` fails on `fin=true` after `lastSeq` or `mergedBuf` was already mutated, a retry with the same `(stream_id, seq)` falsely hits `seq <= lastSeq` deduplication (`Deduplicated: true` with `CommittedOffset: 0`), permanently wedging the session in `409 Conflict` (`ErrStreamConflict`) and preventing idle eviction. Likewise, allocating `actor.inFlight = &inFlightState{}` before verifying the first chunk leaves an empty zombie stream on failure.
-- **Point of No Return (`store.Append`):** Once `store.Append` returns `nil` (for either an atomic event or a `fin=true` stream compaction), the record is durably committed:
-  1. Immediately advance `actor` in-memory state (`lastOffset`, `meta`, `lastCompacted*`, and `actor.inFlight = nil` on `fin=true`).
-  2. Immediately call `actor.fanOutLocked(...)` so live subscribers never miss a committed record or terminal `fin=true` delta.
-  3. Persist `store.SaveMeta` as **best-effort** using `context.WithoutCancel(ctx)` so caller cancellation mid-commit cannot abort metadata persistence. **Never** return an error from `Publish` or skip `fanOutLocked` if `SaveMeta` fails after `store.Append` succeeded—terminal `fin=true` types (`run_finished` / `run_failed`) are persisted on the compacted `Record.Type`, allowing `acquireActor` and `ListSessions` to deterministically reconstruct both `LastOffset` and `SessionState` from tail records via `model.StateFromRecordType` on cold load.
-- **Non-`fin` Delta Consistency:** On `fin=false` chunks, ensure memory mutation (`inFlight`, `mergedBuf`, `lastSeq`) and `fanOutLocked` execute atomically without an intervening failing `SaveMeta` aborting between buffer mutation and fan-out.
+### 3. Commit & State Mutation Invariant (`Storage.Append` Is the Point of No Return)
+- **One atomic commit:** `Storage.Append` assigns the next seq, applies the run state machine and the active-run quota, and writes the event **together with** the session state it leaves behind (`state`, `active_run_start_seq`, latest finished run). There is no separate metadata write.
+- **Nothing changes before the commit:** validation and the idempotency lookup change nothing; the broker's view of the session (latest seq, run pin, run idle timer, idempotency keys) changes only after `Append` succeeds. Why: a failed append must not consume a seq, move the run pin, or remember a key (the retry would be falsely deduplicated).
+- **Point of no return:** once `Append` succeeds, mirror its result, fan the event out and record the `idempotency_key`; never return an error from `Publish` after that. Idle sealing (`run_failed {"reason":"idle_timeout"}`) goes through the same path.
+- **Runs are explicit:** only `run_started` while no run is active opens a run; `run_finished` / `run_failed` / `run_interrupted` while running end it; every other event (including terminal types outside a run) leaves the run as is.
+- **Retention (`hotwindow`):** never evict the active run (`seq >= active_run_start_seq`); the latest finished run ignores `MaxHistoryBytes` and expires `HistoryTTL` after its end; other history expires by `HistoryTTL`, or by `MaxHistoryBytes` while always keeping the newest event; the window stays contiguous. Retention never resets a stream's epoch or seq counter; only `MetaTTL` drops a stream, and the broker keeps the streams of its live sessions alive. `MaxActiveRunBytes` never rejects a terminal event.
 
 ### 4. Zero-Gap Subscription Handoff
-- **[Phase 1 Baseline — Superseded in Phase 2 by `docs/DESIGN_V2.md` §1 & §3]:**
-  - On current `main` (Phase 1), `Broker.Subscribe` resets `afterOffset = 0` on epoch mismatch and captures `(snapOffset, inFlightSnap)` for dual-speed replay.
-  - **When implementing Phase 2 ([`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)):** Remove `InFlight` / `inflight_snapshot` string coalescing and switch to the payload-opaque **Pure Event Cursor (`<epoch>:<seq>`)** with per-session epochs (`MetaTTL`), **pinned active-run retention (`active_run_start_seq` exempt from `HistoryTTL` / `MaxHistoryBytes`)**, and explicit first-frame `event: cursor_reset` (`epoch_mismatch` | `cursor_expired` | `cursor_ahead`).
-- **[Permanent Invariant — Atomic Registration & Snapshot]:** Always register `actor.subscribers[sub] = struct{}{}` and capture the current sequence watermark (`snapSeq` / `snapOffset`) inside the **exact same `actor.mu` critical section**, then replay buffered events up to that watermark outside `actor.mu` and deduplicate `sub.liveCh` events with `Seq <= snapSeq` so zero events are ever dropped or duplicated across the catch-up-to-live boundary.
+- Register the subscriber and capture the snapshot `(epoch, latest seq, active_run_start_seq)` in **one** session critical section, so every live event is newer than the snapshot.
+- Classify the cursor before any frame is sent: no cursor → fresh subscription (whole window, no reset); other epoch or a bare seq → `epoch_mismatch`; seq beyond the snapshot → `cursor_ahead`; next seq already evicted → `cursor_expired`. Never silently reset a cursor.
+- `cursor_reset` is sent at most once and only as the first frame; the retained window and live events follow on the same connection. A hole in the replay ends the subscription with `stream_error` `insufficient_state`, never a silent skip.
 
 ### 5. Non-Blocking Fan-Out, SSE Wire Protocol & Playground XSS Safety
-- **[Permanent] Non-blocking `Publish`:** `fanOutLocked` must use non-blocking channel sends (`select { case sub.liveCh <- ev: default: ... }`). A stalled reader is evicted (`ErrSlowSubscriber`) without delaying producers or sibling subscribers.
-- **[Phase-Scoped] Cursor placement (`id:`):**
-  - *Phase 1 (`main`):* Emits `id: <epoch>:<offset>` only on finalized `event: record` frames.
-  - *Phase 2 (`docs/DESIGN_V2.md`):* Under the Pure Event Cursor model, emit `id: <epoch>:<seq>` on **every business `Event` frame**, and omit `id:` **only** on Broker control/error frames (`event: cursor_reset` and `event: stream_error`). Update this section when landing the Phase 2 data-plane refactor.
-- **Terminal error event naming & reconnection:** Emit `event: stream_error` (never `event: error`, which collides with `EventSource`'s native network `error` event). Browsers only send `Last-Event-ID` on automatic `EventSource` reconnects—never on `new EventSource(url)`—so native `EventSource` clients must leave the instance open on `stream_error` for automatic `Last-Event-ID` recovery, or pass `?after_offset=<epoch>:<offset>` when opening a new `EventSource`.
-- **Single CORS & Shutdown Path:** Set CORS headers once in `withCORS` middleware rather than duplicating them inside handlers. During shutdown (`cmd/seamline/main.go`), call `brk.Close()` **once** and **before** `httpServer.Shutdown()` so open SSE handlers terminate immediately instead of waiting out the shutdown timeout.
-- **DOM XSS Prevention:** In `internal/server/demo.html` (and any future web UI), render session IDs, payloads, deltas, and URL parameters exclusively via safe DOM APIs (`document.createElement`, `node.textContent`, `element.replaceChildren`)—**never** interpolate dynamic strings into `innerHTML`.
+- **Non-blocking publish:** fan-out never blocks; a stalled reader is evicted (`slow_subscriber`) without delaying producers or other subscribers.
+- **Cursor placement:** every business event frame is `id: <epoch>:<seq>` + `data: <Event JSON>` with **no `event:` line** (EventSource `message`), so producer event types can never collide with control frame names. Control frames `event: cursor_reset` (flat `model.CursorReset` JSON) and `event: stream_error` carry **no** `id:`.
+- **Terminal errors:** emit `event: stream_error` (never `event: error`, which collides with `EventSource`'s network `error` event) with `{"error":"slow_subscriber"}` or `{"error":"insufficient_state"}`. Native `EventSource` clients keep the instance open so the browser reconnects with `Last-Event-ID`; a new `EventSource` passes `?after_seq=<epoch>:<seq>`.
+- **Single CORS & shutdown path:** set CORS headers in one place. On shutdown close the broker **once** and **before** the HTTP server.
+- **DOM XSS prevention:** in `demo.html` (and any future web UI) render session IDs, payloads and URL parameters only via `document.createElement`, `textContent` and `replaceChildren`—**never** `innerHTML`.
 
-### 6. Readability, File Modularity & Cognitive Complexity (`gocognit <= 15`)
-- **Hard Complexity Ceiling (`gocognit <= 15`):** Every non-test Go function across `cmd/` and `internal/` **must** keep cognitive complexity `<= 15` (strictly enforced in CI via `gocognit` in `.golangci.yml`).
-- **Flat Guard Clauses & Table-of-Contents Top-Level Functions:** Prefer early returns and flat guard clauses over deeply nested `if / else / switch / select` blocks. Top-level entrypoints (`Publish`, `Subscribe`, `handleStream`, `acquireActor`) should read top-to-bottom like a concise table of contents delegating to single-purpose helpers (`publishAtomicLocked`, `publishStreamLocked`, `replayCatchUp`, `drainLiveStream`, `streamSSELoop`).
-- **Focused ~250-Line Files Over 1,000-Line Monoliths:** Split multi-concern packages by cohesive responsibility (e.g., `broker.go`, `actor.go`, `publish.go`, `subscribe.go`) around ~200–300 lines per file so human reviewers can understand each file without scrolling a 1,000-line monolith. Never contort logic artificially just to game metrics—extract natural domain steps with clear names.
+### 6. Readability & Cognitive Complexity (`gocognit <= 15`)
+- **Hard complexity ceiling (`gocognit <= 15`):** every non-test Go function across `cmd/` and `internal/` keeps cognitive complexity `<= 15` (enforced in CI via `.golangci.yml`).
+- **Flat guard clauses:** prefer early returns; entrypoints read top-to-bottom and delegate to single-purpose helpers.
+- **Focused files:** split packages by responsibility (~200–300 lines per file). Never contort logic just to game metrics.
 
-### 7. Testing & Linter Discipline
-- Every bug fix or state-machine change in `internal/broker` or `internal/storage` must ship with deterministic **fault-injection regression tests** (`flakyStore` / `slowStore`) verifying:
-  - `fin=true` `Append` failure followed by same-`seq` retry commits cleanly with exact content;
-  - first-chunk failure leaves `InFlight == nil` and does not block subsequent streams;
-  - post-`Append` `SaveMeta` failure still fans out to live subscribers, returns `CommittedOffset`, prevents duplicate records on retry, and recovers state after actor eviction + cold reload;
-  - slow storage I/O on Session A does not block `Publish`, `ListSessions`, or idle sweeping on Session B.
-- Always close `*http.Response.Body` in production and test code (`bodyclose` is enforced in CI).
-- Check errors with `errors.Is` / `errors.As` and wrap with `%w` (`errorlint` is enforced in CI).
-- Keep `Storage` implementations defensive: deep-copy `json.RawMessage` byte slices on both write (`Append`) and read (`ReadFrom`) so caller buffer reuse can never mutate stored history under `-race`.
+### 7. Testing
+- Test externally visible contracts and core invariants, not implementation details; do not duplicate coverage another package already has, and write no serialization round-trip tests. Bound every wait with a timeout. Use fault injection only when a change touches the storage commit path.
+- `Storage` isolates `Payload` at its write entry (`Append` keeps a private copy); stored events are immutable and readers share them.
 
 ---
 
 ## Maintaining These Instructions
 
-- Keep `AGENTS.md` concise and authoritative. Deep protocol proofs, failure matrices, and wire-protocol state machines belong in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-- Keep [`CLAUDE.md`](CLAUDE.md) synchronized as a lightweight pointer to `AGENTS.md` so every AI coding assistant follows identical engineering constraints.
+- Keep `AGENTS.md` to the package map and the invariants. Files, internal functions, proofs, failure matrices and wire-protocol details belong in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and code comments.
+- Keep [`CLAUDE.md`](CLAUDE.md) a lightweight pointer to `AGENTS.md`; do not copy rules into it.

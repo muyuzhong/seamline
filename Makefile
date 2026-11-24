@@ -8,7 +8,7 @@ GOLANGCI_LINT_VERSION := $(shell tr -d '[:space:]' < .golangci-lint-version 2>/d
 .PHONY: help fmt fmt-check vet lint complexity install-lint test test-race build run-demo check clean
 
 help: ## Show available Makefile targets
-	@echo "Seamline — Resumable Dual-Speed AI Stream Broker"
+	@echo "Seamline — Resumable AI Stream Broker"
 	@echo ""
 	@echo "Usage: make <target>"
 	@echo ""
