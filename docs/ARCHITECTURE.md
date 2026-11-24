@@ -1,8 +1,8 @@
 # Seamline Architecture Specification
 
-**架构设计规范 · Resumable Dual-Speed AI Stream Broker**
+**架构设计规范 · Resumable Dual-Speed AI Stream Broker · Hot-Window Data Plane**
 
-This document specifies the internal architecture, state invariants, failure consistency model, concurrency hierarchy, zero-gap subscription handoff proof, and W3C Server-Sent Events (SSE) wire protocol of **Seamline**.
+This document specifies the implemented data plane of **Seamline**: the dual-speed engine (committed records + concurrent in-flight streams), the short TTL hot window, the storage failure consistency model, the zero-gap subscription handoff, the concurrency hierarchy, and the W3C Server-Sent Events (SSE) wire protocol. The reasoning behind each decision, the database alignment contract and the Phase 2/3 roadmap live in [`DESIGN_V2.md`](DESIGN_V2.md).
 
 ---
 
@@ -10,136 +10,139 @@ This document specifies the internal architecture, state invariants, failure con
 
 AI agent and LLM backends produce two fundamentally different classes of events within a single conversation session:
 
-1. **Low-frequency, high-value state transitions** (`user_message`, `tool_call`, `tool_result`, finalized `assistant_message`, `run_finished`): Must be durably persisted in strict monotonic order.
-2. **High-frequency, ephemeral token deltas** (`seq = 1..N`, 20–150 chunks/sec): Valuable for low-latency UI rendering while generation is in flight, but once `fin=true` arrives, only the compacted full message matters for historical replay.
+1. **Low-frequency, high-value state transitions** (`user_message`, `tool_result`, finalized `assistant_message`, `run_finished`): committed in strict monotonic order.
+2. **High-frequency token deltas** (`seq = 1..N`, 20–150 chunks/sec, often several streams at once for parallel tool calls): valuable while generation is in flight, but once `fin=true` arrives only the compacted message matters for replay.
 
-Traditional architectures fail in one of two ways:
-- **Fire-and-forget SSE:** Zero storage amplification, but pressing **F5**, switching Wi-Fi/cellular networks, or opening a second browser tab mid-generation loses or truncates the in-flight response.
-- **Per-token log persistence:** Writing every 3-byte token chunk to Postgres, Kafka, or Redis Streams causes **100x+ write amplification** and bloats catch-up reads.
+Seamline is a **short hot window**, not a system of record: long-term history belongs to client-local storage or the application's own database (see [`DESIGN_V2.md` §1–§2](DESIGN_V2.md)).
 
 ### Design Goals
-- **Zero Write Amplification Mid-Stream:** Coalesce `1..N-1` streaming deltas in RAM inside a per-session actor with **zero `Record` storage writes** until `fin=true` compacts the entire turn into **one `Record`** (`offset + 1`).
-- **Exact Mid-Stream Resumability:** Reconnecting clients using standard browser `EventSource` (`Last-Event-ID: <epoch>:<offset>`) or cold-reloading from `offset=0` reconstruct the exact generated text with **zero missing characters and zero duplicated characters**.
-- **Failure Atomicity & Retry Safety:** Storage errors or context cancellations must never corrupt in-memory sequence counters, wedge a session in `409 Conflict`, or silently drop committed events from live subscribers.
-- **Cross-Session Fault Isolation:** Slow consumers (`ErrSlowSubscriber`) and slow per-session storage writes must never block unrelated sessions or stall global broker operations.
+- **Zero Write Amplification Mid-Stream:** Coalesce `1..N-1` deltas in RAM inside a per-session actor with **zero storage writes** until `fin=true` compacts the stream into **one `Record`** (`offset + 1`).
+- **Exact Mid-Stream Resumability:** Reconnecting clients (`Last-Event-ID: <epoch>:<offset>`) or fresh page loads reconstruct every committed record in the window and the exact text of every in-flight stream, with **zero missing and zero duplicated characters**.
+- **Explicit Discontinuity:** A cursor that cannot be continued gaplessly (different epoch, evicted from the window, or ahead of the stream) always receives an explicit `cursor_reset`; nothing is ever silently skipped.
+- **Bounded Memory:** Per-event, per-session in-flight, and per-session history byte limits; idle streams and sessions are reclaimed.
+- **Failure Atomicity & Retry Safety:** Storage errors or context cancellations never corrupt in-memory counters, wedge a stream, or drop committed events from live subscribers. Retries are idempotent.
+- **Cross-Session Fault Isolation:** Slow consumers and slow per-session storage writes never block unrelated sessions or global broker operations.
 
 ---
 
 ## 2. Dual-Speed Engine Dataflow
 
 ```text
-  Producer (AI Worker)                       Seamline Broker (sessionActor)                        Subscribers (EventSource / SDK)
- ┌────────────────────┐                   ┌──────────────────────────────────┐                   ┌─────────────────────────────────┐
- │ Atomic Event       │  StreamID == ""   │ 1. Validate & Marshal Locally    │                   │                                 │
- │ (user_message)     ├──────────────────►│ 2. store.Append(Offset = k+1)    ├──────────────────►│ id: <epoch>:k+1                 │
- └────────────────────┘                   │ 3. Advance lastOffset & Fan-Out  │   event: record   │ event: record                   │
-                                          │ 4. Best-effort SaveMeta          │                   │                                 │
- ┌────────────────────┐                   ├──────────────────────────────────┤                   ├─────────────────────────────────┤
- │ Streaming Deltas   │  seq=1..N-1       │ Fast Path (RAM Only, 0 Append):  │                   │ (No SSE id: header!)            │
- │ (fin = false)      ├──────────────────►│ • Coalesce into inFlight.merged  ├──────────────────►│ event: delta (seq=1..N-1)       │
- └────────────────────┘                   │ • Advance inFlight.lastSeq       │   event: delta    │                                 │
-                                          │ • Non-blocking fanOutLocked      │                   │ Mid-Stream Reconnect (F5):      │
- ┌────────────────────┐                   ├──────────────────────────────────┤                   │ Last-Event-ID: <epoch>:k+1      │
- │ Final Stream Chunk │  seq=N, fin=true  │ Slow Path (Compaction Commit):   │                   │  1) Catch-up records > k+1      │
- │ (fin = true)       ├──────────────────►│ 1. Build mergedText locally      ├──────────────────►│  2) 1x event: inflight_snapshot │
- └────────────────────┘                   │ 2. store.Append(Offset = k+2)    │   event: delta    │  3) Live event: delta (seq > S) │
-                                          │ 3. Clear inFlight, record compact│ + event: record   │  4) id: <epoch>:k+2 record      │
-                                          │ 4. Fan-out fin delta + Record    │                   └─────────────────────────────────┘
-                                          │ 5. Best-effort SaveMeta          │
-                                          └──────────────────────────────────┘
+  Producer (AI Worker)                    Seamline Broker (sessionActor)                      Subscribers (EventSource / SDK)
+ ┌────────────────────┐                ┌───────────────────────────────────────┐            ┌──────────────────────────────┐
+ │ Atomic Event       │ stream_id=""   │ 1. Validate, idempotency_key lookup   │            │ id: <epoch>:k+1              │
+ │ (user_message)     ├───────────────►│ 2. store.Append(offset k+1)           ├───────────►│ event: record                │
+ └────────────────────┘                │ 3. Advance state, fan out, SaveMeta   │            │                              │
+ ┌────────────────────┐                ├───────────────────────────────────────┤            ├──────────────────────────────┤
+ │ Streaming Deltas   │ stream_id=A,B… │ Fast path (RAM only, 0 storage I/O):  │            │ event: delta (no id:)        │
+ │ (fin = false)      ├───────────────►│ • inFlights[stream_id].merged += Δ    ├───────────►│ (meta on seq=1)              │
+ └────────────────────┘                │ • ≤ MaxConcurrentStreams, ≤ quota     │            │                              │
+ ┌────────────────────┐                ├───────────────────────────────────────┤            │ Reconnect / F5:              │
+ │ Final Chunk        │ seq=N fin=true │ Slow path (compaction commit):        │            │  [cursor_reset]              │
+ │ (fin = true)       ├───────────────►│ store.Append(offset k+2, merged text) ├───────────►│  records in window           │
+ └────────────────────┘                │ remove stream, fan out delta + record │            │  1x inflight_snapshot/stream │
+          ╳ producer goes silent       ├───────────────────────────────────────┤            │  live deltas & records       │
+ ────────────────────────────────────► │ Sweeper: seal after InFlightIdleTimeout├──────────►│ event: record (sealed)       │
+                                       └───────────────────┬───────────────────┘            └──────────────────────────────┘
+                                                           ▼
+                                       Storage hot window (per session): epoch, offset counter,
+                                       committed records evicted by HistoryTTL / MaxHistoryBytes
 ```
 
-### Fast Path vs. Slow Path Summary
+### Path Summary
 
-| Path | Trigger | `Storage.Append` Calls | `inFlight` Buffer Mutation | SSE Frames Emitted | SSE `id:` Header |
+| Path | Trigger | `Storage.Append` | In-flight state | SSE frames | SSE `id:` |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Atomic Record** | `stream_id == ""` | `1` (`offset + 1`) | Untouched | `1x event: record` | `<epoch>:<offset>` |
-| **Fast Path (Delta)** | `stream_id != ""`, `fin == false` | **`0`** | Appends `delta`, sets `lastSeq = seq` | `1x event: delta` | *Omitted* |
-| **Slow Path (Compact)** | `stream_id != ""`, `fin == true` | **`1`** (`offset + 1`) | Cleared (`nil`), sets `lastCompacted*` | `1x event: delta` (`fin:true`) + `1x event: record` | Only on `event: record` |
+| **Atomic Record** | `stream_id == ""` | `1` | Untouched | `record` | `<epoch>:<offset>` |
+| **Fast Path (Delta)** | `stream_id != ""`, `fin == false` | **`0`** | Appends `delta`, `lastSeq = seq` (stream created on first chunk) | `delta` | *Omitted* |
+| **Slow Path (Compact)** | `stream_id != ""`, `fin == true` | **`1`** | Stream removed, quota released, recorded in `finalized` | `delta` (`fin:true`) + `record` | Only on `record` |
+| **Idle Sealing** | no chunk for `InFlightIdleTimeout` | **`1`** | Same as compaction, `Record.Sealed = "idle_timeout"` | `record` | Only on `record` |
 
 ---
 
 ## 3. Domain Model & Session Lifecycle
 
-### Session States (`model.SessionState`)
-- `idle`: Session created, hydrated from cold storage, or finished compacting an assistant stream (`fin=true` on a standard message).
-- `running`: An in-flight stream (`actor.inFlight != nil`) is actively coalescing token deltas in memory.
-- `completed`: Terminal session marker triggered when an atomic event or compacted stream carries `type == "run_finished"`.
-- `failed`: Terminal session marker triggered when an atomic event or compacted stream carries `type == "run_failed"`.
+### 3.1 Session States (`model.SessionState`)
+- `idle`: No in-flight stream (fresh, hydrated from storage, or all streams compacted).
+- `running`: At least one in-flight stream is coalescing deltas in memory.
+- `completed` / `failed`: A committed record carries `type == "run_finished"` / `"run_failed"` (`model.StateFromRecordType`).
 
-### Cold-Reload Normalization & Broker Epochs
-- Each `Broker` instance owns a 12-hex-character `Epoch` (generated at startup in Phase 1, or persisted in WAL headers in Phase 2).
-- Every SSE cursor embeds `<epoch>:<offset>`. If a client reconnects to a restarted in-memory node with `afterEpoch != "" && afterEpoch != broker.Epoch()`, `Broker.Subscribe` resets `afterOffset = 0` so the client never skips records due to a high offset from a prior process lifetime.
-- When `acquireActor` or `ListSessions` loads metadata from cold storage where `meta.State == "running"` (e.g., after an unclean process restart or eviction), Seamline normalizes `meta.State` to `"idle"` because ephemeral RAM `inFlight` state does not survive process restarts.
+### 3.2 Session Stream Identity: Epoch & Offsets
+- **The epoch belongs to the session stream, not to the broker process.** `Storage` generates a random 12-hex epoch when it creates a session stream (`EnsureStream`). Every record, cursor and `PublishResult.epoch` uses it. `Broker.InstanceID()` (reported by `/healthz` as `instance_id`) only identifies the process.
+- `Storage` owns the offset counter (`StreamInfo.LatestOffset`, the highest offset ever appended) and requires `Append` to use exactly `LatestOffset + 1` with the stream's epoch.
+- Retention evicts records but **never** resets the epoch or the offset counter. An evicted cursor is therefore reported as `cursor_expired`, never confused with a new incarnation.
+- A stream (epoch, counter, metadata) is dropped only after `MetaTTL` of inactivity; recreating it yields a **new epoch** and offsets restart at `1`. An in-memory process restart gives every session a new epoch.
+- Hydrated actors normalize a stored `running` state to `idle`: in-flight streams live only in actors and do not survive eviction or restarts (actors with in-flight streams are never evicted).
+
+### 3.3 Hot-Window Limits
+
+| Limit | Default | Enforced in | On overflow |
+| :--- | :--- | :--- | :--- |
+| `MaxEventBytes` (`delta + payload + meta` of one publish) | 256 KiB | `broker.validatePublishRequest` | `ErrEventTooLarge` → `413` |
+| `MaxConcurrentStreams` per session | 8 | `checkStreamCapacityLocked` | `ErrTooManyStreams` → `409` (single-chunk `fin` streams take no slot) |
+| `MaxInFlightBytes` (merged text + meta of all in-flight streams) | 2 MiB | `checkStreamCapacityLocked` | `ErrInFlightQuotaExceeded` → `413`; stream untouched; an empty `fin` always fits; `fin` with explicit `payload` is exempt |
+| `InFlightIdleTimeout` | 2m | sweeper `sealIdleStreams` | stream sealed into a `Record` (`sealed: "idle_timeout"`); later new seqs → `ErrStreamFinalized` (`409`) |
+| `MaxHistoryBytes` per session (`payload + meta + type + stream_id + 64B` per record) | 8 MiB | `MemoryStorage.Append` | oldest records evicted, newest always kept |
+| `HistoryTTL` | 15m | `MemoryStorage.Append` / `Sweep` | records older than the TTL evicted |
+| `MetaTTL` | 24h | `MemoryStorage.Sweep` | idle stream dropped entirely (new epoch on recreation) |
+| `IdempotencyWindow` | 5m | `windowIndex` (`finalized`, `idempotent`) | entries forgotten |
+
+### 3.4 Idempotent Retries
+- **Stream chunks** deduplicate by `(stream_id, seq)`: `seq <= lastSeq` of an in-flight stream returns `deduplicated: true`; within `IdempotencyWindow` after compaction or sealing, `seq <= lastSeq` returns the original `committed_offset`, and any newer seq (or auto-seq `0`) returns `ErrStreamFinalized`.
+- **Atomic events** may carry `idempotency_key`. Within `IdempotencyWindow` a repeat returns the original `committed_offset` + `epoch` with `deduplicated: true` and is not fanned out. The key is recorded only after the append succeeds. Content is not compared. An `idempotency_key` on a stream chunk is rejected (`400`).
 
 ---
 
 ## 4. State & Storage Failure Consistency Model
 
-`Publish` executes under `actor.mu`, serializing all state transitions within a single `sessionID` while allowing full parallelism across distinct sessions. To guarantee retry idempotency and live-subscriber consistency in the presence of transient storage errors or caller context cancellation, `Publish` enforces a strict **Two-Phase Commit Boundary** around `store.Append`.
+`Publish` executes under `actor.mu`, serializing all state transitions within a session while allowing full parallelism across sessions. `store.Append` is the commit boundary.
 
 ### 4.1 Pre-Commit Immutability (Before `store.Append`)
-All request validation (`json.Valid`, sequence gap checks, stream conflict checks, `ctx.Err()`) and candidate computations (`seq`, `mergedText`, `recordPayload`) happen in **stack-local variables** before any storage write or `actor` field mutation:
+All validation (`MaxEventBytes`, `json.Valid` of `payload` / `meta`, sequence gaps, finalized-stream checks, `MaxConcurrentStreams`, `MaxInFlightBytes`, `ctx.Err()`) and candidate computations (`seq`, merged text, record payload, `meta`) happen in **local variables**:
 
-1. **No premature `inFlight` allocation:** When `actor.inFlight == nil` and `seq == 1`, a candidate state is prepared locally rather than immediately assigning `actor.inFlight = &inFlightState{}`. If `fin=true` `store.Append` (or `ctx.Err()`) fails on a single-chunk stream, `actor.inFlight` remains `nil` instead of leaving behind an empty placeholder stream that blocks future `stream_id`s with `409 Conflict`.
-2. **No premature `mergedBuf` / `lastSeq` mutation on `fin=true`:** On `fin=true`, `mergedText` is computed as `existingMerged + req.Delta` without mutating `actor.inFlight.mergedBuf` or `actor.inFlight.lastSeq` until `store.Append` returns `nil`.
-   - If `store.Append` fails, `actor.inFlight` retains its exact pre-call `(mergedBuf, lastSeq)`. The worker can safely retry the **exact same `(stream_id, seq, delta, fin=true)`** request and commit cleanly—neither falsely deduplicating (`seq <= lastSeq`) nor duplicating the final chunk (`"Hellolo"`).
+1. **No premature stream allocation:** A new `inFlightState` is created only after every check passed. A failing single-chunk stream (`seq=1, fin=true`) leaves no stream behind, so it cannot hold a slot or quota.
+2. **No premature buffer mutation on `fin=true`:** The record text is `existingMerged + delta` computed locally. If `store.Append` fails, the stream keeps its exact pre-call `(mergedBuf, lastSeq)` and the same request can be retried (no false dedupe, no `"Hellolo"`).
+3. **No premature idempotency:** `idempotency_key` and `finalized` entries are written only after a successful append.
 
 ### 4.2 `store.Append` as the Point of No Return
-`store.Append(commitCtx, sessionID, rec)` is the **sole durability commit point**:
+Once `store.Append` returns `nil` (atomic, `fin=true` compaction, or idle sealing) the record exists in storage. Rolling back would let retries duplicate records and live subscribers miss offsets. Therefore, immediately:
+1. Advance actor state: `lastOffset`, `meta`, remove the stream from `inFlights` and release its bytes, record `finalized` / `idempotent` entries.
+2. `fanOutLocked` the committed event (preceded by the `fin=true` delta on compaction).
+3. `store.SaveMeta(context.WithoutCancel(ctx), meta)` as **best-effort**. A failure never fails `Publish`.
 
-- Once `store.Append` returns `nil`, the `Record` exists in `Storage` at `nextOffset`. Rolling back or returning an HTTP `500` after this point would cause non-idempotent atomic retries to write duplicate records and cause live subscribers to miss committed offsets.
-- Therefore, immediately after `store.Append` succeeds:
-  1. `actor` advances its in-memory state (`lastOffset = nextOffset`, `meta`, `lastCompactedStreamID/Seq/Offset`, and `actor.inFlight = nil` for `fin=true`).
-  2. `actor.fanOutLocked` broadcasts the committed `OutEvent` (preceded by the final `fin=true` `EventDelta` on stream completion) to all active subscribers.
-  3. `store.SaveMeta(context.WithoutCancel(ctx), actor.meta)` executes as **best-effort** metadata persistence:
-     - Using `context.WithoutCancel(ctx)` prevents an HTTP client timeout/disconnect right after `Append` from aborting the metadata update.
-     - Even if `SaveMeta` returns an error, `Publish` **still succeeds** (`CommittedOffset: rec.Offset`) because `SessionMeta.LastOffset` is reconstructible from the record log.
-
-### 4.3 Cold-Load Tail Reconciliation
-Whenever an idle-evicted or restarted session is hydrated in `acquireActor` (or listed via `ListSessions`):
-1. `LoadMeta(ctx, sessionID)` loads the last saved `SessionMeta` (if any, giving `startOffset = meta.LastOffset`).
-2. `ReadFrom(ctx, sessionID, startOffset)` scans any committed records beyond `startOffset`.
-3. Because `commitFinStreamLocked` persists terminal `fin=true` types (`run_finished` / `run_failed`) directly on the compacted `Record.Type`, any newer tail records found by `ReadFrom` deterministically advance `meta.LastOffset`, `meta.UpdatedAt`, and `meta.State` via the single canonical helper `model.StateFromRecordType(lastRec.Type)`—even if prior best-effort `SaveMeta` calls failed.
+### 4.3 Cold-Load Reconciliation
+`Storage` is authoritative for the epoch, `LatestOffset` and `EarliestOffset`. `LoadMeta` and `ListSessions` merge the best-effort saved metadata with the stream: when the newest retained record is newer than the saved `LastOffset`, `State` and `UpdatedAt` come from that record (`model.StateFromRecordType`). A stream without saved metadata gets synthesized metadata. Hydration therefore needs no tail scan, and a lost `SaveMeta` never makes offsets go backwards.
 
 ### 4.4 Failure Consistency Matrix
 
-| Failure Scenario | `Storage` State | `actor` Memory State | Live Subscribers | Worker Retry Behavior (`same req`) |
+| Failure Scenario | Storage | Actor Memory | Live Subscribers | Retry of the same request |
 | :--- | :--- | :--- | :--- | :--- |
-| `seq=1, fin=false` canceled before commit | Unchanged | `inFlight == nil` | Nothing emitted | Cleanly starts stream at `seq=1` |
-| `seq=N, fin=true` `Append` fails | Offset unchanged | `inFlight` stays at `seq=N-1` | Nothing emitted for `seq=N` | Commits `Offset+1` with exact `mergedText` |
-| Atomic `Append` succeeds, `SaveMeta` fails | `Offset+1` persisted | `lastOffset = Offset+1` | Receives `record` (`Offset+1`) | Caller gets `200 OK` (no duplicate retry); cold reload reconciles via `ReadFrom` |
-| `fin=true` `Append` succeeds, `SaveMeta` fails | `Offset+1` persisted | `inFlight = nil`, `lastCompacted*` set | Receives `fin` `delta` + `record` | Caller gets `200 OK`; late duplicate retry returns `Deduplicated: true, CommittedOffset: Offset+1` |
+| `seq=1, fin=false` rejected (quota, slots, cancel) | Unchanged | No stream created | Nothing | Accepted once capacity allows |
+| `seq=N, fin=true` `Append` fails | Unchanged | Stream stays at `seq=N-1` | Nothing for `seq=N` | Commits `offset+1` with exact text |
+| Atomic with `idempotency_key`, `Append` fails | Unchanged | Key not recorded | Nothing | Commits normally |
+| Atomic `Append` ok, `SaveMeta` fails | `offset+1` | `lastOffset = offset+1` | `record` | With key: deduplicated; reload reconciles from storage |
+| `fin=true` `Append` ok, `SaveMeta` fails | `offset+1` | Stream removed, `finalized` set | `delta` + `record` | `deduplicated: true`, original `committed_offset` |
+| Idle sealing `Append` fails | Unchanged | Stream stays in flight | Nothing | Sweeper retries on the next tick |
 
 ---
 
 ## 5. Catch-Up to Live Tailing Zero-Gap Proof Sketch
 
-**Theorem (Zero-Gap & Duplicate-Free Subscription Handoff):** For any session $S$ within a constant broker `Epoch`, a subscriber connecting with `afterOffset` $O_0$ that is not evicted for slow consumption observes every committed record with `Offset` $> O_0$, and for any stream active at or after subscription time, observes the exact sequence of character deltas without gaps or duplicates.
+**Theorem (Zero-Gap & Duplicate-Free Handoff):** For a session stream with epoch $E$, a subscriber that is not evicted (slow consumer or insufficient state) observes either (a) when its cursor is `<E>:O_0` with `EarliestOffset - 1 <= O_0 <= LatestOffset`: every committed record with offset $> O_0$, or (b) otherwise: one `cursor_reset` followed by every record still retained; and in both cases the exact delta sequence of every stream in flight at or after subscription time.
 
-### Proof Sketch
-1. **Linearization Point under `actor.mu`:**
-   In `Broker.Subscribe`, while holding `actor.mu` (which mutually excludes `Broker.Publish`):
-   - `sub` is inserted into `actor.subscribers` (with buffered channel `sub.liveCh`);
-   - `snapOffset` $\leftarrow$ `actor.lastOffset`;
-   - `inFlightSnap` $\leftarrow$ `actor.inFlightViewLocked()` (capturing `(StreamID: id*, LastSeq: Q_snap, Merged: M_snap)` if an active stream exists, else `nil`).
-   Let $T_{\text{sub}}$ denote this atomic critical section.
-
-2. **Partition of Events Relative to $T_{\text{sub}}$:**
-   Because `Publish` also holds `actor.mu` across state updates and `fanOutLocked`:
-   - **Pre-$T_{\text{sub}}$ committed records** have `Offset` $\in (O_0, \text{snapOffset}]$. Since `Storage` is append-only with strictly increasing offsets, `store.ReadFrom(ctx, sessionID, O_0)` filtered by `Offset <= snapOffset` delivers every committed record in $(O_0, \text{snapOffset}]$ exactly once in Step 1.
-   - **Pre-$T_{\text{sub}}$ in-flight deltas** (if stream `id*` was active at $T_{\text{sub}}$) have sequences $1 \dots Q_{\text{snap}}$ already coalesced into $M_{\text{snap}}$. Step 2 emits a single `inflight_snapshot` carrying `(Seq: Q_snap, Delta: M_snap)`.
-   - **Post-$T_{\text{sub}}$ publications** execute after `sub` is registered in `actor.subscribers`, so `fanOutLocked` enqueues every post-$T_{\text{sub}}$ `OutEvent` into `sub.liveCh` in exact publication order:
-     - Every post-$T_{\text{sub}}$ `EventCommitted` has `Offset` $> \text{snapOffset}$, passing the `ev.Offset <= snapOffset` filter in Step 3. (Conversely, `ReadFrom` in Step 1 explicitly ignores `rec.Offset > snapOffset`, preventing double delivery if `Publish` commits while Step 1 is reading storage!)
-     - Every post-$T_{\text{sub}}$ `EventDelta` for stream `id*` has `Seq` $> Q_{\text{snap}}$ (enforced by monotonic `Publish` sequence validation), passing the `ev.Seq <= inFlightSnap.LastSeq` filter in Step 3 and concatenating seamlessly onto $M_{\text{snap}}$.
-     - When `id*` finishes (`fin=true`) and emits its `EventCommitted`, Step 3 clears `inFlightSnap = nil`, ensuring future streams are unaffected. $\blacksquare$
+1. **Linearization point under `actor.mu`:** `registerSubscriber` inserts `sub` into `actor.subscribers` and captures `(epoch, snapOffset = actor.lastOffset, views of all in-flight streams)` in one critical section $T_{sub}$. `Publish` and sealing hold `actor.mu` across state updates and `fanOutLocked`.
+2. **Partition:**
+   - Records committed before $T_{sub}$ have offsets $\le$ `snapOffset` and are read from storage.
+   - Deltas published before $T_{sub}$ are contained in the captured views (`Merged`, `LastSeq`) and are emitted as one `inflight_snapshot` per stream.
+   - Everything published after $T_{sub}$ is enqueued into `sub.liveCh` in publication order and is strictly newer than the snapshot (offset $>$ `snapOffset`, seq $>$ the stream's `LastSeq`). The `isCoveredBySnapshot` filter is therefore defense in depth only.
+3. **Cursor classification (`planReplay`)** uses only the cursor and the snapshot, then one atomic `store.ReadFrom` returns both the records and the window, so the `cursor_expired` test (`O_0 + 1 < EarliestOffset`) and the replayed records are consistent. At most one `cursor_reset` is sent, always first.
+4. **Contiguity check:** For a resumable cursor the first replayed record must be `O_0 + 1` and records must be contiguous up to `snapOffset`; after a reset or for a fresh subscription the replay may start anywhere in the window but must then be contiguous. Records above `snapOffset` are skipped (they arrive through `liveCh`). A hole ends the subscription with `ErrInsufficientState`, so a gap is never delivered silently; the reconnect gets a `cursor_reset`. $\blacksquare$
 
 ---
 
 ## 6. Concurrency, Lock Hierarchy & Actor Pinning Model
 
 ### 6.1 Strict Lock Partial Order
-All mutex acquisitions obey a strict DAG:
 
 ```text
   Broker.mu (b.mu)
@@ -152,17 +155,26 @@ All mutex acquisitions obey a strict DAG:
 ```
 
 ### 6.2 Non-Blocking Global RWMutex (`b.mu`) Rules
-`b.mu` (`sync.RWMutex`) protects `b.closed` and the `b.actors` map (`map[string]*sessionActor`). To guarantee $O(1)$ contention-free session lookup even when individual sessions perform slow `Storage` writes under `actor.mu`:
-- **`acquireActor`:** Checks `b.actors[sessionID]` under `b.mu.RLock()`, atomically incrementing `actor.pins` and updating `actor.lastActiveNano` without acquiring `actor.mu`. On a cache miss, it releases `b.mu.RUnlock()` **before** calling `store.LoadMeta` / `store.ReadFrom`, then acquires `b.mu.Lock()` using double-checked locking to insert the hydrated actor.
-- **`evictIdleActors` (Background Sweeper):** Iterates `b.actors` under `b.mu.Lock()`, skipping pinned actors (`actor.pins.Load() > 0`) and probing unpinned actors via **non-blocking `actor.mu.TryLock()`**. If `TryLock()` returns `false`, another goroutine is actively using the actor, so the sweeper immediately skips it without stalling `b.mu`. Dirty metadata flushes (`!actor.metaPersisted`) are pinned and executed after releasing `b.mu`.
-- **`ListSessions` & `Close`:** Snapshot or swap `*sessionActor` pointers under `b.mu.RLock()` / `b.mu.Lock()`, release `b.mu` immediately, and then acquire `actor.mu` on each pointer outside `b.mu`.
+`b.mu` protects `b.closed` and the `b.actors` map. It is never held while blocking on `actor.mu` or doing storage I/O:
+- **`acquireActor`:** Looks up `b.actors` under `b.mu.RLock()`, pinning atomically without `actor.mu`. On a miss it releases `b.mu` before `store.EnsureStream` / `store.Stream` and `store.LoadMeta`, then inserts with double-checked locking under `b.mu.Lock()`.
+- **`evictIdleActors`:** Iterates under `b.mu.Lock()`, skipping pinned actors and probing others with `actor.mu.TryLock()`. Dirty metadata flushes are pinned and executed after releasing `b.mu`.
+- **`sealIdleStreams`:** Pins all actors under `b.mu.RLock()`, releases it, then `TryLock`s each actor; busy actors are retried next tick.
+- **`maintainStorage`:** Copies live session IDs under `b.mu.RLock()`, then calls `store.Touch` for each and `store.Sweep` outside `b.mu`.
+- **`ListSessions` & `Close`:** Snapshot or swap actor pointers under `b.mu`, release it, then lock each actor individually.
 
 ### 6.3 Atomic Actor Pinning & Idle Eviction
-`acquireActor` atomically increments `actor.pins` (`atomic.Int32`) before returning an actor, and every caller (`CreateSession`, `Publish`, `Subscribe`, `Inspect`) executes `defer actor.unpin()`. An actor is eligible for idle eviction in `evictIdleActors` if and only if all four conditions hold simultaneously while `actor.mu` is held via `TryLock()`:
-1. `actor.pins.Load() == 0` (no in-progress API call holds a reference)
-2. `len(actor.subscribers) == 0` (no active SSE stream is tailing the actor)
-3. `actor.inFlight == nil` (no unfinished token stream is buffered exclusively in RAM)
-4. `now.Sub(time.Unix(0, actor.lastActiveNano.Load())) > b.cfg.IdleSessionTTL`
+Every API call pins its actor (`actor.pins.Add(1)`) and releases it with `defer actor.unpin()`, which also refreshes `lastActiveNano`. **Sweeper pins are released with `actor.pins.Add(-1)` and never touch the actor**, otherwise the sweeper itself would keep every session alive. An actor is evicted iff, while `actor.mu` is held via `TryLock()`:
+1. `actor.pins.Load() == 0`
+2. `len(actor.subscribers) == 0`
+3. `len(actor.inFlights) == 0` (silent streams are sealed first, so dead producers cannot pin a session forever)
+4. `now - lastActiveNano > IdleSessionTTL`
+
+Evicting an actor only drops the broker-side cache: the stream, its epoch and its retained records stay in storage until retention or `MetaTTL` removes them.
+
+### 6.4 Sweeper Pass (every `SweepInterval`)
+1. `sealIdleStreams`: seal streams silent for `InFlightIdleTimeout`.
+2. `evictIdleActors`: evict idle actors.
+3. `maintainStorage`: `Touch` the stream of every remaining actor (so a session with attached subscribers never expires), then `store.Sweep(now)` (history TTL, `MetaTTL`).
 
 ---
 
@@ -171,35 +183,45 @@ All mutex acquisitions obey a strict DAG:
 `GET /v1/sessions/{id}/stream` implements W3C Server-Sent Events (`Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`).
 
 ### 7.1 Cursor Resolution Precedence
-1. **`Last-Event-ID` HTTP Header** (sent automatically by browser `EventSource` on reconnect): `<epoch>:<offset>` (or bare `<offset>`).
-2. **Query Parameters** (used on initial page load or SDK bootstrap): `?after_offset=<offset>&epoch=<epoch>` (or `?after_offset=<epoch>:<offset>`).
-3. **Default:** `afterOffset = 0, afterEpoch = ""` (replays full session history + active `inflight_snapshot` + live stream).
+1. **`Last-Event-ID` header** (sent automatically by browser `EventSource` on reconnect): `<epoch>:<offset>`.
+2. **Query parameters** (initial page load, SDK bootstrap, DB watermark): `?after_offset=<epoch>:<offset>` or `?after_offset=<offset>&epoch=<epoch>`.
+3. **Default:** fresh subscription (whole retained window, in-flight snapshots, live stream; no reset).
+
+A cursor without an epoch but with a non-zero offset cannot be validated against the current incarnation and is answered with `cursor_reset` `epoch_mismatch`.
 
 ### 7.2 Frame Catalog
 
 | Frame Type | Wire Format | Carries `id:`? | Semantics |
 | :--- | :--- | :---: | :--- |
-| **Connected Handshake** | `: connected epoch=<epoch>\n\n` | No | Emitted immediately upon HTTP `200 OK` flush to announce active broker epoch. |
-| **Keepalive Heartbeat** | `: keepalive\n\n` | No | Emitted every `KeepaliveInterval` (default `15s`) to prevent reverse-proxy idle timeouts. |
-| **Committed Record** | `id: <epoch>:<offset>\nevent: record\ndata: {...}\n\n` | **Yes** | Durable session record (`user_message`, compacted `assistant_message`, etc.). Advances client `Last-Event-ID`. |
-| **In-Flight Snapshot** | `event: inflight_snapshot\ndata: {...}\n\n` | **No** | Coalesced text (`delta`) up to `seq` for a stream already running when the client subscribed. |
-| **Live Token Delta** | `event: delta\ndata: {...}\n\n` | **No** | Incremental token slice (`seq`, `delta`, `fin`). |
-| **Terminal Stream Error** | `event: stream_error\ndata: {"error":"slow_subscriber"}\n\n` | **No** | Sent right before closing a slow subscriber's HTTP response. Named `stream_error` so it never collides with browser `EventSource`'s built-in network `error` event. |
+| **Connected Handshake** | `: connected epoch=<session epoch>\n\n` | No | First bytes after `200 OK`; announces the session stream epoch. |
+| **Keepalive Heartbeat** | `: keepalive\n\n` | No | Every `KeepaliveInterval` (default `15s`). |
+| **Cursor Reset** | `event: cursor_reset\ndata: {"reason":…,"requested_epoch":…,"requested_offset":…,"current_epoch":…,"earliest_offset":…,"latest_offset":…}\n\n` | **No** | At most once, first event only. `reason` is `epoch_mismatch`, `cursor_expired` or `cursor_ahead`. The retained window, snapshots and live stream follow on the same connection. |
+| **Committed Record** | `id: <epoch>:<offset>\nevent: record\ndata: {...}\n\n` | **Yes** | Committed record (`meta` and `sealed` when present). Advances `Last-Event-ID`. |
+| **In-Flight Snapshot** | `event: inflight_snapshot\ndata: {...}\n\n` | **No** | One per stream in flight at subscription time: merged text up to `seq`, plus `meta`. |
+| **Live Token Delta** | `event: delta\ndata: {...}\n\n` | **No** | Incremental slice (`stream_id`, `seq`, `delta`, `fin`; `meta` on a stream's first delta). |
+| **Terminal Stream Error** | `event: stream_error\ndata: {"error":"slow_subscriber"}\n\n` or `{"error":"insufficient_state"}` | **No** | Sent right before the server closes the stream. Never named `error` (collides with `EventSource`'s network `error` event). |
 
 ### 7.3 Reference Client Reconstruction State Machine
-Clients maintain a map of committed messages by `offset` plus at most one active `inFlight` buffer keyed by `stream_id`:
-1. On `event: record`: If `stream_id` matches the active `inFlight` buffer, replace the temporary streaming bubble with the authoritative `payload` at `offset`; otherwise append `record` at `offset`. Browser `EventSource` automatically updates `Last-Event-ID` to `<epoch>:<offset>`.
-2. On `event: inflight_snapshot`: Initialize/replace the temporary `inFlight` buffer for `stream_id` with `text = ev.delta` and `lastSeq = ev.seq`.
-3. On `event: delta`: If `ev.seq > lastSeq`, append `ev.delta` to the `inFlight` buffer and advance `lastSeq = ev.seq`.
-4. On `event: stream_error`: Inspect `data.error` (e.g., `"slow_subscriber"`). Note that browsers send the `Last-Event-ID` HTTP header **only** during automatic `EventSource` reconnection—never when instantiating a brand-new `new EventSource(url)`:
-   - **Native `EventSource` client:** Do **not** call `es.close()`; once the server closes the HTTP stream after `stream_error`, the browser automatically reconnects with `Last-Event-ID: <epoch>:<offset>` and recovers via catch-up + `inflight_snapshot`.
-   - **New `EventSource` instance or manual reconnect:** Pass the saved cursor in the query string (`?after_offset=<epoch>:<offset>`, supported by `extractStreamCursor`), or send an explicit `Last-Event-ID` header in non-browser HTTP SDKs.
+Clients keep committed records by `offset` and a map of in-flight buffers keyed by `stream_id`:
+1. `record`: store at `offset`; if a buffer exists for its `stream_id`, replace that streaming bubble with the authoritative `payload` (a `sealed` record means the producer went silent and the text is partial).
+2. `inflight_snapshot`: initialize/replace the buffer for `stream_id` with `text = delta`, `lastSeq = seq`, `meta`.
+3. `delta`: if `seq == lastSeq + 1` append and advance.
+4. `cursor_reset`: keep the connection, buffer the following events, reload committed history from the application's source of truth, then merge (see [`DESIGN_V2.md` §2–§3](DESIGN_V2.md)).
+5. `stream_error`: native `EventSource` clients must **not** call `es.close()`; the browser reconnects with `Last-Event-ID` (for `insufficient_state` that reconnect receives a `cursor_reset`). A brand-new `EventSource` must pass the saved cursor as `?after_offset=<epoch>:<offset>`.
+
+### 7.4 Publish Status Codes
+
+| Status | Broker error |
+| :--- | :--- |
+| `400` | `ErrInvalidInput` (empty event, invalid JSON `payload`/`meta`, `idempotency_key` on a chunk), `ErrSequenceGap` |
+| `409` | `ErrTooManyStreams`, `ErrStreamFinalized` |
+| `413` | `ErrEventTooLarge`, `ErrInFlightQuotaExceeded` |
+| `503` | `ErrBrokerClosed` |
 
 ---
 
 ## 8. Architectural Evolution (Phase 2 -> Phase 3)
 
-> **Design Evolution Notice:** Sections 1–7 above document the currently implemented **Phase 1** baseline. Next-stage architecture decisions are specified in **[`docs/DESIGN_V2.md`](DESIGN_V2.md)**:
-> - **Dual-Speed Short-TTL Hot Window & Three-Tier Byte Quotas (No Custom Disk WAL):** Long-term history belongs to client local storage or the application's primary DB, synchronized via the `seamline_cursor = "<epoch>:<offset>"` causal watermark contract. Seamline retains Dual-Speed coalescing (`Record` + bounded multi-stream `inFlights` with `Meta` headers for parallel tool-call JSON), evicting **only committed `Record`s** under `HistoryTTL` / `MaxHistoryBytes` while protecting active uncommitted `inFlights` (`MaxInFlightBytes`) and enforcing per-request `MaxEventBytes`.
-> - **Explicit Gap Signaling (`event: cursor_reset`):** Superseding Phase 1's silent `afterOffset = 0` reset when `after_epoch != current_epoch` or `after_offset` falls behind `earliest_offset`, eliminating silent gaps on volatile memory restarts or TTL trimming.
-> - **Stateful Agent Session Control Plane & Pluggable Redis:** Differentiating Seamline from stateless pub/sub gateways (such as Centrifugo) via Run concurrency guards, bidirectional `Cancel` / `Steer` channels, idempotent CAS `WaitingApproval` gates, Worker heartbeat leases, and a Phase 3 `RedisStorage` backend.
+The data plane above implements the hot-window part of [`DESIGN_V2.md`](DESIGN_V2.md). Still to come:
+- **Stateful Agent Session Control Plane (Phase 2):** Run concurrency policies, `Cancel` / `Steer` worker channel, idempotent `WaitingApproval` gate, and worker heartbeat leases. A lease expiry reuses the sealing path with a `worker_lost` marker.
+- **`RedisStorage` (Phase 3):** The `Storage` interface is shaped for Redis (meta hash with epoch + offset counter and `EXPIRE`, `XADD` with explicit `<offset>-0` IDs, `XRANGE`, `XTRIM MINID`); see the mapping in `internal/storage/storage.go`. In-flight streams and dedupe indexes stay in the owning broker instance, so multi-instance deployments need session affinity or moving those into Redis.

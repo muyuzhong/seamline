@@ -27,12 +27,29 @@
 1. **未定稿活跃流层（`inFlights map[string]*inFlightState` —— 绝不被历史窗口淘汰）**：
    - **多路并发流与头元数据**：将 Phase 1 的单指针扩展为有界字典（默认单会话最多 `MaxConcurrentStreams = 8` 条并发 `stream_id`），并在首帧保留可选 `Meta json.RawMessage`（如 `{"tool_name":"exec_sql","call_id":"call_1"}`），原生承载多路并行工具调用（Parallel Tool Calls）的半截 JSON 参数流与思维链块。
    - **原地聚合免截断**：同一 `stream_id` 的流式 `delta` 在内存 `bytes.Buffer` 中原地拼接（例如 10,000 个 Token 碎片仅占约 `40 KiB` 内存，而非 10,000 条独立事件），在 `fin=true` 定稿前**绝不参与历史滑动窗口淘汰**。只要任务仍在生成，中途任意时刻重连均可通过 `event: inflight_snapshot` 完整拿到主库尚未落库的半截内容。
+   - **并发上限**：已有 `MaxConcurrentStreams` 条流在途时，新 `stream_id` 的非 `fin` 首帧返回 `409`（`ErrTooManyStreams`）；单帧流（`seq=1, fin=true`）不占名额，照常接受。
+   - **僵尸流封存（数据面最小版本，控制面租约上线前）**：每个 chunk 都会续期该流的空闲期限。超过 `InFlightIdleTimeout`（默认 `2m`）没有新 chunk 的流，由 broker 清扫器把已拼接内容封存成一条 `Record`（`"sealed":"idle_timeout"`，保留 `Meta`），扇出给订阅者并释放名额与配额；之后同一 `stream_id` 的新 `seq` 返回 `409`（`ErrStreamFinalized`），重发已接受过的 `seq` 按幂等返回原 `committed_offset`。生产者可以发空 `delta` 作为心跳。控制面的 Worker 租约到期时复用同一路径，标记 `worker_lost`。
 2. **已定稿记录层（Committed `Record`，单调递增 `Offset = 1, 2, ...`）**：
    - 离散事件（`stream_id == ""`）或流完结帧（`fin == true`）归并为 1 条定稿 `Record`（`Offset + 1`），仅对已定稿 `Record` 执行 `HistoryTTL` 与字节水位滑动淘汰（维护当前缓冲区最早可用偏移 `earliest_offset`）。
 3. **三层硬字节配额（封死单事件大包与内存膨胀）**：
-   - `MaxEventBytes`（默认 `256 KiB`）：限制单次 `Publish` HTTP 请求体及单条 `Record.Payload` 体积（收紧 Phase 1 中过宽的 `4 MiB` 上限，超限返回 `413 Payload Too Large`）；
-   - `MaxInFlightBytes`（默认 `2 MiB` / 会话）：限制单会话所有未完结 `inFlights` 缓冲区的总字节数（足以容纳数十万字符的单轮长输出，同时防止异常 Worker 无限流式写入不发 `fin` 导致 OOM）；
-   - `MaxHistoryBytes`（默认 `8 MiB` / 会话）+ `HistoryTTL`（默认 `15m`）：仅淘汰最老的**已定稿 `Record`**（推进 `earliest_offset`），不影响活跃 `inFlights`。
+   - `MaxEventBytes`（默认 `256 KiB`）：**只限制单次发布请求**（`delta + payload + meta`），在请求到达时检查，超限返回 `413`（收紧 Phase 1 中过宽的 `4 MiB` 上限）。流定稿后的 `Record` 由下一层 `MaxInFlightBytes` 约束，不受 `256 KiB` 限制；
+   - `MaxInFlightBytes`（默认 `2 MiB` / 会话）：限制单会话所有未完结 `inFlights` 的拼接文本 + `Meta` 总字节数（足以容纳数十万字符的单轮长输出，同时防止异常 Worker 无限流式写入不发 `fin` 导致 OOM）。在途内容不能淘汰最旧部分（否则会从中间截断正在生成的文字），所以超限时**拒绝该 chunk**，返回 `413`（`inflight_quota_exceeded`），流保持原样；生产者仍可发空 `delta` 的 `fin` 把已有内容定稿。携带显式 `payload` 的 `fin` 不增长拼接缓冲区，不受此限；
+   - `MaxHistoryBytes`（默认 `8 MiB` / 会话）+ `HistoryTTL`（默认 `15m`）：仅淘汰最老的**已定稿 `Record`**（推进 `earliest_offset`），不影响活跃 `inFlights`。字节规则永远保留最新一条 `Record`；字节计数 = `payload + meta + type + stream_id` + 每条固定 `64B` 开销。
+
+### 1.3 会话纪元与偏移计数器：流的身份比数据活得久
+
+游标是 `<epoch>:<offset>`。**epoch 属于会话流本身（每个会话一份），不属于 broker 进程**，由 Storage 在会话流创建时生成：
+- **淘汰数据不重置身份**：`HistoryTTL` / `MaxHistoryBytes` 只删除 `Record`，会话的 `epoch` 与 `latest_offset`（已提交过的最大 offset）保留。所以拿旧游标来的客户端得到的是 `cursor_expired`，而不是误判成纪元变化，offset 也永远不会在同一个 epoch 里从 1 重来。
+- **元数据单独保留更久**：会话流（epoch、offset 计数器、元数据）闲置超过 `MetaTTL`（默认 `24h`）才整个删除；发布、订阅都会续期，broker 清扫器还会给所有仍在内存里的会话（包括只有订阅者、长时间没有发布的会话）续期。删除后再创建会生成**新 epoch**，offset 从 1 开始。
+- **内存版进程重启**：所有会话都是新 epoch。
+- `/healthz` 返回的是 broker 的 `instance_id`，不是游标 epoch。
+- 对照：Centrifugo 按 channel 生成 epoch，`history_ttl` 到期只清数据，epoch 与 offset 存在 `history_meta_ttl`（默认 30 天）更长的 meta 里；ElectricSQL 的 shape handle、Kafka 的 topic ID 也都在重建时换新。
+
+### 1.4 发布重试幂等
+
+- **流式 chunk**：按 `(stream_id, seq)` 去重。在途流内 `seq <= last_seq` 返回 `deduplicated: true`；流定稿（`fin` 或封存）后 `5m` 内，重发已接受过的 `seq` 返回原 `committed_offset`。
+- **离散事件**：可选字段 `idempotency_key`，同一会话内 `5m` 窗口（与 `HistoryTTL` 无关）。重复请求返回原 `committed_offset` + `epoch` + `deduplicated: true`，不再扇出。key 只在 `Record` 提交成功之后记录，所以存储失败后的重试会正常提交。**不比对请求内容**。
+- 对照：NATS JetStream `Nats-Msg-Id`（默认窗口 2 分钟，重复返回原 seq）、Centrifugo `idempotency_key`（5 分钟，重复返回原 offset + epoch、不再广播）；调研的项目都不比对内容。
 
 ---
 
@@ -41,7 +58,7 @@
 当客户端首次打开历史会话，或收到断层通知需要回源业务主库同步历史时，必须有明确的水位线约定以消除“漏读一段”或“重复一段”的竞态窗口。
 
 ### 2.1 写入侧顺序约定（Worker $\rightarrow$ Seamline $\rightarrow$ 业务主库）
-1. **先定稿发布至 Seamline**：当一轮消息或工具步骤完成时，Worker 先调用 Seamline `Publish`（原子记录或 `fin=true`），获取返回的权威游标 `seamline_cursor = "<epoch>:<committed_offset>"`（例如 `"9f8e7d6c5b4a:12"`）。
+1. **先定稿发布至 Seamline**：当一轮消息或工具步骤完成时，Worker 先调用 Seamline `Publish`（原子记录或 `fin=true`），获取返回的权威游标 `seamline_cursor = "<epoch>:<committed_offset>"`（例如 `"9f8e7d6c5b4a:12"`；`epoch` 是 `Publish` 响应里的会话 epoch）。
 2. **携带游标落业务主库**：Worker（或业务后端）将该轮业务数据写入主数据库时，在**同一数据库事务**中更新该会话的水位线字段 `last_seamline_cursor = "9f8e7d6c5b4a:12"`（同时建议保留业务幂等键 `stream_id` / `message_id`）。
 
 ### 2.2 读取与订阅衔接顺序（Client $\rightarrow$ 业务主库 $\rightarrow$ Seamline）
@@ -65,15 +82,20 @@
 ### 3.1 触发条件（仅针对携带了非空游标的续传请求）
 - **初始无游标订阅（`after_epoch == "" && after_offset == 0`）**：属于全新连接而非断线续传，不发送 `cursor_reset`，直接发送当前热窗口内 `[earliest_offset .. latest_offset]` + 活跃 `inflight_snapshot` + 实时流。
 - **断层场景 1 —— 纪元变更（`reason: "epoch_mismatch"`）**：
-  客户端携带了 `after_epoch != ""` 且 `after_epoch != broker.Epoch()`（如内存节点重启、新老纪元切换）。即使新纪元当前 `latest_offset == 0`（空缓冲），服务端也**必须在首帧发送 `event: cursor_reset`**，明确告知客户端旧纪元上下文已不可连续重放。
+  客户端游标的 epoch 与该会话当前 epoch 不同（内存节点重启、会话闲置超过 `MetaTTL` 后重建）。**只带 offset、不带 epoch 的游标**无法判断属于哪个纪元，也按 `epoch_mismatch` 处理。即使新纪元当前 `latest_offset == 0`（空缓冲），服务端也**必须在首帧发送 `event: cursor_reset`**，明确告知客户端旧纪元上下文已不可连续重放。
 - **断层场景 2 —— 游标已滑出热窗口（`reason: "cursor_expired"`）**：
-  `after_epoch == broker.Epoch()`，但 `after_offset + 1 < earliest_offset`（客户端落后的某段已定稿 `Record` 已被 `HistoryTTL` 或 `MaxHistoryBytes` 淘汰）。服务端首帧发送 `event: cursor_reset`。
+  epoch 相同，但 `after_offset + 1 < earliest_offset`（客户端落后的某段已定稿 `Record` 已被 `HistoryTTL` 或 `MaxHistoryBytes` 淘汰）。服务端首帧发送 `event: cursor_reset`。
+- **断层场景 3 —— 游标比服务端还新（`reason: "cursor_ahead"`）**：
+  epoch 相同，但 `after_offset > latest_offset`。按 §1.3 的规则正常情况下不会出现，只来自伪造或出错的游标。服务端首帧发送 `event: cursor_reset`。
+- **补发途中发现缺口**：`cursor_reset` **只出现在首帧**。如果补发过程中发现历史中间缺了一段（例如分页读取期间被淘汰），服务端发送 `event: stream_error`（`{"error":"insufficient_state"}`）并关闭连接；浏览器带 `Last-Event-ID` 自动重连后，游标已早于窗口，自然在首帧拿到 `cursor_reset`。做法与 Centrifugo 的 `insufficient state` 断开一致。
 
 ### 3.2 `event: cursor_reset` 帧格式与客户端恢复动作
 ```text
 event: cursor_reset
 data: {"reason":"epoch_mismatch","requested_epoch":"old123","requested_offset":42,"current_epoch":"new456","earliest_offset":1,"latest_offset":0}
 ```
+`cursor_reset` 帧不带 `id:`。发完后连接不断开，服务端接着补发当前热窗口内的 `Record`、各条在途流的 `inflight_snapshot` 和实时流。这一点有别于 Centrifugo（`recovered:false` 时不补发窗口剩余部分），原因是正在生成的内容只在 Seamline 里、主库还没有；而且补发的 `record` 带 `id:`，能把浏览器的 `Last-Event-ID` 推进到新纪元，下次重连不会再触发一次 reset。
+
 客户端收到 `event: cursor_reset` 后的标准动作：
 1. 保持当前 SSE 连接不断开，暂存随后到达的当前纪元 `record`（`offset >= earliest_offset`）、`inflight_snapshot`（**正在生成的未落库半截内容**）与实时 `delta`；
 2. 异步向业务主库拉取一次最新已落库历史快照（带回最新 `seamline_cursor`），用主库快照补齐已定稿历史缺口，并以 `offset` 对齐合并步骤 1 暂存的热流事件——从而同时保证**历史已落库记录不漏、当前未落库生成流不断**。
