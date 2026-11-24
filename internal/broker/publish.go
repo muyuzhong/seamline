@@ -64,6 +64,9 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 
 	now := time.Now().UTC()
 	actor.touch()
+	if res, ok := b.idempotentReplayLocked(actor, req.IdempotencyKey, now); ok {
+		return res, nil
+	}
 
 	c := actor.nextCommit(req.Type, req.Payload, now)
 	if err := b.store.Append(ctx, sessionID, c); err != nil {
@@ -72,6 +75,21 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 
 	// Point of no return: the event and its session state are committed.
 	actor.applyCommitLocked(c, now)
+	if req.IdempotencyKey != "" {
+		actor.idempotent.put(req.IdempotencyKey, c.Event.Seq, now)
+	}
 	actor.fanOutLocked(eventDelivery(c.Event))
 	return model.PublishResult{Epoch: c.Event.Epoch, Seq: c.Event.Seq}, nil
+}
+
+// idempotentReplayLocked returns the original result for a retried publish.
+func (b *Broker) idempotentReplayLocked(actor *sessionActor, key string, now time.Time) (model.PublishResult, bool) {
+	if key == "" {
+		return model.PublishResult{}, false
+	}
+	seq, ok := actor.idempotent.get(key, now)
+	if !ok {
+		return model.PublishResult{}, false
+	}
+	return model.PublishResult{Epoch: actor.epoch, Seq: seq, Deduplicated: true}, true
 }
