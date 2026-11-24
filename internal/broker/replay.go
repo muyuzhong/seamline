@@ -55,6 +55,11 @@ func (b *Broker) replayCatchUp(
 	snap subSnapshot,
 ) bool {
 	plan := planReplay(cur, snap)
+	if plan.reason == "" && plan.readAfter == snap.seq {
+		// Nothing to replay (caught-up cursor, or a fresh subscription to an empty stream): every
+		// later event arrives through liveCh, so the cursor cannot have expired.
+		return true
+	}
 	events, info, err := b.store.ReadAfter(ctx, sessionID, plan.readAfter)
 	if err != nil {
 		sub.setErr(err)
@@ -64,36 +69,13 @@ func (b *Broker) replayCatchUp(
 		sub.setErr(ErrInsufficientState)
 		return false
 	}
-	// Events after the snapshot arrive through liveCh, so only a hole at or below snap.seq expires
-	// the cursor; publishes since the snapshot may already have evicted later seqs from storage.
-	if plan.checkWindow && plan.readAfter+1 < min(info.EarliestSeq, snap.seq+1) {
+	if plan.checkWindow && plan.readAfter+1 < info.EarliestSeq {
 		plan.reason = model.ResetCursorExpired
 	}
 	if plan.reason != "" && !b.sendOut(ctx, sub, outCh, resetDelivery(cur, snap, info, plan.reason)) {
 		return false
 	}
 	return b.replayEvents(ctx, sub, outCh, events, plan, snap.seq)
-}
-
-// contiguity checks that replayed seqs have no holes. While strict is false (fresh subscription or
-// after a reset) the first event may start anywhere in the window; after that, and from the start
-// for a resumable cursor, every seq must be prev+1.
-type contiguity struct {
-	prev   uint64
-	strict bool
-}
-
-func (c *contiguity) accept(seq uint64) bool {
-	if c.strict && seq != c.prev+1 {
-		return false
-	}
-	c.prev, c.strict = seq, true
-	return true
-}
-
-// reached reports whether the replay got up to target without losing its tail.
-func (c *contiguity) reached(target uint64) bool {
-	return !c.strict || c.prev >= target
 }
 
 // replayEvents emits events in (readAfter, snapSeq]. A hole means history was lost under the
@@ -106,20 +88,26 @@ func (b *Broker) replayEvents(
 	plan replayPlan,
 	snapSeq uint64,
 ) bool {
-	order := contiguity{prev: plan.readAfter, strict: plan.checkWindow && plan.reason == ""}
+	// wantSeq is the next seq the replay must deliver; 0 lets the first event start anywhere in
+	// the window (fresh subscription or after a reset).
+	var wantSeq uint64
+	if plan.checkWindow && plan.reason == "" {
+		wantSeq = plan.readAfter + 1
+	}
 	for _, ev := range events {
 		if ev.Seq > snapSeq {
 			break
 		}
-		if !order.accept(ev.Seq) {
+		if wantSeq != 0 && ev.Seq != wantSeq {
 			sub.setErr(ErrInsufficientState)
 			return false
 		}
 		if !b.sendOut(ctx, sub, outCh, eventDelivery(ev)) {
 			return false
 		}
+		wantSeq = ev.Seq + 1
 	}
-	if !order.reached(snapSeq) {
+	if wantSeq != 0 && wantSeq <= snapSeq {
 		sub.setErr(ErrInsufficientState)
 		return false
 	}
