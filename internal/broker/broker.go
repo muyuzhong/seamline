@@ -111,6 +111,11 @@ func (b *Broker) InstanceID() string {
 	return b.cfg.InstanceID
 }
 
+// MaxEventBytes is the largest accepted event payload.
+func (b *Broker) MaxEventBytes() int {
+	return b.cfg.MaxEventBytes
+}
+
 // activeActorCount returns the number of in-memory session actors (used by tests).
 func (b *Broker) activeActorCount() int {
 	b.mu.RLock()

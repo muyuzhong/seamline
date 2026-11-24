@@ -451,6 +451,7 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 		{"missing type", `{"payload":{}}`, http.StatusBadRequest, "invalid_request"},
 		{"malformed JSON", `{"type":"x","payload":{`, http.StatusBadRequest, "invalid_request"},
 		{"payload over MaxEventBytes", `{"type":"x","payload":"` + strings.Repeat("x", 2000) + `"}`, http.StatusRequestEntityTooLarge, "event_too_large"},
+		{"body over the request limit", `{"type":"x","payload":"` + strings.Repeat("x", 40000) + `"}`, http.StatusRequestEntityTooLarge, "event_too_large"},
 	}
 	for _, tc := range codes {
 		if out := doPostRaw(t, events, tc.body, tc.status); out["code"] != tc.code {
@@ -461,10 +462,8 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 	_ = doGet(t, api+"/s-err/stream", http.StatusBadRequest, map[string]string{"Last-Event-ID": "not-a-valid-cursor"})
 
 	page := doGet(t, srv.URL+"/", http.StatusOK, nil)
-	for _, want := range []string{"Seamline Live Playground", "stream_error"} {
-		if !strings.Contains(page, want) {
-			t.Fatalf("playground HTML must contain %q", want)
-		}
+	if !strings.Contains(page, "Seamline Live Playground") {
+		t.Fatalf("GET / must serve the playground")
 	}
 	if strings.Contains(page, "innerHTML") {
 		t.Fatalf("playground HTML must not use innerHTML")

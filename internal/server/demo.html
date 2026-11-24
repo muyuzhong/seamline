@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Seamline — Resumable Dual-Speed AI Stream Playground</title>
+  <title>Seamline — Resumable Event Cursor Playground</title>
   <style>
     :root {
       --bg: #0b0f17;
@@ -391,7 +391,7 @@
         <div class="logo">S</div>
         <div>
           <h1>Seamline Live Playground</h1>
-          <p>Dual-Speed Resumable AI Stream Broker &bull; Ephemeral Delta Coalescing + Committed WAL Offset</p>
+          <p>Resumable AI Stream Broker &bull; Payload-Opaque Events &bull; One Cursor <code>&lt;epoch&gt;:&lt;seq&gt;</code></p>
         </div>
       </div>
 
@@ -402,37 +402,37 @@
           <button class="small" id="applySessionBtn" title="Switch to session">Connect</button>
         </div>
         <button id="newSessionBtn">New Session</button>
-        <button class="primary" id="simulateBtn">&#9654; Stream 100+ AI Tokens</button>
+        <button class="primary" id="simulateBtn">&#9654; Start a Simulated Run</button>
       </div>
     </header>
 
     <div class="f5-callout">
       <div>
-        <strong>Resilience Test:</strong> Start a stream, then click <strong>Drop 1.2s &amp; Resume (Last-Event-ID)</strong> on Client B <em>or</em> press <kbd>F5</kbd> / <kbd>Cmd+R</kbd> mid-stream! Watch <code>inflight_snapshot</code> + live <code>delta</code>s reconstruct the exact output with zero lost tokens.
+        <strong>Resilience Test:</strong> Start a run, then click <strong>Drop 1.2s &amp; Resume</strong> on Client B <em>or</em> press <kbd>F5</kbd> / <kbd>Cmd+R</kbd> mid-run. Every event carries <code>id: &lt;epoch&gt;:&lt;seq&gt;</code>, so a reconnect continues at the next seq; the active run is pinned, so a fresh page load replays it from <code>run_started</code>. <strong>Resume with Stale Epoch</strong> shows the explicit <code>cursor_reset</code>.
       </div>
       <div id="parityBadge" class="badge committed">A == B Parity: Waiting</div>
     </div>
 
     <section class="metrics-grid">
       <div class="metric-card">
-        <div class="metric-label">Committed Records (WAL Offset)</div>
+        <div class="metric-label">Event Cursor (latest_seq)</div>
         <div class="metric-value">
-          <span id="metricOffset" style="color: var(--green);">0</span>
+          <span id="metricSeq" style="color: var(--green);">0</span>
           <span class="metric-sub" id="metricEpoch">epoch: -</span>
         </div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">In-Flight Chunks Coalesced</div>
+        <div class="metric-label">Retained Hot Window</div>
         <div class="metric-value">
-          <span id="metricInFlight" style="color: var(--amber);">0</span>
-          <span class="metric-sub" id="metricCompacted">compacts N deltas &rarr; 1 record</span>
+          <span id="metricWindow" style="color: var(--amber);">empty</span>
+          <span class="metric-sub" id="metricWindowSub">earliest_seq .. latest_seq</span>
         </div>
       </div>
       <div class="metric-card">
         <div class="metric-label">Session State</div>
         <div class="metric-value">
           <span id="metricState" style="color: var(--accent);">idle</span>
-          <span class="metric-sub" id="metricStreamId">no active stream</span>
+          <span class="metric-sub" id="metricRun">no active run</span>
         </div>
       </div>
       <div class="metric-card">
@@ -453,17 +453,16 @@
             Client A &mdash; Native Browser EventSource
           </div>
           <div>
-            <button class="small" id="reloadZeroABtn" title="Reconnect from offset 0">Replay from Offset 0</button>
+            <button class="small" id="reloadFreshABtn" title="Reconnect without a cursor">Replay from Start</button>
           </div>
         </div>
         <div class="pane-meta">
           <span>Cursor: <b id="cursorA">(none)</b></span>
-          <span>Records: <b id="recCountA">0</b></span>
-          <span>Snapshots: <b id="snapCountA">0</b></span>
-          <span>Deltas: <b id="deltaCountA">0</b></span>
+          <span>Events: <b id="eventCountA">0</b></span>
+          <span>Resets: <b id="resetCountA">0</b></span>
         </div>
         <div class="messages" id="messagesA">
-          <div class="empty-hint">Click <b>Stream 100+ AI Tokens</b> above to watch dual-speed streaming.</div>
+          <div class="empty-hint">Click <b>Start a Simulated Run</b> above to stream events.</div>
         </div>
         <div class="wire-log" id="wireA"></div>
       </div>
@@ -476,18 +475,18 @@
             Client B &mdash; Chaos / Last-Event-ID Resumption
           </div>
           <div style="display:flex; gap:6px;">
-            <button class="small warn" id="chaosDropBtn">Drop 1.2s &amp; Resume (Last-Event-ID)</button>
+            <button class="small warn" id="chaosDropBtn">Drop 1.2s &amp; Resume</button>
+            <button class="small warn" id="staleCursorBtn" title="Reconnect with a cursor from another epoch">Resume with Stale Epoch</button>
             <button class="small" id="toggleConnBBtn">Disconnect</button>
           </div>
         </div>
         <div class="pane-meta">
           <span>Last-Event-ID: <b id="cursorB">(none)</b></span>
-          <span>Records: <b id="recCountB">0</b></span>
-          <span>Snapshots: <b id="snapCountB">0</b></span>
-          <span>Deltas: <b id="deltaCountB">0</b></span>
+          <span>Events: <b id="eventCountB">0</b></span>
+          <span>Resets: <b id="resetCountB">0</b></span>
         </div>
         <div class="messages" id="messagesB">
-          <div class="empty-hint">Client B mirrors Client A and tests mid-stream disconnects &amp; <code>Last-Event-ID</code> recovery.</div>
+          <div class="empty-hint">Client B mirrors Client A and tests disconnects, <code>Last-Event-ID</code> resumption and <code>cursor_reset</code>.</div>
         </div>
         <div class="wire-log" id="wireB"></div>
       </div>
@@ -500,10 +499,7 @@
       const initialSession = params.get("session") || (window.location.hash ? window.location.hash.slice(1) : "playground-1");
       const sessionInput = document.getElementById("sessionInput");
       sessionInput.value = initialSession;
-
       let currentSession = initialSession;
-      let peakInFlightSeq = 0;
-      let lastCompactedChunks = 0;
 
       function syncUrlSession(id) {
         const url = new URL(window.location.href);
@@ -512,36 +508,30 @@
       }
       syncUrlSession(currentSession);
 
-      function extractContent(payload) {
-        if (payload == null) return "";
-        let obj = payload;
-        if (typeof payload === "string") {
-          try { obj = JSON.parse(payload); } catch (_) { return payload; }
+      function payloadField(payload, field) {
+        if (payload && typeof payload === "object" && typeof payload[field] === "string") {
+          return payload[field];
         }
-        if (typeof obj === "object" && obj !== null) {
-          if (typeof obj.content === "string") return obj.content;
-          return JSON.stringify(obj);
-        }
-        return String(obj);
+        return "";
       }
 
       function createPaneState(suffix) {
         return {
           suffix,
           cursor: "",
+          lastSeq: 0,
           items: [],
-          recCount: 0,
-          snapCount: 0,
-          deltaCount: 0,
+          openRun: null,
+          eventCount: 0,
+          resetCount: 0,
           es: null,
           abortCtrl: null,
           connected: false,
           reconnectTimer: null,
           dotEl: document.getElementById("dot" + suffix),
           cursorEl: document.getElementById("cursor" + suffix),
-          recEl: document.getElementById("recCount" + suffix),
-          snapEl: document.getElementById("snapCount" + suffix),
-          deltaEl: document.getElementById("deltaCount" + suffix),
+          eventCountEl: document.getElementById("eventCount" + suffix),
+          resetCountEl: document.getElementById("resetCount" + suffix),
           messagesEl: document.getElementById("messages" + suffix),
           wireEl: document.getElementById("wire" + suffix),
         };
@@ -570,11 +560,72 @@
         }
       }
 
+      // Client-side reconstruction: the broker only relays opaque events; grouping text deltas and
+      // tool-call argument deltas into a run bubble is the client's job.
+      function openRunBubble(pane, seq) {
+        const run = { kind: "assistant", seq, text: "", tools: new Map(), status: "running" };
+        pane.items.push(run);
+        pane.openRun = run;
+        return run;
+      }
+
+      function applyEvent(pane, ev) {
+        const p = ev.payload;
+        if (ev.type === "user_message") {
+          pane.items.push({ kind: "user", seq: ev.seq, text: payloadField(p, "content") });
+        } else if (ev.type === "run_started") {
+          // The run bubble opens lazily at the run's first delta, so it follows the user message.
+          return;
+        } else if (ev.type === "assistant_delta") {
+          (pane.openRun || openRunBubble(pane, ev.seq)).text += payloadField(p, "text");
+        } else if (ev.type === "tool_call_delta") {
+          const run = pane.openRun || openRunBubble(pane, ev.seq);
+          const id = payloadField(p, "call_id") || "call";
+          run.tools.set(id, (run.tools.get(id) || "") + payloadField(p, "args_delta"));
+        } else if (ev.type === "run_finished" || ev.type === "run_failed" || ev.type === "run_interrupted") {
+          if (pane.openRun) {
+            pane.openRun.status = ev.type + (payloadField(p, "reason") ? " (" + payloadField(p, "reason") + ")" : "");
+            pane.openRun = null;
+          }
+        } else {
+          pane.items.push({ kind: "event", seq: ev.seq, text: ev.type + " " + JSON.stringify(p === undefined ? null : p) });
+        }
+      }
+
+      function renderItem(item) {
+        const card = document.createElement("div");
+        const running = item.kind === "assistant" && item.status === "running";
+        card.className = "msg " + (item.kind === "user" ? "user" : "assistant") + (running ? " streaming" : "");
+
+        const head = document.createElement("div");
+        head.className = "msg-head";
+        const role = document.createElement("span");
+        role.textContent = item.kind === "user" ? "USER" : (item.kind === "assistant" ? "RUN" : "EVENT");
+        const badge = document.createElement("span");
+        badge.className = "badge " + (running ? "inflight" : "committed");
+        badge.textContent = "seq " + item.seq + (item.kind === "assistant" ? " \u2022 " + item.status : "");
+        head.append(role, badge);
+
+        const body = document.createElement("div");
+        body.className = "msg-body" + (running ? " cursor-blink" : "");
+        body.textContent = item.text;
+        card.append(head, body);
+
+        if (item.tools) {
+          for (const [id, args] of item.tools) {
+            const tool = document.createElement("div");
+            tool.className = "msg-body";
+            tool.textContent = "tool " + id + ": " + args;
+            card.appendChild(tool);
+          }
+        }
+        return card;
+      }
+
       function renderPane(pane) {
         pane.cursorEl.textContent = pane.cursor || "(none)";
-        pane.recEl.textContent = String(pane.recCount);
-        pane.snapEl.textContent = String(pane.snapCount);
-        pane.deltaEl.textContent = String(pane.deltaCount);
+        pane.eventCountEl.textContent = String(pane.eventCount);
+        pane.resetCountEl.textContent = String(pane.resetCount);
 
         if (pane.items.length === 0) {
           const hint = document.createElement("div");
@@ -583,166 +634,90 @@
           code.textContent = currentSession;
           hint.append("Waiting for events on ", code, "...");
           pane.messagesEl.replaceChildren(hint);
-          updateParity();
-          return;
+        } else {
+          pane.messagesEl.replaceChildren(...pane.items.map(renderItem));
+          pane.messagesEl.scrollTop = pane.messagesEl.scrollHeight;
         }
-
-        pane.messagesEl.replaceChildren();
-        for (const item of pane.items) {
-          const card = document.createElement("div");
-          const isUser = item.type === "user_message";
-          card.className = "msg " + (isUser ? "user" : "assistant") + (item.committed ? "" : " streaming");
-
-          const head = document.createElement("div");
-          head.className = "msg-head";
-          const roleSpan = document.createElement("span");
-          roleSpan.textContent = (isUser ? "USER" : "ASSISTANT") + (item.streamId ? " [" + item.streamId + "]" : "");
-
-          const badge = document.createElement("span");
-          badge.className = "badge " + (item.committed ? "committed" : "inflight");
-          badge.textContent = item.committed
-            ? "COMMITTED #" + item.offset
-            : (item.viaSnapshot ? "SNAPSHOT+LIVE seq=" + item.lastSeq : "STREAMING seq=" + item.lastSeq);
-
-          head.appendChild(roleSpan);
-          head.appendChild(badge);
-
-          const body = document.createElement("div");
-          body.className = "msg-body" + (item.committed ? "" : " cursor-blink");
-          body.textContent = item.text;
-
-          card.appendChild(head);
-          card.appendChild(body);
-          pane.messagesEl.appendChild(card);
-        }
-        pane.messagesEl.scrollTop = pane.messagesEl.scrollHeight;
         updateParity();
       }
 
-      function handleOutEvent(pane, eventType, lastId, rawData) {
-        let ev;
-        try { ev = JSON.parse(rawData); } catch (_) { return; }
+      function clearPaneItems(pane) {
+        pane.items = [];
+        pane.openRun = null;
+        pane.lastSeq = 0;
+        pane.cursor = "";
+      }
 
-        if (eventType === "record") {
-          pane.recCount++;
-          const cursor = lastId || (ev.epoch + ":" + ev.offset);
-          pane.cursor = cursor;
-          const text = extractContent(ev.payload);
+      function handleBusinessEvent(pane, lastId, ev) {
+        pane.lastSeq = ev.seq;
+        pane.cursor = lastId || (ev.epoch + ":" + ev.seq);
+        pane.eventCount++;
+        applyEvent(pane, ev);
+        if (ev.type !== "assistant_delta" || ev.seq % 15 === 0) {
+          logWire(pane, ev.type === "assistant_delta" ? "delta" : "record", "id=" + pane.cursor + " type=" + ev.type);
+        }
+        renderPane(pane);
+      }
 
-          let existing = null;
-          if (ev.stream_id) {
-            existing = pane.items.find(x => x.streamId === ev.stream_id);
-          }
-          if (!existing) {
-            existing = pane.items.find(x => x.committed && x.offset === ev.offset);
-          }
-          if (existing) {
-            existing.committed = true;
-            existing.offset = ev.offset;
-            existing.type = ev.type || existing.type;
-            existing.text = text;
-          } else {
-            pane.items.push({
-              offset: ev.offset,
-              streamId: ev.stream_id || "",
-              type: ev.type || "record",
-              text: text,
-              lastSeq: 0,
-              committed: true,
-              viaSnapshot: false,
-            });
-          }
-          logWire(pane, "record", "id=" + cursor + " event=record type=" + ev.type + " (" + text.length + " chars)");
-          renderPane(pane);
-        } else if (eventType === "inflight_snapshot") {
-          pane.snapCount++;
-          let existing = pane.items.find(x => x.streamId === ev.stream_id);
-          if (!existing) {
-            existing = {
-              offset: 0,
-              streamId: ev.stream_id,
-              type: ev.type || "assistant_message",
-              text: "",
-              lastSeq: 0,
-              committed: false,
-              viaSnapshot: true,
-            };
-            pane.items.push(existing);
-          }
-          existing.text = ev.delta || "";
-          existing.lastSeq = ev.seq || 0;
-          existing.committed = false;
-          existing.viaSnapshot = true;
-          logWire(pane, "snapshot", "event=inflight_snapshot seq=" + ev.seq + " coalesced_chars=" + existing.text.length);
-          renderPane(pane);
-        } else if (eventType === "delta") {
-          pane.deltaCount++;
-          let existing = pane.items.find(x => x.streamId === ev.stream_id);
-          if (!existing) {
-            existing = {
-              offset: 0,
-              streamId: ev.stream_id,
-              type: ev.type || "assistant_message",
-              text: "",
-              lastSeq: 0,
-              committed: false,
-              viaSnapshot: false,
-            };
-            pane.items.push(existing);
-          }
-          if (!existing.committed && (!ev.seq || ev.seq > existing.lastSeq)) {
-            existing.text += (ev.delta || "");
-            existing.lastSeq = ev.seq || (existing.lastSeq + 1);
-          }
-          if (ev.seq <= 3 || ev.fin || ev.seq % 15 === 0) {
-            logWire(pane, "delta", "event=delta seq=" + ev.seq + (ev.fin ? " [FIN]" : "") + " delta=" + JSON.stringify(ev.delta));
-          }
-          renderPane(pane);
-        } else if (eventType === "stream_error") {
-          const errCode = ev && ev.error ? ev.error : rawData;
-          setConnected(pane, false);
-          if (pane === clientA) {
-            // Leave native EventSource open so the browser auto-reconnects with Last-Event-ID.
-            logWire(pane, "err", "event=stream_error error=" + errCode + " (waiting for native EventSource Last-Event-ID reconnect)");
-          } else {
-            logWire(pane, "err", "event=stream_error error=" + errCode + " (resuming from saved cursor in 500ms)");
-            disconnectClientB();
-            clientB.reconnectTimer = setTimeout(() => {
-              connectClientB(false);
-            }, 500);
-          }
+      function handleCursorReset(pane, reset) {
+        pane.resetCount++;
+        // A real client would now reload committed history from its own database and drop replayed
+        // events with seq <= the database watermark. The playground has no database, so it simply
+        // rebuilds from the retained window that follows on this connection.
+        clearPaneItems(pane);
+        logWire(pane, "snapshot", "event=cursor_reset reason=" + reset.reason + " requested=" + reset.requested_epoch + ":" + reset.requested_seq
+          + " window=" + reset.earliest_seq + ".." + reset.latest_seq + " active_run_start_seq=" + reset.active_run_start_seq);
+        renderPane(pane);
+      }
+
+      function handleStreamError(pane, code) {
+        setConnected(pane, false);
+        if (pane === clientA) {
+          // Leave the native EventSource open: the browser reconnects with Last-Event-ID.
+          logWire(pane, "err", "event=stream_error error=" + code + " (waiting for native Last-Event-ID reconnect)");
+          return;
+        }
+        logWire(pane, "err", "event=stream_error error=" + code + " (resuming from saved cursor in 500ms)");
+        disconnectClientB();
+        clientB.reconnectTimer = setTimeout(() => connectClientB(false), 500);
+      }
+
+      function handleFrame(pane, eventName, lastId, rawData) {
+        let data;
+        try { data = JSON.parse(rawData); } catch (_) { return; }
+        if (eventName === "cursor_reset") {
+          handleCursorReset(pane, data);
+        } else if (eventName === "stream_error") {
+          handleStreamError(pane, data && data.error ? data.error : rawData);
+        } else {
+          handleBusinessEvent(pane, lastId, data);
         }
       }
 
       function resetPaneData(pane) {
-        pane.cursor = "";
-        pane.items = [];
-        pane.recCount = 0;
-        pane.snapCount = 0;
-        pane.deltaCount = 0;
+        clearPaneItems(pane);
+        pane.eventCount = 0;
+        pane.resetCount = 0;
         pane.wireEl.replaceChildren();
         renderPane(pane);
       }
 
-      // Client A uses native browser EventSource
-      function connectClientA(fromZero) {
+      // Client A: native EventSource. Business events have no "event:" line, so they arrive as
+      // "message"; control frames are named cursor_reset and stream_error.
+      function connectClientA() {
         disconnectClientA();
-        if (fromZero) resetPaneData(clientA);
-        let url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
-        if (!fromZero && clientA.cursor) {
-          url += "?after_offset=" + encodeURIComponent(clientA.cursor);
-        }
+        resetPaneData(clientA);
+        const url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
         const es = new EventSource(url);
         clientA.es = es;
         es.onopen = () => {
           setConnected(clientA, true);
           logWire(clientA, "sys", "EventSource connected to " + url);
         };
-        es.onerror = () => {
-          setConnected(clientA, false);
-        };
-        ["record", "inflight_snapshot", "delta", "stream_error"].forEach(kind => {
-          es.addEventListener(kind, e => handleOutEvent(clientA, kind, e.lastEventId, e.data));
+        es.onerror = () => setConnected(clientA, false);
+        es.onmessage = e => handleFrame(clientA, "message", e.lastEventId, e.data);
+        ["cursor_reset", "stream_error"].forEach(name => {
+          es.addEventListener(name, e => handleFrame(clientA, name, e.lastEventId, e.data));
         });
       }
 
@@ -754,10 +729,10 @@
         setConnected(clientA, false);
       }
 
-      // Client B uses fetch + ReadableStream with explicit Last-Event-ID HTTP header
-      async function connectClientB(resetAll) {
+      // Client B: fetch + ReadableStream with an explicit Last-Event-ID header.
+      async function connectClientB(fresh) {
         disconnectClientB();
-        if (resetAll) resetPaneData(clientB);
+        if (fresh) resetPaneData(clientB);
 
         const ctrl = new AbortController();
         clientB.abortCtrl = ctrl;
@@ -766,7 +741,7 @@
           headers["Last-Event-ID"] = clientB.cursor;
         }
         const url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
-        logWire(clientB, "sys", "GET " + url + (clientB.cursor ? " [Last-Event-ID: " + clientB.cursor + "]" : " [offset=0]"));
+        logWire(clientB, "sys", "GET " + url + (clientB.cursor ? " [Last-Event-ID: " + clientB.cursor + "]" : " [no cursor]"));
 
         try {
           const resp = await fetch(url, { headers, signal: ctrl.signal });
@@ -775,21 +750,7 @@
             return;
           }
           setConnected(clientB, true);
-          const reader = resp.body.getReader();
-          const decoder = new TextDecoder();
-          let buf = "";
-
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            let idx;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-              const block = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
-              parseSSEBlock(clientB, block);
-            }
-          }
+          await readSSE(clientB, resp.body.getReader());
         } catch (err) {
           if (err.name !== "AbortError") {
             logWire(clientB, "sys", "stream closed: " + err.message);
@@ -801,28 +762,38 @@
         }
       }
 
-      function parseSSEBlock(pane, block) {
-        const lines = block.split("\n");
-        let evType = "message";
-        let evId = "";
-        const dataLines = [];
-        for (const line of lines) {
-          if (line.startsWith(":")) {
-            if (line.includes("connected")) {
-              logWire(pane, "sys", line);
-            }
-            continue;
+      async function readSSE(pane, reader) {
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf("\n\n")) !== -1) {
+            parseSSEBlock(pane, buf.slice(0, idx));
+            buf = buf.slice(idx + 2);
           }
-          if (line.startsWith("id:")) {
-            evId = line.slice(3).trim();
+        }
+      }
+
+      function parseSSEBlock(pane, block) {
+        let eventName = "message";
+        let id = "";
+        const dataLines = [];
+        for (const line of block.split("\n")) {
+          if (line.startsWith(":")) {
+            if (line.includes("connected")) logWire(pane, "sys", line);
+          } else if (line.startsWith("id:")) {
+            id = line.slice(3).trim();
           } else if (line.startsWith("event:")) {
-            evType = line.slice(6).trim();
+            eventName = line.slice(6).trim();
           } else if (line.startsWith("data:")) {
             dataLines.push(line.slice(5).trimStart());
           }
         }
         if (dataLines.length > 0) {
-          handleOutEvent(pane, evType, evId, dataLines.join("\n"));
+          handleFrame(pane, eventName, id, dataLines.join("\n"));
         }
       }
 
@@ -838,6 +809,10 @@
         setConnected(clientB, false);
       }
 
+      function signature(pane) {
+        return pane.items.map(i => i.kind + ":" + i.text + (i.tools ? JSON.stringify([...i.tools]) : "")).join("\n---\n");
+      }
+
       function updateParity() {
         const badge = document.getElementById("parityBadge");
         if (clientA.items.length === 0 && clientB.items.length === 0) {
@@ -845,49 +820,37 @@
           badge.textContent = "A == B Parity: Ready";
           return;
         }
-        const sigA = clientA.items.map(i => i.type + ":" + i.text).join("\n---\n");
-        const sigB = clientB.items.map(i => i.type + ":" + i.text).join("\n---\n");
-        if (sigA === sigB) {
-          badge.className = "badge committed";
-          badge.textContent = "A == B Exact Byte Match (" + sigA.length + " chars)";
-        } else {
-          badge.className = "badge inflight";
-          badge.textContent = "Syncing In-Flight (" + sigA.length + " vs " + sigB.length + " chars)";
-        }
+        const sigA = signature(clientA);
+        const sigB = signature(clientB);
+        badge.className = "badge " + (sigA === sigB ? "committed" : "inflight");
+        badge.textContent = sigA === sigB
+          ? "A == B Exact Match (" + sigA.length + " chars)"
+          : "Syncing (" + sigA.length + " vs " + sigB.length + " chars)";
+      }
+
+      function setText(id, text) {
+        document.getElementById(id).textContent = text;
       }
 
       async function pollSessionMetrics() {
         try {
           const resp = await fetch("/v1/sessions/" + encodeURIComponent(currentSession));
           if (!resp.ok) {
-            document.getElementById("metricOffset").textContent = "0";
-            document.getElementById("metricInFlight").textContent = "0";
-            document.getElementById("metricState").textContent = "idle";
-            document.getElementById("metricSubs").textContent = "0";
+            setText("metricSeq", "0");
+            setText("metricWindow", "empty");
+            setText("metricState", "idle");
+            setText("metricSubs", "0");
             return;
           }
           const snap = await resp.json();
-          document.getElementById("metricOffset").textContent = String(snap.meta.last_offset);
-          document.getElementById("metricEpoch").textContent = "epoch: " + snap.meta.epoch;
-          document.getElementById("metricState").textContent = snap.meta.state;
-          document.getElementById("metricSubs").textContent = String(snap.subscriber_count);
-
-          if (snap.in_flight) {
-            peakInFlightSeq = Math.max(peakInFlightSeq, snap.in_flight.last_seq);
-            document.getElementById("metricInFlight").textContent = String(snap.in_flight.last_seq);
-            document.getElementById("metricCompacted").textContent = snap.in_flight.merged.length + " chars buffered in RAM";
-            document.getElementById("metricStreamId").textContent = snap.in_flight.stream_id;
-          } else {
-            if (peakInFlightSeq > 0) {
-              lastCompactedChunks = peakInFlightSeq;
-              peakInFlightSeq = 0;
-            }
-            document.getElementById("metricInFlight").textContent = "0";
-            document.getElementById("metricCompacted").textContent = lastCompactedChunks > 0
-              ? "compacted " + lastCompactedChunks + " chunks \u2192 1 WAL record!"
-              : "compacts N deltas \u2192 1 record";
-            document.getElementById("metricStreamId").textContent = "no active stream";
-          }
+          const m = snap.meta;
+          setText("metricSeq", String(m.latest_seq));
+          setText("metricEpoch", "epoch: " + m.epoch);
+          setText("metricWindow", m.earliest_seq > m.latest_seq ? "empty" : m.earliest_seq + " .. " + m.latest_seq);
+          setText("metricWindowSub", m.active_run_start_seq ? "pinned from seq " + m.active_run_start_seq : "earliest_seq .. latest_seq");
+          setText("metricState", m.state);
+          setText("metricRun", m.active_run_start_seq ? "active_run_start_seq = " + m.active_run_start_seq : "no active run");
+          setText("metricSubs", String(snap.subscriber_count));
         } catch (_) {}
       }
 
@@ -901,7 +864,7 @@
             body: JSON.stringify({ session_id: currentSession, delay_ms: 35 }),
           });
           if (resp.status === 409) {
-            logWire(clientA, "sys", "Stream already in-flight for session " + currentSession);
+            logWire(clientA, "sys", "A run is already active for session " + currentSession);
           }
           await pollSessionMetrics();
         } finally {
@@ -912,50 +875,46 @@
       document.getElementById("chaosDropBtn").addEventListener("click", () => {
         disconnectClientB();
         logWire(clientB, "sys", "*** SIMULATED NETWORK DROP (offline for 1.2s...) ***");
-        clientB.reconnectTimer = setTimeout(() => {
-          connectClientB(false);
-        }, 1200);
+        clientB.reconnectTimer = setTimeout(() => connectClientB(false), 1200);
+      });
+
+      document.getElementById("staleCursorBtn").addEventListener("click", () => {
+        disconnectClientB();
+        clientB.cursor = "stale0epoch0:" + (clientB.lastSeq || 1);
+        logWire(clientB, "sys", "Resuming with a cursor from another epoch: " + clientB.cursor);
+        connectClientB(false);
       });
 
       document.getElementById("toggleConnBBtn").addEventListener("click", () => {
         if (clientB.connected) {
           disconnectClientB();
-          logWire(clientB, "sys", "Manually disconnected Client B (cursor saved: " + (clientB.cursor || "0") + ")");
+          logWire(clientB, "sys", "Manually disconnected Client B (cursor saved: " + (clientB.cursor || "none") + ")");
         } else {
           connectClientB(false);
         }
       });
 
-      document.getElementById("reloadZeroABtn").addEventListener("click", () => {
-        connectClientA(true);
-      });
+      document.getElementById("reloadFreshABtn").addEventListener("click", () => connectClientA());
 
       function switchSession(id) {
         currentSession = id.trim() || "playground-1";
         sessionInput.value = currentSession;
-        peakInFlightSeq = 0;
-        lastCompactedChunks = 0;
         syncUrlSession(currentSession);
-        connectClientA(true);
+        connectClientA();
         connectClientB(true);
         pollSessionMetrics();
       }
 
-      document.getElementById("applySessionBtn").addEventListener("click", () => {
-        switchSession(sessionInput.value);
-      });
-
+      document.getElementById("applySessionBtn").addEventListener("click", () => switchSession(sessionInput.value));
       sessionInput.addEventListener("keydown", e => {
         if (e.key === "Enter") switchSession(sessionInput.value);
       });
-
       document.getElementById("newSessionBtn").addEventListener("click", () => {
-        const suffix = Math.random().toString(36).slice(2, 7);
-        switchSession("demo-" + suffix);
+        switchSession("demo-" + Math.random().toString(36).slice(2, 7));
       });
 
-      // Connect both independent SSE panes immediately on load (handles F5 mid-stream!)
-      connectClientA(true);
+      // Connect both panes on load (an F5 in the middle of a run replays it from run_started).
+      connectClientA();
       connectClientB(true);
       pollSessionMetrics();
       setInterval(pollSessionMetrics, 250);

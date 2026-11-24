@@ -18,8 +18,9 @@ import (
 
 const defaultKeepaliveInterval = 15 * time.Second
 
-// maxPublishBodyBytes bounds a publish request body.
-const maxPublishBodyBytes = 4 << 20
+// publishEnvelopeBytes is the room a publish body may use beyond the event payload
+// (type, idempotency_key and JSON syntax).
+const publishEnvelopeBytes = 16 << 10
 
 // Config configures the Seamline HTTP/SSE transport layer.
 type Config struct {
@@ -30,6 +31,7 @@ type Config struct {
 type handler struct {
 	broker            *broker.Broker
 	keepaliveInterval time.Duration
+	maxPublishBody    int64
 
 	demoMu      sync.Mutex
 	activeDemos map[string]struct{}
@@ -45,6 +47,7 @@ func NewHandler(b *broker.Broker, cfg Config) http.Handler {
 	h := &handler{
 		broker:            b,
 		keepaliveInterval: keepalive,
+		maxPublishBody:    int64(b.MaxEventBytes()) + publishEnvelopeBytes,
 		activeDemos:       make(map[string]struct{}),
 	}
 
@@ -128,9 +131,9 @@ func (h *handler) handleInspectSession(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	var req model.PublishRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxPublishBodyBytes))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, h.maxPublishBody))
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid JSON request body")
+		writeDecodeError(w, err)
 		return
 	}
 	res, err := h.broker.Publish(r.Context(), r.PathValue("id"), req)
@@ -139,6 +142,15 @@ func (h *handler) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, codeEventTooLarge, "request body exceeds the maximum event size")
+		return
+	}
+	writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid JSON request body")
 }
 
 func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
