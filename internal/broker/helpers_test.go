@@ -78,7 +78,7 @@ func recvEvent(t *testing.T, sub *Subscription) model.Event {
 	t.Helper()
 	d := recv(t, sub, 2*time.Second)
 	if d.Kind != model.DeliveryEvent {
-		t.Fatalf("expected an event delivery, got %+v", d)
+		t.Fatalf("expected an event delivery, got %+v (reset=%+v)", d, d.Reset)
 	}
 	return d.Event
 }

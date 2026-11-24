@@ -15,8 +15,11 @@ import (
 
 var (
 	ErrSlowSubscriber = errors.New("subscriber evicted due to slow consumption")
-	ErrInvalidInput   = errors.New("invalid publish request")
-	ErrEventTooLarge  = errors.New("event payload exceeds the maximum event size")
+	// ErrInsufficientState ends a subscription whose catch-up replay found a hole in the
+	// history; the client must reconnect with its last cursor to get a cursor_reset.
+	ErrInsufficientState = errors.New("subscriber evicted: event history has a gap")
+	ErrInvalidInput      = errors.New("invalid publish request")
+	ErrEventTooLarge     = errors.New("event payload exceeds the maximum event size")
 	// ErrActiveRunQuotaExceeded is returned when an event would grow the active run beyond
 	// the storage's MaxActiveRunBytes. Terminal events are never rejected by it.
 	ErrActiveRunQuotaExceeded = hotwindow.ErrActiveRunQuotaExceeded

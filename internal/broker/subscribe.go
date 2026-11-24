@@ -16,6 +16,13 @@ type Subscription struct {
 
 // subSnapshot is captured in the same actor.mu critical section that registers liveCh.
 type subSnapshot struct {
+	epoch             string
+	seq               uint64
+	activeRunStartSeq uint64
+}
+
+// cursor is the client's resume position ("" epoch and seq 0 mean a fresh subscription).
+type cursor struct {
 	epoch string
 	seq   uint64
 }
@@ -39,11 +46,13 @@ func (b *Broker) registerSubscriber(ctx context.Context, actor *sessionActor, su
 	}
 	actor.subscribers[sub] = struct{}{}
 	actor.touch()
-	return subSnapshot{epoch: actor.epoch, seq: actor.latestSeq}, nil
+	return subSnapshot{epoch: actor.epoch, seq: actor.latestSeq, activeRunStartSeq: actor.activeRunStartSeq}, nil
 }
 
 // Subscribe resumes the session after (afterEpoch, afterSeq). An empty epoch with seq 0 is a fresh
-// subscription that replays the retained window before live events.
+// subscription. Any other cursor that cannot be continued gaplessly (different epoch, seq evicted
+// from the hot window, or seq ahead of the stream) first receives one cursor reset and then the
+// retained window and live events.
 func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterSeq uint64, afterEpoch string) (*Subscription, error) {
 	if err := b.checkOpen(ctx); err != nil {
 		return nil, err
@@ -72,14 +81,8 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterSeq uint6
 		return nil, err
 	}
 
-	// A cursor from another epoch of this session is replayed from the start of the retained
-	// window. An explicit cursor_reset notification replaces this in a follow-up change.
-	if afterEpoch != snap.epoch {
-		afterSeq = 0
-	}
-
 	outCh := make(chan model.Delivery)
-	go b.runSubscriberPump(ctx, sessionID, actor, sub, outCh, afterSeq, snap)
+	go b.runSubscriberPump(ctx, sessionID, actor, sub, outCh, cursor{epoch: afterEpoch, seq: afterSeq}, snap)
 	return &Subscription{Epoch: snap.epoch, Events: outCh, Cancel: sub.cancel, Err: sub.getErr}, nil
 }
 
@@ -99,42 +102,17 @@ func (b *Broker) runSubscriberPump(
 	actor *sessionActor,
 	sub *subState,
 	outCh chan<- model.Delivery,
-	afterSeq uint64,
+	cur cursor,
 	snap subSnapshot,
 ) {
 	defer b.subWg.Done()
 	defer close(outCh)
 	defer detachSubscriber(actor, sub)
 
-	if !b.replayCatchUp(ctx, sessionID, sub, outCh, afterSeq, snap.seq) {
+	if !b.replayCatchUp(ctx, sessionID, sub, outCh, cur, snap) {
 		return
 	}
 	b.drainLiveStream(ctx, sub, outCh, snap.seq)
-}
-
-// replayCatchUp sends the retained events in (afterSeq, snapSeq] from one ReadAfter.
-func (b *Broker) replayCatchUp(
-	ctx context.Context,
-	sessionID string,
-	sub *subState,
-	outCh chan<- model.Delivery,
-	afterSeq uint64,
-	snapSeq uint64,
-) bool {
-	events, _, err := b.store.ReadAfter(ctx, sessionID, afterSeq)
-	if err != nil {
-		sub.setErr(err)
-		return false
-	}
-	for _, ev := range events {
-		if ev.Seq > snapSeq {
-			break
-		}
-		if !b.sendOut(ctx, sub, outCh, eventDelivery(ev)) {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *Broker) checkPumpStop(ctx context.Context, sub *subState) bool {

@@ -204,19 +204,30 @@ func (h *handler) streamSSELoop(ctx context.Context, w io.Writer, flusher http.F
 }
 
 // writeTerminalStreamError tells the client why the broker ended its subscription. The native
-// EventSource then reconnects with Last-Event-ID.
+// EventSource then reconnects with Last-Event-ID; for insufficient_state that reconnect receives
+// a cursor_reset because the cursor fell out of the retained window.
 func writeTerminalStreamError(w io.Writer, flusher http.Flusher, err error) {
-	if !errors.Is(err, broker.ErrSlowSubscriber) {
+	var code string
+	switch {
+	case errors.Is(err, broker.ErrSlowSubscriber):
+		code = "slow_subscriber"
+	case errors.Is(err, broker.ErrInsufficientState):
+		code = "insufficient_state"
+	default:
 		return
 	}
-	_, _ = io.WriteString(w, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n")
+	_, _ = fmt.Fprintf(w, "event: stream_error\ndata: {\"error\":%q}\n\n", code)
 	flusher.Flush()
 }
 
 // formatDelivery renders one SSE frame. Business events carry id: <epoch>:<seq> and no event:
 // line (EventSource dispatches them as "message"), so producer event types can never collide
-// with control frame names.
+// with control frame names. cursor_reset carries no id:.
 func formatDelivery(d model.Delivery) (string, error) {
+	if d.Kind == model.DeliveryCursorReset {
+		data, err := json.Marshal(d.Reset)
+		return fmt.Sprintf("event: cursor_reset\ndata: %s\n\n", data), err
+	}
 	data, err := json.Marshal(d.Event)
 	return fmt.Sprintf("id: %s:%d\ndata: %s\n\n", d.Event.Epoch, d.Event.Seq, data), err
 }

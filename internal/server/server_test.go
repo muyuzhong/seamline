@@ -626,3 +626,76 @@ func TestSlowSubscriberEmitsSSEErrorFrame(t *testing.T) {
 		t.Fatalf("must not emit a colliding event: error frame:\n%s", wire)
 	}
 }
+
+func TestCursorResetFrameOnEpochMismatch(t *testing.T) {
+	_, srv := newTestEnv(t, "newepoch", broker.Config{}, server.Config{KeepaliveInterval: 5 * time.Second})
+	doPostJSON(t, srv.URL+"/v1/sessions/ep-sess/events", ev("user_message", map[string]string{"content": "kept"}), http.StatusOK, nil)
+
+	sc := openSSEStream(t, srv.URL+"/v1/sessions/ep-sess/stream?after_seq=99&epoch=old_stale_epoch", nil)
+	if f := sc.nextFrame(t, 2*time.Second); !strings.Contains(f.Comment, "connected epoch=newepoch") {
+		t.Fatalf("expected connected comment with the session epoch, got %+v", f)
+	}
+	reset := sc.nextFrame(t, 2*time.Second)
+	if reset.Event != "cursor_reset" || reset.ID != "" {
+		t.Fatalf("expected cursor_reset frame without id, got %+v", reset)
+	}
+	var got model.CursorReset
+	if err := json.Unmarshal([]byte(reset.Data), &got); err != nil {
+		t.Fatalf("decode cursor_reset data %q: %v", reset.Data, err)
+	}
+	want := model.CursorReset{Reason: model.ResetEpochMismatch, RequestedEpoch: "old_stale_epoch", RequestedSeq: 99, CurrentEpoch: "newepoch", EarliestSeq: 1, LatestSeq: 1}
+	if got != want {
+		t.Fatalf("cursor_reset data = %+v, want %+v", got, want)
+	}
+	if f, e := sc.nextEvent(t, 2*time.Second); f.ID != "newepoch:1" || e.Seq != 1 {
+		t.Fatalf("expected event newepoch:1 after the reset, got %+v / %+v", f, e)
+	}
+}
+
+// gappyStore loses one event on reads so the broker detects a hole during catch-up replay.
+type gappyStore struct {
+	*hotwindow.MemoryStorage
+	drop uint64
+}
+
+func (g *gappyStore) ReadAfter(ctx context.Context, id string, after uint64) ([]model.Event, hotwindow.StreamInfo, error) {
+	events, info, err := g.MemoryStorage.ReadAfter(ctx, id, after)
+	out := events[:0]
+	for _, e := range events {
+		if e.Seq != g.drop {
+			out = append(out, e)
+		}
+	}
+	return out, info, err
+}
+
+func TestInsufficientStateEmitsStreamErrorFrame(t *testing.T) {
+	brk := broker.New(&gappyStore{MemoryStorage: hotwindow.NewMemoryStorage(), drop: 2}, broker.Config{})
+	srv := httptest.NewServer(server.NewHandler(brk, server.Config{KeepaliveInterval: 5 * time.Second}))
+	t.Cleanup(func() {
+		_ = brk.Close()
+		srv.Close()
+	})
+	for i := 1; i <= 3; i++ {
+		doPostJSON(t, srv.URL+"/v1/sessions/gap/events", ev("msg", nil), http.StatusOK, nil)
+	}
+
+	sc := openSSEStream(t, srv.URL+"/v1/sessions/gap/stream", nil)
+	var frames []string
+	deadline := time.After(2 * time.Second)
+	for open := true; open; {
+		select {
+		case f, ok := <-sc.frames:
+			if ok && f.Data != "" {
+				frames = append(frames, f.Event+"|"+f.ID)
+			}
+			open = ok
+		case <-deadline:
+			t.Fatalf("stream must end after insufficient_state; still open after %q", frames)
+		}
+	}
+	// One business event frame (no event name, with an id), then stream_error without an id.
+	if len(frames) != 2 || !strings.HasPrefix(frames[0], "|") || frames[0] == "|" || frames[1] != "stream_error|" {
+		t.Fatalf("expected one event frame then stream_error, got %q", frames)
+	}
+}
