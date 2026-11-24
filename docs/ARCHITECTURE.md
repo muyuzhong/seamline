@@ -197,7 +197,9 @@ Clients maintain a map of committed messages by `offset` plus at most one active
 
 ---
 
-## 8. Roadmap & Extension Seams
+## 8. Architectural Evolution (Phase 2 -> Phase 3)
 
-- **Phase 2 — Durable Disk WAL (`storage.Storage`):** Segment-based append-only Write-Ahead Log with CRC32 framing, persisted `Epoch` header for zero-reset crash recovery, and Prometheus `/metrics` telemetry. Because `Broker` depends solely on the `storage.Storage` interface and already decouples `b.mu` from per-session `actor.mu` I/O, swapping `MemoryStorage` for `WALStorage` requires zero wire-protocol changes.
-- **Phase 3 — Multi-Stream Multiplexing & Horizontal Routing:** Replacing single `inFlight *inFlightState` with `map[string]*inFlightState` for parallel tool-call streams per session, paired with consistent-hash session routing and official TypeScript / Go client SDKs.
+> **Design Evolution Notice:** Sections 1–7 above document the currently implemented **Phase 1** baseline. Following Phase 1 review, the next-stage architecture has been refined in **[`docs/DESIGN_V2.md`](DESIGN_V2.md)**:
+> - **Short-TTL Hot Window Only (No Custom Disk WAL):** Long-term conversation history belongs to client local storage or the application's primary database. Seamline focuses strictly on the active/recent hot recovery window (`MemoryEngine` with TTL by default, plus pluggable `RedisEngine` in Phase 3).
+> - **Unified Monotonic Event Cursor (`<epoch>:<seq>`):** Replacing dual-cursor string coalescing with a payload-opaque per-session event ring buffer so parallel tool-call JSON streams and arbitrary agent events pass through untouched to any downstream application.
+> - **Stateful Agent Session Control Plane:** Differentiating Seamline from stateless pub/sub gateways (such as Centrifugo) via Run concurrency guards, bidirectional `Cancel` / `Steer` channels, idempotent CAS `WaitingApproval` gates, and publisher-side Worker heartbeat leases.

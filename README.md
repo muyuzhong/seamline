@@ -179,16 +179,17 @@ go test -race -v ./...
 
 ## Documentation & Engineering Specs / 架构与工程规范
 
-- [Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the dual-speed state machine, storage failure consistency model, lock hierarchy, and catch-up handoff proof sketch.
+- [v2 Architecture Evolution & Centrifugo Comparison (`docs/DESIGN_V2.md`)](docs/DESIGN_V2.md) — **Next-stage blueprint**: short-TTL hot-window scope boundary (RAM + pluggable Redis, no custom disk WAL), unified monotonic event cursor (`<epoch>:<seq>`) for payload-opaque tool/JSON streaming, downstream-agnostic protocol design, and stateful Agent control-plane differentiation vs. Centrifugo.
+- [Phase 1 Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the Phase 1 engine, lock hierarchy, and catch-up handoff proof sketch.
 - [Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Hard concurrency, cognitive complexity (`gocognit <= 15`), and verification rules (`make check`, `make lint`).
 
 ---
 
 ## Roadmap / 演进路线图
 
-- **Phase 1 (Current):** Core dual-speed broker (`SessionActor`), in-memory storage engine, monotonic sequence idempotency, atomic `inflight_snapshot` + live `delta` handoff, slow-subscriber eviction, idle actor eviction, zero-dependency HTTP/SSE server, CLI worker simulator, and embedded F5 Live Playground.
-- **Phase 2:** Append-only disk Write-Ahead Log (WAL) + CRC32 framing & segment compaction implementing `storage.Storage`, crash recovery with persistent epoch continuity, and Prometheus `/metrics` observability.
-- **Phase 3:** Multi-stream concurrent tool-call multiplexing per session, consistent-hash horizontal session routing, and lightweight TypeScript / Go client SDKs.
+- **Phase 1 (Current `main`):** Core per-session actor broker, thread-safe in-memory engine, atomic catch-up to live-tailing handoff, slow-subscriber backpressure eviction (`stream_error`), idle actor eviction, zero-dependency HTTP/SSE server (compatible with custom backend/CLI/desktop apps and browsers), CLI worker simulator, and `gocognit <= 15` CI gates.
+- **Phase 2 (Next — Event Cursor & Stateful Agent Control Plane):** Streamline the hot buffer to a payload-opaque **single monotonic event cursor (`<epoch>:<seq>`) + TTL ring buffer** (natively supporting parallel streaming tool-call JSON & custom events), and build the core **Agent Session Control Plane**: bidirectional `Cancel` / `Steer` queue, atomic CAS `WaitingApproval` human-in-the-loop gate, Run concurrency guard, and Worker heartbeat lease (zombie-session reaper). See [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
+- **Phase 3 (Production Scale-Out):** Pluggable **Redis hot-window backend** (`Streams + EXPIRE`, replacing custom disk WAL so permanent history stays cleanly in client storage or business DBs), lightweight publisher/subscriber token auth, and `/metrics` observability.
 
 ---
 
