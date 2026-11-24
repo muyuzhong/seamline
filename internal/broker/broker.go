@@ -107,12 +107,6 @@ func (b *Broker) InstanceID() string {
 	return b.cfg.InstanceID
 }
 
-func (b *Broker) isClosed() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.closed
-}
-
 // activeActorCount returns the number of in-memory session actors (used by tests).
 func (b *Broker) activeActorCount() int {
 	b.mu.RLock()
@@ -120,27 +114,15 @@ func (b *Broker) activeActorCount() int {
 	return len(b.actors)
 }
 
-func metaFromInfo(info hotwindow.StreamInfo) model.SessionMeta {
-	return model.SessionMeta{
-		SessionID:         info.SessionID,
-		Epoch:             info.Epoch,
-		State:             info.State,
-		EarliestSeq:       info.EarliestSeq,
-		LatestSeq:         info.LatestSeq,
-		ActiveRunStartSeq: info.ActiveRunStartSeq,
-		CreatedAt:         info.CreatedAt,
-		UpdatedAt:         info.UpdatedAt,
-	}
-}
-
+// checkOpen fails once the broker is closed or ctx is done. It needs no lock: Close closes doneCh
+// in the same b.mu critical section that sets closed.
 func (b *Broker) checkOpen(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if b.isClosed() {
+	select {
+	case <-b.doneCh:
 		return ErrBrokerClosed
+	default:
+		return ctx.Err()
 	}
-	return nil
 }
 
 // CreateSession creates the session stream (with a fresh epoch) if it does not exist yet.
@@ -151,11 +133,7 @@ func (b *Broker) CreateSession(ctx context.Context, sessionID string) (model.Ses
 	if sessionID == "" {
 		sessionID = "sess_" + randomHex(6)
 	}
-	info, err := b.store.EnsureStream(ctx, sessionID)
-	if err != nil {
-		return model.SessionMeta{}, err
-	}
-	return metaFromInfo(info), nil
+	return b.store.EnsureStream(ctx, sessionID)
 }
 
 // Inspect reads a session from storage, which is authoritative because every append writes the
@@ -167,24 +145,24 @@ func (b *Broker) Inspect(ctx context.Context, sessionID string) (model.SessionSn
 	if sessionID == "" {
 		return model.SessionSnapshot{}, false, nil
 	}
-	info, ok, err := b.store.Stream(ctx, sessionID)
+	meta, ok, err := b.store.Stream(ctx, sessionID)
 	if err != nil || !ok {
 		return model.SessionSnapshot{}, false, err
 	}
-	return model.SessionSnapshot{Meta: metaFromInfo(info), SubscriberCount: b.subscriberCount(sessionID)}, true, nil
+	return model.SessionSnapshot{Meta: meta, SubscriberCount: b.subscriberCount(sessionID)}, true, nil
 }
 
 func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, error) {
 	if err := b.checkOpen(ctx); err != nil {
 		return nil, err
 	}
-	infos, err := b.store.List(ctx)
+	metas, err := b.store.List(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]model.SessionSnapshot, 0, len(infos))
-	for _, info := range infos {
-		out = append(out, model.SessionSnapshot{Meta: metaFromInfo(info), SubscriberCount: b.subscriberCount(info.SessionID)})
+	out := make([]model.SessionSnapshot, 0, len(metas))
+	for _, meta := range metas {
+		out = append(out, model.SessionSnapshot{Meta: meta, SubscriberCount: b.subscriberCount(meta.SessionID)})
 	}
 	return out, nil
 }

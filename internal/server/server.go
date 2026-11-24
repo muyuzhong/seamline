@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,11 +96,7 @@ func (h *handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sessionID := strings.TrimSpace(req.SessionID)
-	if sessionID == "" {
-		sessionID = generateID("sess_")
-	}
-	meta, err := h.broker.CreateSession(r.Context(), sessionID)
+	meta, err := h.broker.CreateSession(r.Context(), strings.TrimSpace(req.SessionID))
 	if err != nil {
 		writeBrokerError(w, err)
 		return
@@ -244,57 +238,32 @@ func writeDelivery(w io.Writer, flusher http.Flusher, d model.Delivery) error {
 	return nil
 }
 
-// extractStreamCursor reads the resume cursor: the Last-Event-ID header first, then
-// ?after_seq=<epoch>:<seq> (or ?after_seq=<seq>&epoch=<epoch>).
+// extractStreamCursor reads the resume cursor <epoch>:<seq> from the Last-Event-ID header, or
+// else from ?after_seq=.
 func extractStreamCursor(r *http.Request) (epoch string, seq uint64, err error) {
-	if lastID := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastID != "" {
-		return parseCursor(lastID)
+	raw := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if raw == "" {
+		raw = strings.TrimSpace(r.URL.Query().Get("after_seq"))
 	}
-
-	q := r.URL.Query()
-	rawSeq := strings.TrimSpace(q.Get("after_seq"))
-	rawEpoch := strings.TrimSpace(q.Get("epoch"))
-	if rawSeq == "" {
-		return rawEpoch, 0, nil
-	}
-	parsedEpoch, parsedSeq, err := parseCursor(rawSeq)
-	if err != nil {
-		return "", 0, err
-	}
-	if parsedEpoch == "" {
-		parsedEpoch = rawEpoch
-	}
-	return parsedEpoch, parsedSeq, nil
-}
-
-func parseCursor(raw string) (epoch string, seq uint64, err error) {
-	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", 0, nil
 	}
+	return parseCursor(raw)
+}
+
+// parseCursor parses <epoch>:<seq>. A bare <seq> yields an empty epoch, which never matches a
+// session stream.
+func parseCursor(raw string) (epoch string, seq uint64, err error) {
+	seqStr := raw
 	if idx := strings.LastIndexByte(raw, ':'); idx != -1 {
-		epoch = raw[:idx]
-		seqStr := raw[idx+1:]
-		if epoch == "" || seqStr == "" {
+		epoch, seqStr = raw[:idx], raw[idx+1:]
+		if epoch == "" {
 			return "", 0, errors.New("invalid cursor format")
 		}
-		n, err := strconv.ParseUint(seqStr, 10, 64)
-		if err != nil {
-			return "", 0, fmt.Errorf("invalid cursor seq: %w", err)
-		}
-		return epoch, n, nil
 	}
-	n, err := strconv.ParseUint(raw, 10, 64)
+	n, err := strconv.ParseUint(seqStr, 10, 64)
 	if err != nil {
 		return "", 0, fmt.Errorf("invalid cursor seq: %w", err)
 	}
-	return "", n, nil
-}
-
-func generateID(prefix string) string {
-	var buf [6]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
-	}
-	return prefix + hex.EncodeToString(buf[:])
+	return epoch, n, nil
 }

@@ -3,7 +3,6 @@ package broker
 import (
 	"context"
 
-	"github.com/muyuzhong/seamline/internal/hotwindow"
 	"github.com/muyuzhong/seamline/internal/model"
 )
 
@@ -30,7 +29,7 @@ func planReplay(cur cursor, snap subSnapshot) replayPlan {
 	}
 }
 
-func resetDelivery(cur cursor, snap subSnapshot, info hotwindow.StreamInfo, reason string) model.Delivery {
+func resetDelivery(cur cursor, snap subSnapshot, info model.SessionMeta, reason string) model.Delivery {
 	return model.Delivery{
 		Kind: model.DeliveryCursorReset,
 		Reset: &model.CursorReset{

@@ -96,7 +96,7 @@ type gappyStore struct {
 	dropSeq atomic.Uint64
 }
 
-func (g *gappyStore) ReadAfter(ctx context.Context, id string, after uint64) ([]model.Event, hotwindow.StreamInfo, error) {
+func (g *gappyStore) ReadAfter(ctx context.Context, id string, after uint64) ([]model.Event, model.SessionMeta, error) {
 	events, info, err := g.MemoryStorage.ReadAfter(ctx, id, after)
 	drop := g.dropSeq.Load()
 	out := events[:0]
@@ -156,7 +156,7 @@ type evictingStore struct {
 	beforeRead atomic.Pointer[func()]
 }
 
-func (s *evictingStore) ReadAfter(ctx context.Context, id string, after uint64) ([]model.Event, hotwindow.StreamInfo, error) {
+func (s *evictingStore) ReadAfter(ctx context.Context, id string, after uint64) ([]model.Event, model.SessionMeta, error) {
 	if hook := s.beforeRead.Swap(nil); hook != nil {
 		(*hook)()
 	}

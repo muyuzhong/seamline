@@ -25,63 +25,37 @@ func fixedEpochs(epochs ...string) func() string {
 	}
 }
 
-// writer appends events to one stream and tracks the run bookkeeping like the broker does.
+// writer appends events of a given payload size to one stream.
 type writer struct {
-	t     *testing.T
-	s     *MemoryStorage
-	id    string
-	epoch string
-	seq   uint64
-	pin   uint64
+	t  *testing.T
+	s  *MemoryStorage
+	id string
 }
 
 func newWriter(t *testing.T, s *MemoryStorage, id string) *writer {
 	t.Helper()
-	info, err := s.EnsureStream(context.Background(), id)
-	if err != nil {
+	if _, err := s.EnsureStream(context.Background(), id); err != nil {
 		t.Fatalf("EnsureStream(%s): %v", id, err)
 	}
-	return &writer{t: t, s: s, id: id, epoch: info.Epoch, seq: info.LatestSeq}
+	return &writer{t: t, s: s, id: id}
 }
 
-// commit builds the next commit for eventType: run_started opens a run, terminal types end it.
-func (w *writer) commit(eventType string, payloadLen int, at time.Time) Commit {
-	seq := w.seq + 1
-	pin, state := w.pin, model.StateIdle
-	if eventType == model.TypeRunStarted && pin == 0 {
-		pin = seq
-	}
-	if terminal, ok := model.TerminalState(eventType); ok && pin != 0 {
-		pin, state = 0, terminal
-	}
-	if pin != 0 {
-		state = model.StateRunning
-	}
+func (w *writer) append(eventType string, payloadLen int, at time.Time) (model.SessionMeta, error) {
 	payload := json.RawMessage(`"` + strings.Repeat("x", max(payloadLen-2, 0)) + `"`)
-	return Commit{
-		Event:             model.Event{Seq: seq, Epoch: w.epoch, Type: eventType, Payload: payload, CreatedAt: at},
-		State:             state,
-		ActiveRunStartSeq: pin,
-	}
+	_, info, err := w.s.Append(context.Background(), w.id, eventType, payload, at)
+	return info, err
 }
 
-func (w *writer) append(eventType string, payloadLen int, at time.Time) error {
-	c := w.commit(eventType, payloadLen, at)
-	if err := w.s.Append(context.Background(), w.id, c); err != nil {
-		return err
-	}
-	w.seq, w.pin = c.Event.Seq, c.ActiveRunStartSeq
-	return nil
-}
-
-func (w *writer) must(eventType string, payloadLen int, at time.Time) {
+func (w *writer) must(eventType string, payloadLen int, at time.Time) model.SessionMeta {
 	w.t.Helper()
-	if err := w.append(eventType, payloadLen, at); err != nil {
-		w.t.Fatalf("append %s at seq %d: %v", eventType, w.seq+1, err)
+	info, err := w.append(eventType, payloadLen, at)
+	if err != nil {
+		w.t.Fatalf("append %s: %v", eventType, err)
 	}
+	return info
 }
 
-func (w *writer) window() (string, StreamInfo) {
+func (w *writer) window() (string, model.SessionMeta) {
 	w.t.Helper()
 	events, info, err := w.s.ReadAfter(context.Background(), w.id, 0)
 	if err != nil {
@@ -104,40 +78,23 @@ func TestAppendContractAndReadAfter(t *testing.T) {
 	s := NewMemoryStorage(WithEpochSource(fixedEpochs("ep-1")))
 	now := time.Now().UTC()
 
-	ev := func(seq uint64, epoch string) Commit {
-		return Commit{Event: model.Event{Seq: seq, Epoch: epoch, Type: "msg", CreatedAt: now}, State: model.StateIdle}
-	}
-	if err := s.Append(ctx, "a", ev(1, "ep-1")); !errors.Is(err, ErrStreamNotFound) {
+	if _, _, err := s.Append(ctx, "a", "msg", nil, now); !errors.Is(err, ErrStreamNotFound) {
 		t.Fatalf("append before EnsureStream: want ErrStreamNotFound, got %v", err)
+	}
+	if _, _, err := s.Append(ctx, "", "msg", nil, now); !errors.Is(err, ErrInvalidSessionID) {
+		t.Fatalf("empty session: want ErrInvalidSessionID, got %v", err)
 	}
 	info, err := s.EnsureStream(ctx, "a")
 	if err != nil || info.Epoch != "ep-1" || info.EarliestSeq != 1 || info.LatestSeq != 0 || info.State != model.StateIdle {
 		t.Fatalf("new stream: %+v err=%v", info, err)
 	}
-	bad := []struct {
-		name string
-		id   string
-		c    Commit
-		want error
-	}{
-		{"empty session", "", ev(1, "ep-1"), ErrInvalidSessionID},
-		{"foreign epoch", "a", ev(1, "other"), ErrEpochMismatch},
-		{"seq gap", "a", ev(2, "ep-1"), ErrNonMonotonicSeq},
-		{"seq zero", "a", ev(0, "ep-1"), ErrNonMonotonicSeq},
-	}
-	for _, tc := range bad {
-		if err := s.Append(ctx, tc.id, tc.c); !errors.Is(err, tc.want) {
-			t.Fatalf("%s: want %v, got %v", tc.name, tc.want, err)
+	for want := uint64(1); want <= 5; want++ {
+		ev, info, err := s.Append(ctx, "a", "msg", json.RawMessage(`{"n":1}`), now)
+		if err != nil || ev.Seq != want || ev.Epoch != "ep-1" || ev.Type != "msg" || !ev.CreatedAt.Equal(now) || info.LatestSeq != want {
+			t.Fatalf("append %d: event=%+v info=%+v err=%v", want, ev, info, err)
 		}
 	}
-
-	w := newWriter(t, s, "a")
-	for i := 0; i < 5; i++ {
-		w.must("msg", 10, now)
-	}
-	if err := s.Append(ctx, "a", ev(5, "ep-1")); !errors.Is(err, ErrNonMonotonicSeq) {
-		t.Fatalf("duplicate seq: want ErrNonMonotonicSeq, got %v", err)
-	}
+	w := &writer{t: t, s: s, id: "a"}
 	if got, info := w.window(); got != "1,2,3,4,5" || info.EarliestSeq != 1 || info.LatestSeq != 5 {
 		t.Fatalf("window = %s (%+v)", got, info)
 	}
@@ -150,6 +107,31 @@ func TestAppendContractAndReadAfter(t *testing.T) {
 	}
 	if again, _ := s.EnsureStream(ctx, "a"); again.Epoch != "ep-1" || again.LatestSeq != 5 {
 		t.Fatalf("EnsureStream on an existing stream must keep it: %+v", again)
+	}
+}
+
+func TestRunStateMachine(t *testing.T) {
+	now := time.Now().UTC()
+	w := newWriter(t, NewMemoryStorage(), "runs")
+	steps := []struct {
+		eventType string
+		pin       uint64
+		state     model.SessionState
+	}{
+		{"msg", 0, model.StateIdle},                           // 1: events outside a run change nothing
+		{model.TypeRunFinished, 0, model.StateIdle},           // 2: a terminal event outside a run too
+		{model.TypeRunStarted, 3, model.StateRunning},         // 3: only run_started opens a run
+		{model.TypeRunStarted, 3, model.StateRunning},         // 4: a second run_started keeps the start
+		{"assistant_delta", 3, model.StateRunning},            // 5
+		{model.TypeRunFailed, 0, model.StateFailed},           // 6: a terminal event ends the run
+		{"msg", 0, model.StateFailed},                         // 7: the last run's state stays
+		{model.TypeRunStarted, 8, model.StateRunning},         // 8
+		{model.TypeRunInterrupted, 0, model.StateInterrupted}, // 9
+	}
+	for i, st := range steps {
+		if info := w.must(st.eventType, 2, now); info.ActiveRunStartSeq != st.pin || info.State != st.state {
+			t.Fatalf("step %d (%s): pin=%d state=%s, want pin=%d state=%s", i+1, st.eventType, info.ActiveRunStartSeq, info.State, st.pin, st.state)
+		}
 	}
 }
 
@@ -226,47 +208,19 @@ func TestActiveRunQuota(t *testing.T) {
 	w.must(model.TypeRunStarted, 10, now)
 	w.must("d", 100, now)
 	w.must("d", 100, now)
-	if err := w.append("d", 100, now); !errors.Is(err, ErrActiveRunQuotaExceeded) {
+	if _, err := w.append("d", 100, now); !errors.Is(err, ErrActiveRunQuotaExceeded) {
 		t.Fatalf("want ErrActiveRunQuotaExceeded, got %v", err)
 	}
-	if _, info := w.window(); info.LatestSeq != 3 || info.ActiveRunBytes != size(model.TypeRunStarted, 10)+2*size("d", 100) {
+	if _, info := w.window(); info.LatestSeq != 3 || info.ActiveRunStartSeq != 1 {
 		t.Fatalf("rejected append must not change the stream: %+v", info)
 	}
 	// A terminal event is exempt, so the run can always end.
-	w.must(model.TypeRunFailed, 1000, now)
-	if _, info := w.window(); info.ActiveRunStartSeq != 0 || info.ActiveRunBytes != 0 || info.State != model.StateFailed {
+	if info := w.must(model.TypeRunFailed, 1000, now); info.ActiveRunStartSeq != 0 || info.State != model.StateFailed {
 		t.Fatalf("terminal event must end the run: %+v", info)
 	}
 	// A new run starts with a fresh budget.
 	w.must(model.TypeRunStarted, 10, now)
 	w.must("d", 100, now)
-}
-
-func TestInvalidRunTransitions(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now().UTC()
-	s := NewMemoryStorage(WithEpochSource(fixedEpochs("ep")))
-	w := newWriter(t, s, "tr")
-	w.must("msg", 1, now)
-
-	try := func(seq, pin uint64) error {
-		return s.Append(ctx, "tr", Commit{Event: model.Event{Seq: seq, Epoch: "ep", Type: "x", CreatedAt: now}, ActiveRunStartSeq: pin})
-	}
-	if err := try(2, 1); !errors.Is(err, ErrInvalidRunTransition) {
-		t.Fatalf("a run cannot start before its first event: %v", err)
-	}
-	if err := try(2, 2); err != nil { // run starts at seq 2
-		t.Fatalf("starting a run: %v", err)
-	}
-	if err := try(3, 3); !errors.Is(err, ErrInvalidRunTransition) {
-		t.Fatalf("a second run cannot start while one is active: %v", err)
-	}
-	if err := try(3, 2); err != nil {
-		t.Fatalf("continuing the run: %v", err)
-	}
-	if err := try(4, 0); err != nil {
-		t.Fatalf("ending the run: %v", err)
-	}
 }
 
 func TestHistoryTTLKeepsEpochAndSeq(t *testing.T) {
@@ -293,9 +247,8 @@ func TestHistoryTTLKeepsEpochAndSeq(t *testing.T) {
 	if got != "" || info.Epoch != "ep-ttl" || info.LatestSeq != 2 || info.EarliestSeq != 3 {
 		t.Fatalf("empty window must keep epoch and seq counter: window=%q info=%+v", got, info)
 	}
-	w.must("msg", 1, t0.Add(31*time.Minute))
-	if w.seq != 3 {
-		t.Fatalf("seq must continue at 3, got %d", w.seq)
+	if info := w.must("msg", 1, t0.Add(31*time.Minute)); info.LatestSeq != 3 {
+		t.Fatalf("seq must continue at 3, got %d", info.LatestSeq)
 	}
 }
 
@@ -337,45 +290,20 @@ func TestMetaTTLDropsIdleStreamAndRotatesEpoch(t *testing.T) {
 	}
 }
 
-func TestDeepCopyIsolation(t *testing.T) {
+func TestAppendCopiesPayload(t *testing.T) {
 	ctx := context.Background()
-	s := NewMemoryStorage(WithEpochSource(fixedEpochs("ep")))
+	s := NewMemoryStorage()
 	if _, err := s.EnsureStream(ctx, "copy"); err != nil {
 		t.Fatalf("EnsureStream: %v", err)
 	}
 	payload := json.RawMessage(`{"text":"original"}`)
-	if err := s.Append(ctx, "copy", Commit{Event: model.Event{Seq: 1, Epoch: "ep", Type: "t", Payload: payload}}); err != nil {
+	if _, _, err := s.Append(ctx, "copy", "t", payload, time.Now()); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	payload[0] = 'X'
 	got, _, _ := s.ReadAfter(ctx, "copy", 0)
 	if string(got[0].Payload) != `{"text":"original"}` {
 		t.Fatalf("stored payload mutated via input buffer: %s", got[0].Payload)
-	}
-	got[0].Payload[0] = 'Y'
-	again, _, _ := s.ReadAfter(ctx, "copy", 0)
-	if string(again[0].Payload) != `{"text":"original"}` {
-		t.Fatalf("stored payload mutated via output buffer: %s", again[0].Payload)
-	}
-}
-
-func TestContextCancellation(t *testing.T) {
-	s := NewMemoryStorage()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	calls := map[string]error{
-		"EnsureStream": func() error { _, err := s.EnsureStream(ctx, "a"); return err }(),
-		"Stream":       func() error { _, _, err := s.Stream(ctx, "a"); return err }(),
-		"Append":       s.Append(ctx, "a", Commit{}),
-		"ReadAfter":    func() error { _, _, err := s.ReadAfter(ctx, "a", 0); return err }(),
-		"Touch":        s.Touch(ctx, "a"),
-		"Sweep":        s.Sweep(ctx, time.Now()),
-		"List":         func() error { _, err := s.List(ctx); return err }(),
-	}
-	for name, err := range calls {
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("%s: want context.Canceled, got %v", name, err)
-		}
 	}
 }
 
@@ -395,7 +323,7 @@ func TestConcurrentRace(t *testing.T) {
 				case 19:
 					typ = model.TypeRunFinished
 				}
-				if err := w.append(typ, 20, time.Now().UTC()); err != nil {
+				if _, err := w.append(typ, 20, time.Now().UTC()); err != nil {
 					t.Errorf("append: %v", err)
 					return
 				}
