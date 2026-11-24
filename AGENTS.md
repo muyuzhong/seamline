@@ -14,7 +14,8 @@ This file is the **single source of truth** for AI coding agents (Claude Code, C
 - `internal/storage/`: `Storage` interface and `MemoryStorage` reference implementation (`sync.RWMutex`, deep-copied `Payload` slices, strictly monotonic `Offset >= 1`).
 - `internal/broker/`: Core `Broker` (`broker.go`), per-session `sessionActor` & idle sweeper (`actor.go`), dual-speed `Publish` state machine (`publish.go`), and zero-gap `Subscribe` catch-up/live pump (`subscribe.go`).
 - `internal/server/`: Standard-library `http.ServeMux` REST + W3C SSE transport (`server.go`) and embedded F5 Live Playground (`demo.go`, `demo.html`).
-- `docs/ARCHITECTURE.md`: Formal specification of the Dual-Speed Engine, storage failure consistency model, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
+- `docs/ARCHITECTURE.md`: Formal specification of the currently implemented Phase 1 Dual-Speed baseline, storage failure consistency model, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
+- `docs/DESIGN_V2.md`: Phase 2 / Phase 3 architectural blueprint (three-tier byte-bounded TTL hot window, multi-stream `inFlights` with `Meta`, `seamline_cursor` DB alignment, `event: cursor_reset`, and stateful Agent session control plane).
 
 ---
 
@@ -24,6 +25,7 @@ Consult the corresponding specification **before** modifying that subsystem:
 
 | Area Being Changed | Required Reference |
 | :--- | :--- |
+| Phase 2 / Phase 3 features (TTL retention, byte quotas, `cursor_reset`, control plane, Redis) | [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md) |
 | `internal/broker/` state transitions, retries, `inFlight` lifecycle, or `Storage` calls | [State & Storage Failure Consistency](docs/ARCHITECTURE.md#4-state--storage-failure-consistency-model) |
 | `Broker.Subscribe`, `runSubscriberPump`, `Last-Event-ID`, or epoch cursor handling | [Zero-Gap Catch-Up to Live Handoff](docs/ARCHITECTURE.md#5-catch-up-to-live-tailing-zero-gap-proof-sketch) |
 | Locks (`b.mu`, `actor.mu`, `sub.errMu`), `pins`, `evictIdleActors`, or `ListSessions` | [Concurrency, Lock Hierarchy & Pinning](docs/ARCHITECTURE.md#6-concurrency-lock-hierarchy--actor-pinning-model) |
@@ -52,10 +54,10 @@ Formatting rewrites files; always re-run `make check` and `make lint` **after** 
 
 ## Hard Engineering Invariants
 
-Every change to Seamline **must** preserve the following seven invariants. Violations cause silent stream corruption, cross-session stalls, stuck sessions, browser security bugs, or unmaintainable monoliths.
+Every change to Seamline **must** preserve the permanent invariants below. Note the **Phase Scope** markers: rules marked **[Phase 1 Baseline — Evolves in Phase 2]** describe the currently compiled Phase 1 code and **must be updated in lockstep** (never treated as blockers) when implementing the corresponding Phase 2 items in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
 
-### 1. Zero-Dependency Core & No `cgo`
-- Phase 1 runtime packages use **100% Go 1.23+ standard library** (`go 1.23` in `go.mod`). Do not add third-party modules to `go.mod` without explicit architectural approval.
+### 1. Dependency Discipline & No `cgo`
+- **[Phase 1 & 2 Core]:** Core runtime packages (`internal/model`, `internal/broker`, `internal/server`, `MemoryStorage`) use **100% Go 1.23+ standard library** (`go 1.23` in `go.mod`). Optional external drivers (such as Phase 3 `RedisStorage`) require explicit approval before adding dependencies.
 - Never run `go mod init` or `go mod tidy` with an experimental host toolchain that rewrites the `go 1.23` directive in `go.mod`.
 - Production binaries (`./cmd/seamline`, `./cmd/simworker`) must build cleanly with `CGO_ENABLED=0`. (Note: `go test -race` requires `CGO_ENABLED=1` on the test runner; never set global `CGO_ENABLED=0` across race-test steps.)
 
@@ -84,16 +86,16 @@ Every change to Seamline **must** preserve the following seven invariants. Viola
 
 ### 4. Zero-Gap Subscription Handoff
 - In `Broker.Subscribe(ctx, sessionID, afterOffset, afterEpoch)`:
-  - If `afterEpoch != "" && afterEpoch != b.Epoch()`, reset `afterOffset = 0` before catch-up so stale cursors from prior broker epochs replay cleanly from the start of the session.
-  - Register `actor.subscribers[sub] = struct{}{}`, read `snapOffset := actor.lastOffset`, and capture `inFlightSnap := actor.inFlightViewLocked()` inside the **exact same `actor.mu` critical section**.
+  - **[Phase 1 Baseline — Evolves in Phase 2]:** Phase 1 resets `afterOffset = 0` when `afterEpoch != "" && afterEpoch != b.Epoch()`. **In Phase 2 ([`docs/DESIGN_V2.md` §3](docs/DESIGN_V2.md#3-显式断层控制协议event-cursor_reset消除静默缺口))**, non-empty cursors encountering `epoch_mismatch` or `cursor_expired` (`afterOffset + 1 < earliestOffset`) must emit an explicit `event: cursor_reset` frame rather than silently replaying from `0`.
+  - **[Permanent Invariant]:** Register `actor.subscribers[sub] = struct{}{}`, read `snapOffset := actor.lastOffset`, and capture active `inFlight` snapshot(s) inside the **exact same `actor.mu` critical section**. *(Note: Phase 1 tracks a single `actor.inFlight`; Phase 2 expands this to bounded `inFlights map[string]*inFlightState` with `Meta` headers while keeping active uncommitted streams exempt from history TTL/byte eviction.)*
 - In `runSubscriberPump`:
-  1. Replay committed records in `(afterOffset, snapOffset]` from `store.ReadFrom`.
-  2. If `inFlightSnap != nil && inFlightSnap.LastSeq > 0`, emit one `inflight_snapshot` (`Seq = inFlightSnap.LastSeq`, `Delta = inFlightSnap.Merged`).
-  3. Drain `sub.liveCh`, dropping any `EventCommitted` with `Offset <= snapOffset` and any `EventDelta` matching `inFlightSnap.StreamID` with `Seq <= inFlightSnap.LastSeq` (and clearing `inFlightSnap` once its compacted `EventCommitted` is observed).
+  1. Replay committed records in `(afterOffset, snapOffset]` from `store.ReadFrom` (after emitting `cursor_reset` if applicable in Phase 2).
+  2. Emit `inflight_snapshot` frame(s) for active stream(s) with `LastSeq > 0`.
+  3. Drain `sub.liveCh`, dropping any `EventCommitted` with `Offset <= snapOffset` and any `EventDelta` matching an `inflight_snapshot`'s `StreamID` with `Seq <= snap.LastSeq` (clearing that stream's snapshot state once its compacted `EventCommitted` is observed).
 
 ### 5. Non-Blocking Fan-Out, SSE Wire Protocol & Playground XSS Safety
-- **Non-blocking `Publish`:** `fanOutLocked` must use non-blocking channel sends (`select { case sub.liveCh <- ev: default: ... }`). A stalled reader is evicted (`ErrSlowSubscriber`) without delaying producers or sibling subscribers.
-- **Cursor placement (`id:`):** Emit SSE `id: <epoch>:<offset>` **exclusively** on finalized `event: record` frames. Never emit `id:` on `inflight_snapshot`, `delta`, or `stream_error` frames; otherwise browser `EventSource` overwrites its last committed offset cursor.
+- **[Permanent] Non-blocking `Publish`:** `fanOutLocked` must use non-blocking channel sends (`select { case sub.liveCh <- ev: default: ... }`). A stalled reader is evicted (`ErrSlowSubscriber`) without delaying producers or sibling subscribers.
+- **[Permanent] Cursor placement (`id:`):** Emit SSE `id: <epoch>:<offset>` **exclusively** on finalized `event: record` frames. Never emit `id:` on `inflight_snapshot`, `delta`, `cursor_reset`, or `stream_error` frames; otherwise browser `EventSource` overwrites its last committed offset cursor.
 - **Terminal error event naming & reconnection:** Emit `event: stream_error` (never `event: error`, which collides with `EventSource`'s native network `error` event). Browsers only send `Last-Event-ID` on automatic `EventSource` reconnects—never on `new EventSource(url)`—so native `EventSource` clients must leave the instance open on `stream_error` for automatic `Last-Event-ID` recovery, or pass `?after_offset=<epoch>:<offset>` when opening a new `EventSource`.
 - **Single CORS & Shutdown Path:** Set CORS headers once in `withCORS` middleware rather than duplicating them inside handlers. During shutdown (`cmd/seamline/main.go`), call `brk.Close()` **once** and **before** `httpServer.Shutdown()` so open SSE handlers terminate immediately instead of waiting out the shutdown timeout.
 - **DOM XSS Prevention:** In `internal/server/demo.html` (and any future web UI), render session IDs, payloads, deltas, and URL parameters exclusively via safe DOM APIs (`document.createElement`, `node.textContent`, `element.replaceChildren`)—**never** interpolate dynamic strings into `innerHTML`.

@@ -179,17 +179,17 @@ go test -race -v ./...
 
 ## Documentation & Engineering Specs / 架构与工程规范
 
-- [v2 Architecture Evolution & Centrifugo Comparison (`docs/DESIGN_V2.md`)](docs/DESIGN_V2.md) — **Next-stage blueprint**: short-TTL hot-window scope boundary (RAM + pluggable Redis, no custom disk WAL), unified monotonic event cursor (`<epoch>:<seq>`) for payload-opaque tool/JSON streaming, downstream-agnostic protocol design, and stateful Agent control-plane differentiation vs. Centrifugo.
-- [Phase 1 Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the Phase 1 engine, lock hierarchy, and catch-up handoff proof sketch.
-- [Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Hard concurrency, cognitive complexity (`gocognit <= 15`), and verification rules (`make check`, `make lint`).
+- [v2 Architecture Evolution & Control-Plane Spec (`docs/DESIGN_V2.md`)](docs/DESIGN_V2.md) — **Phase 2/3 blueprint**: dual-speed TTL hot window with three-tier byte quotas (preserving uncommitted `inflight_snapshot` across history trimming), primary-DB `seamline_cursor` causal alignment, explicit `event: cursor_reset` gap signaling, and stateful Agent control-plane differentiation vs. Centrifugo.
+- [Phase 1 Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the currently implemented Phase 1 baseline, lock hierarchy, and catch-up handoff proof sketch.
+- [Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Permanent concurrency & complexity (`gocognit <= 15`) gates plus Phase 1 vs. Phase 2 scoped rules.
 
 ---
 
 ## Roadmap / 演进路线图
 
-- **Phase 1 (Current `main`):** Core per-session actor broker, thread-safe in-memory engine, atomic catch-up to live-tailing handoff, slow-subscriber backpressure eviction (`stream_error`), idle actor eviction, zero-dependency HTTP/SSE server (compatible with custom backend/CLI/desktop apps and browsers), CLI worker simulator, and `gocognit <= 15` CI gates.
-- **Phase 2 (Next — Event Cursor & Stateful Agent Control Plane):** Streamline the hot buffer to a payload-opaque **single monotonic event cursor (`<epoch>:<seq>`) + TTL ring buffer** (natively supporting parallel streaming tool-call JSON & custom events), and build the core **Agent Session Control Plane**: bidirectional `Cancel` / `Steer` queue, atomic CAS `WaitingApproval` human-in-the-loop gate, Run concurrency guard, and Worker heartbeat lease (zombie-session reaper). See [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
-- **Phase 3 (Production Scale-Out):** Pluggable **Redis hot-window backend** (`Streams + EXPIRE`, replacing custom disk WAL so permanent history stays cleanly in client storage or business DBs), lightweight publisher/subscriber token auth, and `/metrics` observability.
+- **Phase 1 (Current `main`):** Core dual-speed per-session actor broker (`Record` + `InFlight` coalescing), thread-safe in-memory engine, atomic catch-up to live-tailing handoff, slow-subscriber backpressure eviction (`stream_error`), idle actor eviction, downstream-agnostic HTTP/SSE server, CLI worker simulator, and `gocognit <= 15` CI gates.
+- **Phase 2 (Next — Bounded Dual-Speed Hot Window & Stateful Agent Control Plane):** Multi-stream `inFlights` with `Meta` headers for parallel tool-call JSON streaming, three-tier byte quotas + `HistoryTTL` (evicting only committed `Record`s while protecting active uncommitted `inFlights`), explicit `event: cursor_reset` (`epoch_mismatch` / `cursor_expired`) + `seamline_cursor` DB alignment, and the **Agent Session Control Plane** (`Cancel` / `Steer` queue, CAS `WaitingApproval` gate, Run concurrency guard, and Worker heartbeat lease). See [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
+- **Phase 3 (Production Scale-Out):** Pluggable **Redis hot-window backend** (storing compacted `Record`s + session control state with native `EXPIRE`, keeping permanent history in client storage or business DBs), lightweight publisher/subscriber token auth, and `/metrics` observability.
 
 ---
 
