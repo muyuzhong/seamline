@@ -65,7 +65,9 @@ func (b *Broker) replayCatchUp(
 		sub.setErr(ErrInsufficientState)
 		return false
 	}
-	if plan.checkWindow && plan.readAfter+1 < info.EarliestSeq {
+	// Events after the snapshot arrive through liveCh, so only a hole at or below snap.seq expires
+	// the cursor; publishes since the snapshot may already have evicted later seqs from storage.
+	if plan.checkWindow && plan.readAfter+1 < min(info.EarliestSeq, snap.seq+1) {
 		plan.reason = model.ResetCursorExpired
 	}
 	if plan.reason != "" && !b.sendOut(ctx, sub, outCh, resetDelivery(cur, snap, info, plan.reason)) {
