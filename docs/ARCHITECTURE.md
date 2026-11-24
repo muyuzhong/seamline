@@ -73,13 +73,13 @@ Seamline is a **short hot window**, not a system of record: long-term history be
 | `MaxEventBytes` (payload of one publish) | 256 KiB | `broker.validatePublishRequest`; body limit = `MaxEventBytes` + 16 KiB | `413 event_too_large` |
 | `MaxActiveRunBytes` (retained bytes of the active run) | 16 MiB | `hotwindow` `stream.check` | `413 active_run_quota_exceeded`; terminal events exempt |
 | `ActiveRunIdleTimeout` | 2m | sweeper `sealIdleRuns` | `run_failed {"reason":"idle_timeout"}` |
-| `MaxHistoryBytes` (events outside the active run; `payload + type + 64B` each) | 8 MiB | `hotwindow` `stream.evict` | oldest history evicted; latest finished run and newest event kept |
+| `MaxHistoryBytes` (events outside the active run; `payload + type + 64B` each) | 8 MiB | `hotwindow` `stream.evict` | oldest history evicted; latest finished run and newest event kept. The window stays contiguous, so history published after the latest finished run is evicted by bytes only once that run expires (`HistoryTTL` from its end); until then retained history can exceed this limit |
 | `HistoryTTL` | 15m | `Append` / `Sweep` | history evicted; the latest finished run counts from its end |
 | `MetaTTL` | 24h | `MemoryStorage.Sweep` | stream dropped (new epoch on recreation) |
-| `IdempotencyWindow` | 5m | `windowIndex` in the actor | key forgotten |
+| `IdempotencyWindow` | 5m | `windowIndex` in the actor | key forgotten (also when the actor is evicted, see §3.4) |
 
 ### 3.4 Idempotent Retries
-A publish may carry `idempotency_key`. Within `IdempotencyWindow` a repeat returns the original `{epoch, seq, deduplicated: true}` and is not fanned out. The key is recorded only after the append succeeds. Content is not compared.
+A publish may carry `idempotency_key`. Within `IdempotencyWindow` a repeat returns the original `{epoch, seq, deduplicated: true}` and is not fanned out. The key is recorded only after the append succeeds. Content is not compared. The index lives in the session actor and idle eviction (§6.3) drops it, so keep `IdleSessionTTL` (default 30m) at least `IdempotencyWindow`; otherwise a retry that arrives after the actor was evicted is committed again.
 
 ---
 
@@ -109,10 +109,10 @@ After `Append` returns `nil`: `applyCommitLocked`, record the `idempotency_key`,
 
 ## 5. Catch-Up to Live Tailing Zero-Gap Proof Sketch
 
-**Theorem:** for a session stream with epoch $E$, a subscriber that is not evicted (slow consumer or insufficient state) receives (a) when its cursor is `<E>:S_0` with `EarliestSeq - 1 <= S_0 <= LatestSeq`: every event with seq $> S_0$ exactly once and in order; (b) otherwise: one `cursor_reset` followed by every retained event and all later events exactly once and in order.
+**Theorem:** for a session stream with epoch $E$, a subscriber that is not evicted (slow consumer or insufficient state) receives (a) with no cursor: no `cursor_reset`, then every retained event and all later events exactly once and in order; (b) when its cursor is `<E>:S_0` with `EarliestSeq - 1 <= S_0 <= LatestSeq`: every event with seq $> S_0$ exactly once and in order; (c) otherwise: one `cursor_reset` followed by every retained event and all later events exactly once and in order.
 
 1. **Linearization point:** `registerSubscriber` inserts `sub` and captures `(epoch, snapSeq = latestSeq, activeRunStartSeq)` in one `actor.mu` critical section $T_{sub}$. `Publish` and sealing hold `actor.mu` across `Append` and `fanOutLocked`, so every event with seq $\le$ `snapSeq` is in storage and every later event goes to `liveCh` in order.
-2. **Cursor classification** (`planReplay`) uses only the cursor and the snapshot; one atomic `ReadAfter` returns the events and the window, so the `cursor_expired` test (`S_0 + 1 < EarliestSeq`) and the replayed events agree.
+2. **Cursor classification** (`planReplay`) uses only the cursor and the snapshot; one atomic `ReadAfter` returns the events and the window, so the `cursor_expired` test (`S_0 + 1 < min(EarliestSeq, snapSeq + 1)`) and the replayed events agree. Seqs above `snapSeq` arrive through `liveCh`, so publishes that evict them from storage before the read never expire a caught-up cursor.
 3. **Replay** sends events up to `snapSeq` (later ones arrive through `liveCh`) and checks contiguity: for a resumable cursor the first event must be `S_0 + 1`; after a reset or on a fresh subscription it may start anywhere in the window. A hole ends the subscription with `ErrInsufficientState`.
 4. **Live:** every `liveCh` event has seq $>$ `snapSeq`; the `Seq <= snapSeq` filter is defense in depth. $\blacksquare$
 
@@ -143,7 +143,7 @@ Because the active run is pinned, `EarliestSeq <= active_run_start_seq` holds wh
 - **`Inspect` / `ListSessions`:** read storage; `subscriberCount` looks up the actor under `b.mu.RLock()` and locks it after releasing `b.mu`.
 
 ### 6.3 Pinning & Idle Eviction
-API calls pin their actor and release it with `defer actor.unpin()` (which refreshes `lastActiveNano`). **Sweeper pins are released with `actor.pins.Add(-1)` and never touch the actor.** An actor is evicted iff, while `actor.mu` is held via `TryLock()`: no pins, no subscribers, **no active run** (the actor owns the run's idle timer), and idle longer than `IdleSessionTTL`. Evicting an actor only drops the broker-side cache; the stream stays in storage.
+API calls pin their actor and release it with `defer actor.unpin()` (which refreshes `lastActiveNano`). **Sweeper pins are released with `actor.pins.Add(-1)` and never touch the actor.** An actor is evicted iff, while `actor.mu` is held via `TryLock()`: no pins, no subscribers, **no active run** (the actor owns the run's idle timer), and idle longer than `IdleSessionTTL`. Evicting an actor only drops the broker-side cache (including its idempotency index, §3.4); the stream stays in storage.
 
 ### 6.4 Sweeper Pass (every `SweepInterval`)
 1. `sealIdleRuns`: end runs silent for `ActiveRunIdleTimeout`.
@@ -185,9 +185,10 @@ Errors are `{"error": "...", "code": "..."}`.
 | :--- | :--- | :--- |
 | `400` | `invalid_request` | empty `type`, invalid JSON, malformed cursor |
 | `404` | `not_found` | unknown session on `GET /v1/sessions/{id}` |
-| `409` | `conflict` | demo simulation already running |
+| `409` | `conflict` | demo simulate: a run is already active, or a demo simulation is already running |
 | `413` | `event_too_large` | payload over `MaxEventBytes` or body over the request limit |
 | `413` | `active_run_quota_exceeded` | active run over `MaxActiveRunBytes` |
+| `500` | `internal_error` | unexpected storage error |
 | `503` | `broker_closed` | broker shutting down |
 
 ---
