@@ -14,8 +14,8 @@ This file is the **single source of truth** for AI coding agents (Claude Code, C
 - `internal/storage/`: `Storage` interface and `MemoryStorage` reference implementation (`sync.RWMutex`, deep-copied `Payload` slices, strictly monotonic `Offset >= 1`).
 - `internal/broker/`: Core `Broker` (`broker.go`), per-session `sessionActor` & idle sweeper (`actor.go`), dual-speed `Publish` state machine (`publish.go`), and zero-gap `Subscribe` catch-up/live pump (`subscribe.go`).
 - `internal/server/`: Standard-library `http.ServeMux` REST + W3C SSE transport (`server.go`) and embedded F5 Live Playground (`demo.go`, `demo.html`).
-- `docs/ARCHITECTURE.md`: Formal specification of the currently implemented Phase 1 Dual-Speed baseline, storage failure consistency model, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
-- `docs/DESIGN_V2.md`: Phase 2 / Phase 3 architectural blueprint (three-tier byte-bounded TTL hot window, multi-stream `inFlights` with `Meta`, `seamline_cursor` DB alignment, `event: cursor_reset`, and stateful Agent session control plane).
+- `docs/ARCHITECTURE.md`: Formal specification of the currently implemented Phase 1 baseline on `main`, storage failure consistency model, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
+- `docs/DESIGN_V2.md`: **Authoritative Phase 2 / Phase 3 blueprint** — payload-opaque **pure monotonic event cursor (`<epoch>:<seq>`)**, per-session `epoch` + `MetaTTL`, pinned active-run byte ring buffer (`active_run_start_seq` + three-tier byte quotas), `idempotency_key`, `seamline_cursor` DB alignment, `event: cursor_reset`, and stateful Agent session control plane.
 
 ---
 
@@ -85,17 +85,16 @@ Every change to Seamline **must** preserve the permanent invariants below. Note 
 - **Non-`fin` Delta Consistency:** On `fin=false` chunks, ensure memory mutation (`inFlight`, `mergedBuf`, `lastSeq`) and `fanOutLocked` execute atomically without an intervening failing `SaveMeta` aborting between buffer mutation and fan-out.
 
 ### 4. Zero-Gap Subscription Handoff
-- In `Broker.Subscribe(ctx, sessionID, afterOffset, afterEpoch)`:
-  - **[Phase 1 Baseline — Evolves in Phase 2]:** Phase 1 resets `afterOffset = 0` when `afterEpoch != "" && afterEpoch != b.Epoch()`. **In Phase 2 ([`docs/DESIGN_V2.md` §3](docs/DESIGN_V2.md#3-显式断层控制协议event-cursor_reset消除静默缺口))**, non-empty cursors encountering `epoch_mismatch` or `cursor_expired` (`afterOffset + 1 < earliestOffset`) must emit an explicit `event: cursor_reset` frame rather than silently replaying from `0`.
-  - **[Permanent Invariant]:** Register `actor.subscribers[sub] = struct{}{}`, read `snapOffset := actor.lastOffset`, and capture active `inFlight` snapshot(s) inside the **exact same `actor.mu` critical section**. *(Note: Phase 1 tracks a single `actor.inFlight`; Phase 2 expands this to bounded `inFlights map[string]*inFlightState` with `Meta` headers while keeping active uncommitted streams exempt from history TTL/byte eviction.)*
-- In `runSubscriberPump`:
-  1. Replay committed records in `(afterOffset, snapOffset]` from `store.ReadFrom` (after emitting `cursor_reset` if applicable in Phase 2).
-  2. Emit `inflight_snapshot` frame(s) for active stream(s) with `LastSeq > 0`.
-  3. Drain `sub.liveCh`, dropping any `EventCommitted` with `Offset <= snapOffset` and any `EventDelta` matching an `inflight_snapshot`'s `StreamID` with `Seq <= snap.LastSeq` (clearing that stream's snapshot state once its compacted `EventCommitted` is observed).
+- **[Phase 1 Baseline — Superseded in Phase 2 by `docs/DESIGN_V2.md` §1 & §3]:**
+  - On current `main` (Phase 1), `Broker.Subscribe` resets `afterOffset = 0` on epoch mismatch and captures `(snapOffset, inFlightSnap)` for dual-speed replay.
+  - **When implementing Phase 2 ([`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)):** Remove `InFlight` / `inflight_snapshot` string coalescing and switch to the payload-opaque **Pure Event Cursor (`<epoch>:<seq>`)** with per-session epochs (`MetaTTL`), **pinned active-run retention (`active_run_start_seq` exempt from `HistoryTTL` / `MaxHistoryBytes`)**, and explicit first-frame `event: cursor_reset` (`epoch_mismatch` | `cursor_expired` | `cursor_ahead`).
+- **[Permanent Invariant — Atomic Registration & Snapshot]:** Always register `actor.subscribers[sub] = struct{}{}` and capture the current sequence watermark (`snapSeq` / `snapOffset`) inside the **exact same `actor.mu` critical section**, then replay buffered events up to that watermark outside `actor.mu` and deduplicate `sub.liveCh` events with `Seq <= snapSeq` so zero events are ever dropped or duplicated across the catch-up-to-live boundary.
 
 ### 5. Non-Blocking Fan-Out, SSE Wire Protocol & Playground XSS Safety
 - **[Permanent] Non-blocking `Publish`:** `fanOutLocked` must use non-blocking channel sends (`select { case sub.liveCh <- ev: default: ... }`). A stalled reader is evicted (`ErrSlowSubscriber`) without delaying producers or sibling subscribers.
-- **[Permanent] Cursor placement (`id:`):** Emit SSE `id: <epoch>:<offset>` **exclusively** on finalized `event: record` frames. Never emit `id:` on `inflight_snapshot`, `delta`, `cursor_reset`, or `stream_error` frames; otherwise browser `EventSource` overwrites its last committed offset cursor.
+- **[Phase-Scoped] Cursor placement (`id:`):**
+  - *Phase 1 (`main`):* Emits `id: <epoch>:<offset>` only on finalized `event: record` frames.
+  - *Phase 2 (`docs/DESIGN_V2.md`):* Under the Pure Event Cursor model, emit `id: <epoch>:<seq>` on **every business `Event` frame**, and omit `id:` **only** on Broker control/error frames (`event: cursor_reset` and `event: stream_error`). Update this section when landing the Phase 2 data-plane refactor.
 - **Terminal error event naming & reconnection:** Emit `event: stream_error` (never `event: error`, which collides with `EventSource`'s native network `error` event). Browsers only send `Last-Event-ID` on automatic `EventSource` reconnects—never on `new EventSource(url)`—so native `EventSource` clients must leave the instance open on `stream_error` for automatic `Last-Event-ID` recovery, or pass `?after_offset=<epoch>:<offset>` when opening a new `EventSource`.
 - **Single CORS & Shutdown Path:** Set CORS headers once in `withCORS` middleware rather than duplicating them inside handlers. During shutdown (`cmd/seamline/main.go`), call `brk.Close()` **once** and **before** `httpServer.Shutdown()` so open SSE handlers terminate immediately instead of waiting out the shutdown timeout.
 - **DOM XSS Prevention:** In `internal/server/demo.html` (and any future web UI), render session IDs, payloads, deltas, and URL parameters exclusively via safe DOM APIs (`document.createElement`, `node.textContent`, `element.replaceChildren`)—**never** interpolate dynamic strings into `innerHTML`.
