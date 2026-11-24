@@ -2,6 +2,8 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,9 +16,29 @@ import (
 type inFlightState struct {
 	streamID  string
 	typ       string
+	meta      json.RawMessage
 	mergedBuf strings.Builder
 	lastSeq   uint64
 	startedAt time.Time
+	updatedAt time.Time
+}
+
+func (f *inFlightState) view() model.InFlightView {
+	return model.InFlightView{
+		StreamID:  f.streamID,
+		Type:      f.typ,
+		Meta:      f.meta,
+		Merged:    f.mergedBuf.String(),
+		LastSeq:   f.lastSeq,
+		StartedAt: f.startedAt,
+		UpdatedAt: f.updatedAt,
+	}
+}
+
+// finalizedStream remembers a stream compacted into a Record so retries stay idempotent.
+type finalizedStream struct {
+	lastSeq uint64
+	offset  uint64
 }
 
 type subState struct {
@@ -52,18 +74,16 @@ func (s *subState) getErr() error {
 }
 
 type sessionActor struct {
-	mu                    sync.Mutex
-	meta                  model.SessionMeta
-	metaPersisted         bool
-	metaFlushTried        bool
-	lastOffset            uint64
-	inFlight              *inFlightState
-	lastCompactedStreamID string
-	lastCompactedSeq      uint64
-	lastCompactedOffset   uint64
-	subscribers           map[*subState]struct{}
-	lastActiveNano        atomic.Int64
-	pins                  atomic.Int32
+	mu             sync.Mutex
+	meta           model.SessionMeta // meta.Epoch is the session stream epoch owned by Storage
+	metaPersisted  bool
+	metaFlushTried bool
+	lastOffset     uint64
+	inFlights      map[string]*inFlightState
+	finalized      *windowIndex[finalizedStream]
+	subscribers    map[*subState]struct{}
+	lastActiveNano atomic.Int64
+	pins           atomic.Int32
 }
 
 func (a *sessionActor) touch() {
@@ -75,23 +95,25 @@ func (a *sessionActor) unpin() {
 	a.pins.Add(-1)
 }
 
-func (a *sessionActor) inFlightViewLocked() *model.InFlightView {
-	if a.inFlight == nil {
-		return nil
+// inFlightViewsLocked returns the active streams ordered by start time (then stream ID).
+func (a *sessionActor) inFlightViewsLocked() []model.InFlightView {
+	views := make([]model.InFlightView, 0, len(a.inFlights))
+	for _, f := range a.inFlights {
+		views = append(views, f.view())
 	}
-	return &model.InFlightView{
-		StreamID:  a.inFlight.streamID,
-		Type:      a.inFlight.typ,
-		Merged:    a.inFlight.mergedBuf.String(),
-		LastSeq:   a.inFlight.lastSeq,
-		StartedAt: a.inFlight.startedAt,
-	}
+	sort.Slice(views, func(i, j int) bool {
+		if !views[i].StartedAt.Equal(views[j].StartedAt) {
+			return views[i].StartedAt.Before(views[j].StartedAt)
+		}
+		return views[i].StreamID < views[j].StreamID
+	})
+	return views
 }
 
 func (a *sessionActor) snapshotLocked() model.SessionSnapshot {
 	return model.SessionSnapshot{
 		Meta:            a.meta,
-		InFlight:        a.inFlightViewLocked(),
+		InFlights:       a.inFlightViewsLocked(),
 		SubscriberCount: len(a.subscribers),
 	}
 }
@@ -163,6 +185,8 @@ func (b *Broker) newCandidateActor(meta model.SessionMeta, saved bool) *sessionA
 		meta:          meta,
 		metaPersisted: saved,
 		lastOffset:    meta.LastOffset,
+		inFlights:     make(map[string]*inFlightState),
+		finalized:     newWindowIndex[finalizedStream](b.cfg.IdempotencyWindow),
 		subscribers:   make(map[*subState]struct{}),
 	}
 	actor.pins.Store(1)

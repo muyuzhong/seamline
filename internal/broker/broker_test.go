@@ -82,8 +82,8 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 				if snap.Meta.State != model.StateRunning || snap.Meta.LastOffset != 0 {
 					t.Fatalf("expected running with LastOffset=0 mid-stream, got %+v", snap.Meta)
 				}
-				if snap.InFlight == nil || snap.InFlight.LastSeq != 250 || snap.InFlight.Merged != wantBuilder.String() {
-					t.Fatalf("unexpected mid-stream InFlight: %+v", snap.InFlight)
+				if len(snap.InFlights) != 1 || snap.InFlights[0].LastSeq != 250 || snap.InFlights[0].Merged != wantBuilder.String() {
+					t.Fatalf("unexpected mid-stream InFlights: %+v", snap.InFlights)
 				}
 			}
 		} else {
@@ -112,8 +112,8 @@ func Test500DeltasCompactIntoSingleRecord(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Inspect post-compaction failed: ok=%v err=%v", ok, err)
 	}
-	if snap.InFlight != nil {
-		t.Fatalf("expected InFlight == nil after compaction, got %+v", snap.InFlight)
+	if len(snap.InFlights) != 0 {
+		t.Fatalf("expected no in-flight streams after compaction, got %+v", snap.InFlights)
 	}
 	if snap.Meta.LastOffset != 1 || snap.Meta.State != model.StateCompleted {
 		t.Fatalf("expected LastOffset=1 and State=completed, got %+v", snap.Meta)
@@ -461,11 +461,6 @@ func TestIdempotentSeqRetryAndValidationErrors(t *testing.T) {
 		t.Fatalf("expected ErrSequenceGap on Seq=4, got %v", err)
 	}
 
-	// Concurrent stream with different StreamID -> ErrStreamConflict!
-	if _, err := b.Publish(ctx, "s1", model.PublishRequest{StreamID: "st-OTHER", Seq: 1, Delta: "hi"}); !errors.Is(err, ErrStreamConflict) {
-		t.Fatalf("expected ErrStreamConflict on st-OTHER, got %v", err)
-	}
-
 	// Invalid JSON payload on Fin must NOT corrupt in-flight state!
 	if _, err := b.Publish(ctx, "s1", model.PublishRequest{
 		StreamID: "st-1",
@@ -503,6 +498,13 @@ func TestIdempotentSeqRetryAndValidationErrors(t *testing.T) {
 	}
 	if !lateDup.Deduplicated || lateDup.CommittedOffset != 1 || lateDup.InFlightSeq != 3 {
 		t.Fatalf("expected Deduplicated=true CommittedOffset=1 on late Fin retry, got %+v", lateDup)
+	}
+
+	// A finalized stream only accepts exact retries: a new seq or an auto-seq is rejected.
+	for _, seq := range []uint64{4, 0} {
+		if _, err := b.Publish(ctx, "s1", model.PublishRequest{StreamID: "st-1", Seq: seq, Delta: "late"}); !errors.Is(err, ErrStreamFinalized) {
+			t.Fatalf("expected ErrStreamFinalized for seq %d on finalized stream, got %v", seq, err)
+		}
 	}
 
 	// Verify subscriber saw exactly 3 deltas + 1 committed record = "Hello!"
@@ -881,11 +883,11 @@ func TestFinAppendFailureThenRetryCommits(t *testing.T) {
 
 	// Verify inFlight was NOT mutated by the failed Fin attempt.
 	snap, ok, err := b.Inspect(ctx, "s")
-	if err != nil || !ok || snap.InFlight == nil {
-		t.Fatalf("expected InFlight still active after failed Fin, got snap=%+v ok=%v err=%v", snap, ok, err)
+	if err != nil || !ok || len(snap.InFlights) != 1 {
+		t.Fatalf("expected stream still in flight after failed Fin, got snap=%+v ok=%v err=%v", snap, ok, err)
 	}
-	if snap.InFlight.LastSeq != 1 || snap.InFlight.Merged != "Hel" {
-		t.Fatalf("expected InFlight untouched (LastSeq=1, Merged='Hel'), got %+v", snap.InFlight)
+	if snap.InFlights[0].LastSeq != 1 || snap.InFlights[0].Merged != "Hel" {
+		t.Fatalf("expected in-flight stream untouched (LastSeq=1, Merged='Hel'), got %+v", snap.InFlights[0])
 	}
 
 	// Retry with same Seq=2 must commit Offset=1 with "Hello" (NOT Deduplicated: true!).
@@ -964,11 +966,11 @@ func TestFirstChunkFailureLeavesNoOrphanInFlight(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Inspect failed: ok=%v err=%v", ok, err)
 	}
-	if snap.InFlight != nil {
-		t.Fatalf("expected nil InFlight after failed first chunk, got %+v", snap.InFlight)
+	if len(snap.InFlights) != 0 {
+		t.Fatalf("expected no in-flight stream after failed first chunk, got %+v", snap.InFlights)
 	}
 
-	// 2. Subsequent stream with a brand-new StreamID must succeed without ErrStreamConflict,
+	// 2. A subsequent stream with a brand-new StreamID must succeed,
 	// even if SaveMeta fails on StateRunning transition!
 	sub, err := b.Subscribe(ctx, "s-first", 0, "")
 	if err != nil {

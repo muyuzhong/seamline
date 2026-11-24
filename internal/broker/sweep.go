@@ -52,7 +52,7 @@ func (b *Broker) tryEvictOrStageFlushLocked(id string, actor *sessionActor, now 
 	defer actor.mu.Unlock()
 
 	lastActive := time.Unix(0, actor.lastActiveNano.Load())
-	isIdle := actor.pins.Load() == 0 && len(actor.subscribers) == 0 && actor.inFlight == nil
+	isIdle := actor.pins.Load() == 0 && len(actor.subscribers) == 0 && len(actor.inFlights) == 0
 	if !isIdle || now.Sub(lastActive) <= b.cfg.IdleSessionTTL {
 		return nil
 	}

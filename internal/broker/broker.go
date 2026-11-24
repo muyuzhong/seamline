@@ -15,17 +15,21 @@ import (
 )
 
 var (
-	ErrSlowSubscriber = errors.New("subscriber evicted due to slow consumption")
-	ErrInvalidInput   = errors.New("invalid publish request")
-	ErrSequenceGap    = errors.New("out-of-order stream sequence")
-	ErrStreamConflict = errors.New("another stream is currently in-flight for this session")
-	ErrBrokerClosed   = errors.New("broker closed")
+	ErrSlowSubscriber  = errors.New("subscriber evicted due to slow consumption")
+	ErrInvalidInput    = errors.New("invalid publish request")
+	ErrSequenceGap     = errors.New("out-of-order stream sequence")
+	ErrTooManyStreams  = errors.New("too many concurrent in-flight streams for this session")
+	ErrStreamFinalized = errors.New("stream already finalized")
+	ErrBrokerClosed    = errors.New("broker closed")
 )
 
 const (
 	defaultSubscriberBufferSize = 128
 	defaultIdleSessionTTL       = 30 * time.Minute
 	defaultSweepInterval        = 1 * time.Minute
+
+	DefaultMaxConcurrentStreams = 8
+	DefaultIdempotencyWindow    = 5 * time.Minute
 )
 
 type Config struct {
@@ -35,18 +39,25 @@ type Config struct {
 	// InstanceID identifies this broker process (random 12-char hex if empty). Session
 	// cursors use the per-session stream epoch from Storage, not this value.
 	InstanceID string
+	// MaxConcurrentStreams bounds in-flight streams per session (default 8).
+	MaxConcurrentStreams int
+	// IdempotencyWindow is how long a finalized stream keeps deduplicating retries (default 5m).
+	IdempotencyWindow time.Duration
+}
+
+func orDefault[T int | time.Duration](v, def T) T {
+	if v <= 0 {
+		return def
+	}
+	return v
 }
 
 func normalizeConfig(cfg Config) Config {
-	if cfg.SubscriberBufferSize <= 0 {
-		cfg.SubscriberBufferSize = defaultSubscriberBufferSize
-	}
-	if cfg.IdleSessionTTL <= 0 {
-		cfg.IdleSessionTTL = defaultIdleSessionTTL
-	}
-	if cfg.SweepInterval <= 0 {
-		cfg.SweepInterval = defaultSweepInterval
-	}
+	cfg.SubscriberBufferSize = orDefault(cfg.SubscriberBufferSize, defaultSubscriberBufferSize)
+	cfg.IdleSessionTTL = orDefault(cfg.IdleSessionTTL, defaultIdleSessionTTL)
+	cfg.SweepInterval = orDefault(cfg.SweepInterval, defaultSweepInterval)
+	cfg.MaxConcurrentStreams = orDefault(cfg.MaxConcurrentStreams, DefaultMaxConcurrentStreams)
+	cfg.IdempotencyWindow = orDefault(cfg.IdempotencyWindow, DefaultIdempotencyWindow)
 	if cfg.InstanceID == "" {
 		cfg.InstanceID = randomHex(6)
 	}
@@ -230,7 +241,10 @@ func (b *Broker) ListSessions(ctx context.Context) ([]model.SessionSnapshot, err
 
 	byID := make(map[string]model.SessionSnapshot, len(metas))
 	for _, meta := range metas {
-		byID[meta.SessionID] = model.SessionSnapshot{Meta: normalizeStoredMeta(meta)}
+		byID[meta.SessionID] = model.SessionSnapshot{
+			Meta:      normalizeStoredMeta(meta),
+			InFlights: []model.InFlightView{},
+		}
 	}
 	if err := b.overlayLiveActors(byID); err != nil {
 		return nil, err

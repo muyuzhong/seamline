@@ -53,7 +53,7 @@ func (h *handler) handleDemoSimulate(w http.ResponseWriter, r *http.Request) {
 		h.writeBrokerError(w, err)
 		return
 	}
-	if exists && snap.InFlight != nil {
+	if exists && len(snap.InFlights) > 0 {
 		writeError(w, http.StatusConflict, "another stream is already in-flight for this session")
 		return
 	}

@@ -451,8 +451,8 @@ func TestFullPageReloadMidStreamAndCompactionInspect(t *testing.T) {
 	if midSnap.Meta.State != model.StateRunning {
 		t.Fatalf("expected StateRunning mid-stream, got %q", midSnap.Meta.State)
 	}
-	if midSnap.InFlight == nil || midSnap.InFlight.LastSeq != 20 {
-		t.Fatalf("expected InFlight.LastSeq=20, got %+v", midSnap.InFlight)
+	if len(midSnap.InFlights) != 1 || midSnap.InFlights[0].LastSeq != 20 {
+		t.Fatalf("expected one in-flight stream at LastSeq=20, got %+v", midSnap.InFlights)
 	}
 
 	// Connect F5 browser client with ?after_offset=0.
@@ -499,8 +499,8 @@ func TestFullPageReloadMidStreamAndCompactionInspect(t *testing.T) {
 	if postSnap.Meta.LastOffset != 1 {
 		t.Fatalf("expected LastOffset=1 after compaction, got %d", postSnap.Meta.LastOffset)
 	}
-	if postSnap.InFlight != nil {
-		t.Fatalf("expected InFlight=nil after compaction, got %+v", postSnap.InFlight)
+	if len(postSnap.InFlights) != 0 {
+		t.Fatalf("expected no in-flight streams after compaction, got %+v", postSnap.InFlights)
 	}
 	if postSnap.Meta.State != model.StateIdle {
 		t.Fatalf("expected StateIdle after compaction, got %q", postSnap.Meta.State)
@@ -534,7 +534,10 @@ func TestSSEKeepaliveHeartbeat(t *testing.T) {
 }
 
 func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
-	_, srv := newTestEnv(t, "err999", broker.Config{InstanceID: "inst-err999"}, server.Config{
+	_, srv := newTestEnv(t, "err999", broker.Config{
+		InstanceID:           "inst-err999",
+		MaxConcurrentStreams: 2,
+	}, server.Config{
 		EnableDemo: true,
 	})
 
@@ -590,12 +593,18 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 		Delta:    "gap",
 	}, http.StatusBadRequest, nil)
 
-	// 6. 409 Conflict when concurrent stream-b attempts to publish while stream-a is in-flight!
+	// 6. Parallel streams are allowed up to MaxConcurrentStreams (2); the third gets 409 Conflict.
 	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
 		StreamID: "stream-b",
 		Seq:      1,
 		Type:     "assistant_message",
-		Delta:    "intruder",
+		Delta:    "parallel",
+	}, http.StatusOK, nil)
+	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
+		StreamID: "stream-c",
+		Seq:      1,
+		Type:     "assistant_message",
+		Delta:    "one too many",
 	}, http.StatusConflict, nil)
 
 	// 7. Malformed Last-Event-ID returns 400 Bad Request.
@@ -628,7 +637,7 @@ func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
 	for {
 		var snap model.SessionSnapshot
 		doGetJSON(t, srv.URL+"/v1/sessions/sim-test", http.StatusOK, &snap)
-		if snap.Meta.LastOffset == 2 && snap.InFlight == nil {
+		if snap.Meta.LastOffset == 2 && len(snap.InFlights) == 0 {
 			break
 		}
 		if time.Now().After(deadline) {

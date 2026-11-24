@@ -16,9 +16,9 @@ type Subscription struct {
 
 // subSnapshot is captured in the same actor.mu critical section that registers liveCh.
 type subSnapshot struct {
-	epoch    string
-	offset   uint64
-	inFlight *model.InFlightView
+	epoch     string
+	offset    uint64
+	inFlights []model.InFlightView
 }
 
 func (b *Broker) reserveSubSlot() error {
@@ -40,9 +40,9 @@ func (b *Broker) registerSubscriber(ctx context.Context, actor *sessionActor, su
 	}
 	actor.subscribers[sub] = struct{}{}
 	snap := subSnapshot{
-		epoch:    actor.meta.Epoch,
-		offset:   actor.lastOffset,
-		inFlight: actor.inFlightViewLocked(),
+		epoch:     actor.meta.Epoch,
+		offset:    actor.lastOffset,
+		inFlights: actor.inFlightViewsLocked(),
 	}
 	actor.touch()
 	return snap, nil
@@ -127,6 +127,8 @@ func (b *Broker) runSubscriberPump(
 	b.drainLiveStream(ctx, sub, outCh, snap)
 }
 
+// replayCatchUp sends the committed records in (afterOffset, snap.offset] and then one
+// inflight_snapshot per stream that was active at subscription time.
 func (b *Broker) replayCatchUp(
 	ctx context.Context,
 	sessionID string,
@@ -135,24 +137,10 @@ func (b *Broker) replayCatchUp(
 	afterOffset uint64,
 	snap subSnapshot,
 ) bool {
-	if snap.offset > afterOffset {
-		if !b.replayStoredRecords(ctx, sessionID, sub, outCh, afterOffset, snap.offset) {
-			return false
-		}
+	if snap.offset > afterOffset && !b.replayStoredRecords(ctx, sessionID, sub, outCh, afterOffset, snap.offset) {
+		return false
 	}
-	inFlightSnap := snap.inFlight
-	if inFlightSnap == nil || inFlightSnap.LastSeq == 0 {
-		return true
-	}
-	return b.sendOutEvent(ctx, sub, outCh, model.OutEvent{
-		Kind:      model.EventInFlightSnapshot,
-		Epoch:     snap.epoch,
-		StreamID:  inFlightSnap.StreamID,
-		Seq:       inFlightSnap.LastSeq,
-		Type:      inFlightSnap.Type,
-		Delta:     inFlightSnap.Merged,
-		CreatedAt: inFlightSnap.StartedAt,
-	})
+	return b.replayInFlightSnapshots(ctx, sub, outCh, snap)
 }
 
 func (b *Broker) replayStoredRecords(
@@ -170,16 +158,29 @@ func (b *Broker) replayStoredRecords(
 	}
 	for _, rec := range recs {
 		if rec.Offset > snapOffset {
+			break
+		}
+		if !b.sendOutEvent(ctx, sub, outCh, committedEvent(rec)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *Broker) replayInFlightSnapshots(ctx context.Context, sub *subState, outCh chan<- model.OutEvent, snap subSnapshot) bool {
+	for _, f := range snap.inFlights {
+		if f.LastSeq == 0 {
 			continue
 		}
 		ev := model.OutEvent{
-			Kind:      model.EventCommitted,
-			Offset:    rec.Offset,
-			Epoch:     rec.Epoch,
-			StreamID:  rec.StreamID,
-			Type:      rec.Type,
-			Payload:   rec.Payload,
-			CreatedAt: rec.CreatedAt,
+			Kind:      model.EventInFlightSnapshot,
+			Epoch:     snap.epoch,
+			StreamID:  f.StreamID,
+			Seq:       f.LastSeq,
+			Type:      f.Type,
+			Delta:     f.Merged,
+			Meta:      f.Meta,
+			CreatedAt: f.StartedAt,
 		}
 		if !b.sendOutEvent(ctx, sub, outCh, ev) {
 			return false
@@ -188,20 +189,23 @@ func (b *Broker) replayStoredRecords(
 	return true
 }
 
-func isCoveredBySnapshot(ev model.OutEvent, snapOffset uint64, inFlightSnap *model.InFlightView) (bool, *model.InFlightView) {
-	if ev.Kind == model.EventCommitted {
+// isCoveredBySnapshot drops live events already delivered by the catch-up replay: records at or
+// below the snapshot offset and deltas of a snapshotted stream at or below its snapshot seq.
+// A stream's entry is cleared once its compacted record arrives.
+func isCoveredBySnapshot(ev model.OutEvent, snapOffset uint64, snapSeqs map[string]uint64) bool {
+	switch ev.Kind {
+	case model.EventCommitted:
 		if ev.Offset <= snapOffset {
-			return true, inFlightSnap
+			return true
 		}
-		if inFlightSnap != nil && ev.StreamID == inFlightSnap.StreamID {
-			return false, nil
-		}
-		return false, inFlightSnap
+		delete(snapSeqs, ev.StreamID)
+		return false
+	case model.EventDelta:
+		last, ok := snapSeqs[ev.StreamID]
+		return ok && ev.Seq <= last
+	default:
+		return false
 	}
-	if ev.Kind == model.EventDelta && inFlightSnap != nil && ev.StreamID == inFlightSnap.StreamID && ev.Seq <= inFlightSnap.LastSeq {
-		return true, inFlightSnap
-	}
-	return false, inFlightSnap
 }
 
 func (b *Broker) checkPumpStop(ctx context.Context, sub *subState) bool {
@@ -238,13 +242,17 @@ func (b *Broker) waitNextLiveEvent(ctx context.Context, sub *subState) (model.Ou
 	}
 }
 
-func (b *Broker) drainLiveStream(
-	ctx context.Context,
-	sub *subState,
-	outCh chan<- model.OutEvent,
-	snap subSnapshot,
-) {
-	inFlightSnap := snap.inFlight
+// snapshotSeqs maps each snapshotted stream to the seq its inflight_snapshot covered.
+func snapshotSeqs(views []model.InFlightView) map[string]uint64 {
+	seqs := make(map[string]uint64, len(views))
+	for _, f := range views {
+		seqs[f.StreamID] = f.LastSeq
+	}
+	return seqs
+}
+
+func (b *Broker) drainLiveStream(ctx context.Context, sub *subState, outCh chan<- model.OutEvent, snap subSnapshot) {
+	snapSeqs := snapshotSeqs(snap.inFlights)
 	for {
 		if b.checkPumpStop(ctx, sub) {
 			return
@@ -253,9 +261,7 @@ func (b *Broker) drainLiveStream(
 		if !ok {
 			return
 		}
-		var covered bool
-		covered, inFlightSnap = isCoveredBySnapshot(ev, snap.offset, inFlightSnap)
-		if covered {
+		if isCoveredBySnapshot(ev, snap.offset, snapSeqs) {
 			continue
 		}
 		if !b.sendOutEvent(ctx, sub, outCh, ev) {
@@ -268,9 +274,8 @@ func (b *Broker) sendOutEvent(ctx context.Context, sub *subState, outCh chan<- m
 	if b.checkPumpStop(ctx, sub) {
 		return false
 	}
-	if ev.Payload != nil {
-		ev.Payload = cloneRawMessage(ev.Payload)
-	}
+	ev.Payload = cloneRawMessage(ev.Payload)
+	ev.Meta = cloneRawMessage(ev.Meta)
 	select {
 	case outCh <- ev:
 		return true

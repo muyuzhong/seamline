@@ -30,6 +30,18 @@ func cloneRawMessage(raw json.RawMessage) json.RawMessage {
 	return cp
 }
 
+func hasJSON(raw json.RawMessage) bool {
+	return len(bytes.TrimSpace(raw)) > 0
+}
+
+// normalizeRaw returns a private copy of raw, or nil when it is empty or whitespace.
+func normalizeRaw(raw json.RawMessage) json.RawMessage {
+	if !hasJSON(raw) {
+		return nil
+	}
+	return cloneRawMessage(raw)
+}
+
 func resolveRecordPayload(hasPayload bool, raw json.RawMessage, text string) (json.RawMessage, error) {
 	if hasPayload {
 		return cloneRawMessage(raw), nil
@@ -37,21 +49,35 @@ func resolveRecordPayload(hasPayload bool, raw json.RawMessage, text string) (js
 	return marshalContentPayload(text)
 }
 
-func validatePublishRequest(sessionID string, req model.PublishRequest) (bool, error) {
-	if sessionID == "" {
+func committedEvent(rec model.Record) model.OutEvent {
+	return model.OutEvent{
+		Kind:      model.EventCommitted,
+		Offset:    rec.Offset,
+		Epoch:     rec.Epoch,
+		StreamID:  rec.StreamID,
+		Type:      rec.Type,
+		Payload:   rec.Payload,
+		Meta:      rec.Meta,
+		CreatedAt: rec.CreatedAt,
+	}
+}
+
+// validOptionalJSON accepts an absent (empty or whitespace) value or valid JSON.
+func validOptionalJSON(raw json.RawMessage) bool {
+	return !hasJSON(raw) || json.Valid(raw)
+}
+
+// validPublishShape rejects an atomic event that carries neither payload nor delta.
+func validPublishShape(req model.PublishRequest, hasPayload bool) bool {
+	return req.StreamID != "" || hasPayload || req.Delta != ""
+}
+
+func (b *Broker) validatePublishRequest(sessionID string, req model.PublishRequest) (bool, error) {
+	if sessionID == "" || !validOptionalJSON(req.Payload) || !validOptionalJSON(req.Meta) {
 		return false, ErrInvalidInput
 	}
-	hasPayload := len(bytes.TrimSpace(req.Payload)) > 0
-	if req.StreamID == "" {
-		if !hasPayload && req.Delta == "" {
-			return false, ErrInvalidInput
-		}
-		if hasPayload && !json.Valid(req.Payload) {
-			return false, ErrInvalidInput
-		}
-		return hasPayload, nil
-	}
-	if req.Fin && hasPayload && !json.Valid(req.Payload) {
+	hasPayload := hasJSON(req.Payload)
+	if !validPublishShape(req, hasPayload) {
 		return false, ErrInvalidInput
 	}
 	return hasPayload, nil
@@ -74,7 +100,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		return model.PublishResult{}, ErrBrokerClosed
 	}
 
-	hasPayload, err := validatePublishRequest(sessionID, req)
+	hasPayload, err := b.validatePublishRequest(sessionID, req)
 	if err != nil {
 		return model.PublishResult{}, err
 	}
@@ -96,9 +122,9 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 	actor.touch()
 
 	if req.StreamID == "" {
-		return b.publishAtomicLocked(ctx, sessionID, actor, req, hasPayload, now)
+		return b.publishAtomicLocked(ctx, actor, req, hasPayload, now)
 	}
-	return b.publishStreamLocked(ctx, sessionID, actor, req, hasPayload, now)
+	return b.publishStreamLocked(ctx, actor, req, hasPayload, now)
 }
 
 func nextAtomicState(reqType string, hasInFlight bool, current model.SessionState) model.SessionState {
@@ -116,7 +142,6 @@ func nextAtomicState(reqType string, hasInFlight bool, current model.SessionStat
 
 func (b *Broker) publishAtomicLocked(
 	ctx context.Context,
-	sessionID string,
 	actor *sessionActor,
 	req model.PublishRequest,
 	hasPayload bool,
@@ -127,36 +152,29 @@ func (b *Broker) publishAtomicLocked(
 		return model.PublishResult{}, err
 	}
 
-	nextOffset := actor.lastOffset + 1
 	rec := model.Record{
-		Offset:    nextOffset,
+		Offset:    actor.lastOffset + 1,
 		Epoch:     actor.meta.Epoch,
 		Type:      req.Type,
 		Payload:   payload,
+		Meta:      normalizeRaw(req.Meta),
 		CreatedAt: now,
 	}
-	if err := b.store.Append(ctx, sessionID, rec); err != nil {
+	if err := b.store.Append(ctx, actor.meta.SessionID, rec); err != nil {
 		return model.PublishResult{}, err
 	}
 
-	// Point of no return: record is committed in storage. Advance memory state and fan out first.
-	actor.lastOffset = nextOffset
-	actor.meta.LastOffset = nextOffset
+	// Point of no return: the record is committed. Advance memory state and fan out first.
+	actor.lastOffset = rec.Offset
+	actor.meta.LastOffset = rec.Offset
 	actor.meta.UpdatedAt = now
-	actor.meta.State = nextAtomicState(req.Type, actor.inFlight != nil, actor.meta.State)
+	actor.meta.State = nextAtomicState(req.Type, len(actor.inFlights) > 0, actor.meta.State)
 
-	actor.fanOutLocked(model.OutEvent{
-		Kind:      model.EventCommitted,
-		Offset:    rec.Offset,
-		Epoch:     rec.Epoch,
-		Type:      rec.Type,
-		Payload:   rec.Payload,
-		CreatedAt: rec.CreatedAt,
-	})
+	actor.fanOutLocked(committedEvent(rec))
 	actor.saveMetaBestEffortLocked(ctx, b.store)
 
 	return model.PublishResult{
 		CommittedOffset: rec.Offset,
-		Epoch:           actor.meta.Epoch,
+		Epoch:           rec.Epoch,
 	}, nil
 }

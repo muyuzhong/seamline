@@ -32,6 +32,7 @@ type Record struct {
 	StreamID  string          `json:"stream_id,omitempty"`
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
+	Meta      json.RawMessage `json:"meta,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
@@ -41,7 +42,10 @@ type PublishRequest struct {
 	Type     string          `json:"type"`
 	Delta    string          `json:"delta,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
-	Fin      bool            `json:"fin"`
+	// Meta is an optional JSON header kept from the first chunk of a stream (for example
+	// {"tool_name":"exec_sql","call_id":"call_1"}). It is ignored on later chunks.
+	Meta json.RawMessage `json:"meta,omitempty"`
+	Fin  bool            `json:"fin"`
 }
 
 type PublishResult struct {
@@ -68,16 +72,19 @@ type OutEvent struct {
 	Type      string          `json:"type,omitempty"`
 	Delta     string          `json:"delta,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
+	Meta      json.RawMessage `json:"meta,omitempty"`
 	Fin       bool            `json:"fin,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
 type InFlightView struct {
-	StreamID  string    `json:"stream_id"`
-	Type      string    `json:"type"`
-	Merged    string    `json:"merged"`
-	LastSeq   uint64    `json:"last_seq"`
-	StartedAt time.Time `json:"started_at"`
+	StreamID  string          `json:"stream_id"`
+	Type      string          `json:"type"`
+	Meta      json.RawMessage `json:"meta,omitempty"`
+	Merged    string          `json:"merged"`
+	LastSeq   uint64          `json:"last_seq"`
+	StartedAt time.Time       `json:"started_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
 }
 
 type SessionMeta struct {
@@ -93,7 +100,7 @@ type SessionMeta struct {
 }
 
 type SessionSnapshot struct {
-	Meta            SessionMeta   `json:"meta"`
-	InFlight        *InFlightView `json:"in_flight,omitempty"`
-	SubscriberCount int           `json:"subscriber_count"`
+	Meta            SessionMeta    `json:"meta"`
+	InFlights       []InFlightView `json:"in_flights"`
+	SubscriberCount int            `json:"subscriber_count"`
 }

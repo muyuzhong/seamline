@@ -299,7 +299,7 @@ func (h *handler) writeBrokerError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, broker.ErrInvalidInput), errors.Is(err, broker.ErrSequenceGap):
 		writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, broker.ErrStreamConflict):
+	case errors.Is(err, broker.ErrTooManyStreams), errors.Is(err, broker.ErrStreamFinalized):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, broker.ErrBrokerClosed):
 		writeError(w, http.StatusServiceUnavailable, err.Error())

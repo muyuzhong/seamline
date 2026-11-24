@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/model"
@@ -12,21 +13,62 @@ type streamCandidate struct {
 	baseType   string
 	evType     string
 	baseMerged string
+	meta       json.RawMessage
 }
 
-func (b *Broker) isCompactedDuplicateLocked(actor *sessionActor, req model.PublishRequest) (model.PublishResult, bool) {
-	if actor.inFlight != nil || actor.lastCompactedStreamID == "" || req.StreamID != actor.lastCompactedStreamID {
-		return model.PublishResult{}, false
+func resolveCandidateTypes(inFlight *inFlightState, reqType string) (string, string) {
+	baseType := reqType
+	if inFlight != nil && inFlight.typ != "" {
+		baseType = inFlight.typ
 	}
-	if req.Seq == 0 || req.Seq > actor.lastCompactedSeq {
-		return model.PublishResult{}, false
+	evType := reqType
+	if evType == "" {
+		evType = baseType
 	}
-	return model.PublishResult{
-		CommittedOffset: actor.lastCompactedOffset,
-		Epoch:           actor.meta.Epoch,
-		InFlightSeq:     actor.lastCompactedSeq,
-		Deduplicated:    true,
-	}, true
+	return baseType, evType
+}
+
+func newStreamCandidate(inFlight *inFlightState, req model.PublishRequest, seq uint64) streamCandidate {
+	baseType, evType := resolveCandidateTypes(inFlight, req.Type)
+	cand := streamCandidate{seq: seq, baseType: baseType, evType: evType}
+	if inFlight != nil {
+		cand.baseMerged = inFlight.mergedBuf.String()
+		cand.meta = inFlight.meta
+	} else {
+		cand.meta = normalizeRaw(req.Meta)
+	}
+	return cand
+}
+
+func deltaEvent(epoch, streamID string, cand streamCandidate, delta string, fin bool, now time.Time) model.OutEvent {
+	return model.OutEvent{
+		Kind:      model.EventDelta,
+		Epoch:     epoch,
+		StreamID:  streamID,
+		Seq:       cand.seq,
+		Type:      cand.evType,
+		Delta:     delta,
+		Fin:       fin,
+		CreatedAt: now,
+	}
+}
+
+// finalizedReplayLocked handles chunks for a stream that was already compacted (by fin=true or
+// by idle sealing): exact retries are deduplicated, anything else is rejected.
+func (b *Broker) finalizedReplayLocked(actor *sessionActor, req model.PublishRequest, now time.Time) (model.PublishResult, bool, error) {
+	f, ok := actor.finalized.get(req.StreamID, now)
+	if !ok {
+		return model.PublishResult{}, false, nil
+	}
+	if req.Seq != 0 && req.Seq <= f.lastSeq {
+		return model.PublishResult{
+			CommittedOffset: f.offset,
+			Epoch:           actor.meta.Epoch,
+			InFlightSeq:     f.lastSeq,
+			Deduplicated:    true,
+		}, true, nil
+	}
+	return model.PublishResult{}, true, ErrStreamFinalized
 }
 
 func resolveStreamSeq(epoch string, inFlight *inFlightState, reqSeq uint64) (uint64, *model.PublishResult, error) {
@@ -52,90 +94,78 @@ func resolveStreamSeq(epoch string, inFlight *inFlightState, reqSeq uint64) (uin
 	return reqSeq, nil, nil
 }
 
-func resolveCandidateTypes(inFlight *inFlightState, reqType string) (string, string) {
-	baseType := reqType
-	if inFlight != nil && inFlight.typ != "" {
-		baseType = inFlight.typ
+// checkStreamCapacityLocked enforces MaxConcurrentStreams before any state changes. A
+// single-chunk stream (fin on its first chunk) never occupies a slot.
+func (b *Broker) checkStreamCapacityLocked(actor *sessionActor, inFlight *inFlightState, req model.PublishRequest) error {
+	if inFlight == nil && !req.Fin && len(actor.inFlights) >= b.cfg.MaxConcurrentStreams {
+		return ErrTooManyStreams
 	}
-	evType := reqType
-	if evType == "" {
-		evType = baseType
-	}
-	return baseType, evType
+	return nil
 }
 
 func (b *Broker) publishStreamLocked(
 	ctx context.Context,
-	sessionID string,
 	actor *sessionActor,
 	req model.PublishRequest,
 	hasPayload bool,
 	now time.Time,
 ) (model.PublishResult, error) {
-	if dupRes, ok := b.isCompactedDuplicateLocked(actor, req); ok {
-		return dupRes, nil
-	}
-	if actor.inFlight != nil && actor.inFlight.streamID != req.StreamID {
-		return model.PublishResult{}, ErrStreamConflict
+	inFlight := actor.inFlights[req.StreamID]
+	if inFlight == nil {
+		if res, done, err := b.finalizedReplayLocked(actor, req, now); done {
+			return res, err
+		}
 	}
 
-	seq, dupInFlight, err := resolveStreamSeq(actor.meta.Epoch, actor.inFlight, req.Seq)
+	seq, dup, err := resolveStreamSeq(actor.meta.Epoch, inFlight, req.Seq)
 	if err != nil {
 		return model.PublishResult{}, err
 	}
-	if dupInFlight != nil {
-		return *dupInFlight, nil
+	if dup != nil {
+		return *dup, nil
+	}
+	if err := b.checkStreamCapacityLocked(actor, inFlight, req); err != nil {
+		return model.PublishResult{}, err
 	}
 
-	baseType, evType := resolveCandidateTypes(actor.inFlight, req.Type)
-	cand := streamCandidate{
-		seq:      seq,
-		baseType: baseType,
-		evType:   evType,
-	}
-	if req.Fin && actor.inFlight != nil {
-		cand.baseMerged = actor.inFlight.mergedBuf.String()
-	}
-
+	cand := newStreamCandidate(inFlight, req, seq)
 	if !req.Fin {
-		return b.appendStreamDeltaLocked(ctx, actor, req, cand, now), nil
+		return b.appendStreamDeltaLocked(ctx, actor, inFlight, req, cand, now), nil
 	}
-	return b.commitFinStreamLocked(ctx, sessionID, actor, req, cand, hasPayload, now)
+	return b.commitFinStreamLocked(ctx, actor, req, cand, hasPayload, now)
 }
 
 func (b *Broker) appendStreamDeltaLocked(
 	ctx context.Context,
 	actor *sessionActor,
+	inFlight *inFlightState,
 	req model.PublishRequest,
 	cand streamCandidate,
 	now time.Time,
 ) model.PublishResult {
-	if actor.inFlight == nil {
-		actor.inFlight = &inFlightState{
+	first := inFlight == nil
+	if first {
+		inFlight = &inFlightState{
 			streamID:  req.StreamID,
-			typ:       cand.baseType,
+			meta:      cand.meta,
 			startedAt: now,
 		}
-	} else {
-		actor.inFlight.typ = cand.baseType
+		actor.inFlights[req.StreamID] = inFlight
 	}
-	_, _ = actor.inFlight.mergedBuf.WriteString(req.Delta)
-	actor.inFlight.lastSeq = cand.seq
+	inFlight.typ = cand.baseType
+	_, _ = inFlight.mergedBuf.WriteString(req.Delta)
+	inFlight.lastSeq = cand.seq
+	inFlight.updatedAt = now
 
 	needMetaSave := !actor.metaPersisted || actor.meta.State != model.StateRunning
 	actor.meta.State = model.StateRunning
 	actor.meta.UpdatedAt = now
 
-	actor.fanOutLocked(model.OutEvent{
-		Kind:      model.EventDelta,
-		Epoch:     actor.meta.Epoch,
-		StreamID:  req.StreamID,
-		Seq:       cand.seq,
-		Type:      cand.evType,
-		Delta:     req.Delta,
-		Fin:       false,
-		CreatedAt: now,
-	})
+	ev := deltaEvent(actor.meta.Epoch, req.StreamID, cand, req.Delta, false, now)
+	if first {
+		ev.Meta = cand.meta
+	}
+	actor.fanOutLocked(ev)
 	if needMetaSave {
 		actor.saveMetaBestEffortLocked(ctx, b.store)
 	}
@@ -156,70 +186,69 @@ func resolveFinRecordType(baseType string, finType string) string {
 	return finType
 }
 
+// settledState is the session state right after a stream is compacted into rec.
+func settledState(recordType string, hasInFlight bool) model.SessionState {
+	if terminal := model.StateFromRecordType(recordType); terminal != model.StateIdle {
+		return terminal
+	}
+	if hasInFlight {
+		return model.StateRunning
+	}
+	return model.StateIdle
+}
+
+// finishStreamLocked applies the in-memory effects of a committed stream Record. It must only
+// run after store.Append succeeded (point of no return).
+func (b *Broker) finishStreamLocked(actor *sessionActor, streamID string, lastSeq uint64, rec model.Record, now time.Time) {
+	delete(actor.inFlights, streamID)
+	actor.finalized.put(streamID, finalizedStream{lastSeq: lastSeq, offset: rec.Offset}, now)
+	actor.lastOffset = rec.Offset
+	actor.meta.LastOffset = rec.Offset
+	actor.meta.UpdatedAt = rec.CreatedAt
+	actor.meta.State = settledState(rec.Type, len(actor.inFlights) > 0)
+}
+
 func (b *Broker) commitFinStreamLocked(
 	ctx context.Context,
-	sessionID string,
 	actor *sessionActor,
 	req model.PublishRequest,
 	cand streamCandidate,
 	hasPayload bool,
 	now time.Time,
 ) (model.PublishResult, error) {
-	mergedText := cand.baseMerged + req.Delta
-	recordPayload, err := resolveRecordPayload(hasPayload, req.Payload, mergedText)
+	recordPayload, err := resolveRecordPayload(hasPayload, req.Payload, cand.baseMerged+req.Delta)
 	if err != nil {
 		return model.PublishResult{}, err
 	}
 
-	recordType := resolveFinRecordType(cand.baseType, req.Type)
-
-	nextOffset := actor.lastOffset + 1
 	rec := model.Record{
-		Offset:    nextOffset,
+		Offset:    actor.lastOffset + 1,
 		Epoch:     actor.meta.Epoch,
 		StreamID:  req.StreamID,
-		Type:      recordType,
+		Type:      resolveFinRecordType(cand.baseType, req.Type),
 		Payload:   recordPayload,
+		Meta:      cand.meta,
 		CreatedAt: now,
 	}
-	if err := b.store.Append(ctx, sessionID, rec); err != nil {
+	_, wasInFlight := actor.inFlights[req.StreamID]
+	if err := b.store.Append(ctx, actor.meta.SessionID, rec); err != nil {
 		return model.PublishResult{}, err
 	}
 
-	// Point of no return: compacted record is committed in storage.
-	actor.lastCompactedStreamID = req.StreamID
-	actor.lastCompactedSeq = cand.seq
-	actor.lastCompactedOffset = rec.Offset
-	actor.inFlight = nil
-	actor.lastOffset = nextOffset
-	actor.meta.State = model.StateFromRecordType(recordType)
-	actor.meta.LastOffset = nextOffset
-	actor.meta.UpdatedAt = now
+	// Point of no return: the compacted record is committed.
+	b.finishStreamLocked(actor, req.StreamID, cand.seq, rec, now)
 
-	actor.fanOutLocked(model.OutEvent{
-		Kind:      model.EventDelta,
-		Epoch:     actor.meta.Epoch,
-		StreamID:  req.StreamID,
-		Seq:       cand.seq,
-		Type:      cand.evType,
-		Delta:     req.Delta,
-		Fin:       true,
-		CreatedAt: now,
-	})
-	actor.fanOutLocked(model.OutEvent{
-		Kind:      model.EventCommitted,
-		Offset:    rec.Offset,
-		Epoch:     rec.Epoch,
-		StreamID:  rec.StreamID,
-		Type:      rec.Type,
-		Payload:   rec.Payload,
-		CreatedAt: rec.CreatedAt,
-	})
+	finDelta := deltaEvent(rec.Epoch, req.StreamID, cand, req.Delta, true, now)
+	if !wasInFlight {
+		finDelta.Meta = cand.meta
+	}
+	actor.fanOutLocked(finDelta)
+	actor.fanOutLocked(committedEvent(rec))
 	actor.saveMetaBestEffortLocked(ctx, b.store)
 
 	return model.PublishResult{
 		CommittedOffset: rec.Offset,
-		Epoch:           actor.meta.Epoch,
+		Epoch:           rec.Epoch,
 		InFlightSeq:     cand.seq,
 	}, nil
 }

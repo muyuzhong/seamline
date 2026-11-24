@@ -247,20 +247,21 @@ func TestMemoryStorageDeepCopyIsolation(t *testing.T) {
 	}
 
 	payload := json.RawMessage(`{"content":"original"}`)
-	if err := s.Append(ctx, "sess-copy", model.Record{Offset: 1, Epoch: "ep1", Type: "text", Payload: payload}); err != nil {
+	meta := json.RawMessage(`{"tool":"a"}`)
+	if err := s.Append(ctx, "sess-copy", model.Record{Offset: 1, Epoch: "ep1", Type: "text", Payload: payload, Meta: meta}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	payload[0] = 'X'
+	payload[0], meta[0] = 'X', 'X'
 
 	recs1, _, _ := s.ReadFrom(ctx, "sess-copy", 0)
-	if string(recs1[0].Payload) != `{"content":"original"}` {
-		t.Fatalf("stored record was mutated via input buffer: %s", recs1[0].Payload)
+	if string(recs1[0].Payload) != `{"content":"original"}` || string(recs1[0].Meta) != `{"tool":"a"}` {
+		t.Fatalf("stored record was mutated via input buffers: %s %s", recs1[0].Payload, recs1[0].Meta)
 	}
-	recs1[0].Payload[0] = 'Y'
+	recs1[0].Payload[0], recs1[0].Meta[0] = 'Y', 'Y'
 
 	recs2, _, _ := s.ReadFrom(ctx, "sess-copy", 0)
-	if string(recs2[0].Payload) != `{"content":"original"}` {
-		t.Fatalf("stored record was mutated via output buffer: %s", recs2[0].Payload)
+	if string(recs2[0].Payload) != `{"content":"original"}` || string(recs2[0].Meta) != `{"tool":"a"}` {
+		t.Fatalf("stored record was mutated via output buffers: %s %s", recs2[0].Payload, recs2[0].Meta)
 	}
 }
 
