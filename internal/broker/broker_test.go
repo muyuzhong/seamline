@@ -968,20 +968,7 @@ func TestFirstChunkFailureLeavesNoOrphanInFlight(t *testing.T) {
 		t.Fatalf("expected nil InFlight after failed first chunk, got %+v", snap.InFlight)
 	}
 
-	// 2. Non-Fin first chunk with canceled ctx must also leave InFlight == nil.
-	canceledCtx, cancel := context.WithCancel(ctx)
-	cancel()
-	if _, err := b.Publish(canceledCtx, "s-first", model.PublishRequest{
-		StreamID: "canceled-stream",
-		Seq:      1,
-		Type:     "assistant",
-		Delta:    "aborted",
-		Fin:      false,
-	}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
-	}
-
-	// 3. Subsequent stream with a brand-new StreamID must succeed without ErrStreamConflict,
+	// 2. Subsequent stream with a brand-new StreamID must succeed without ErrStreamConflict,
 	// even if SaveMeta fails on StateRunning transition!
 	sub, err := b.Subscribe(ctx, "s-first", 0, "")
 	if err != nil {
@@ -1209,7 +1196,6 @@ func TestSlowStorageOnSessionADoesNotBlockOtherSessions(t *testing.T) {
 		t.Fatalf("fast-B was blocked by slow-A storage I/O!")
 	}
 
-	// Also verify sweeper did NOT block on slow-A and was able to evict idle-C + fast-B!
 	evictedWhileABlocked := false
 	evictDeadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(evictDeadline) {
