@@ -17,16 +17,15 @@ import (
 //go:embed demo.html
 var demoHTML []byte
 
-const defaultDemoPrompt = "Explain how Seamline decouples high-frequency LLM token deltas from durable WAL records and survives mid-stream F5 reloads."
+const defaultDemoPrompt = "Explain how Seamline resumes an AI stream after a disconnect or an F5 reload."
 
-const defaultDemoMarkdown = `### Dual-Speed Stream Compaction in Seamline
+const defaultDemoMarkdown = `### One cursor for every event
 
-Traditional chat backends treat every streamed LLM token identically: either they **skip persistence** until completion (so hitting **F5** mid-response loses everything generated so far), or they **write every token chunk** into Redis Streams / Postgres (causing massive 100x write amplification for a single paragraph).
+Seamline gives every event of a session the next **monotonic cursor** ` + "`<epoch>:<seq>`" + `, stores it unchanged in a short hot window, and fans it out over plain SSE. Payloads are opaque: text deltas, half-finished tool-call JSON and status events are all just events.
 
-**Seamline separates ephemeral token velocity from durable state:**
-1. **Ephemeral In-Flight Coalescing (RAM):** Token deltas (` + "`seq=1..N`" + `) append into an in-memory buffer on the session actor and fan out immediately to live SSE subscribers with **no ` + "`id:`" + ` header** and zero storage writes.
-2. **Instant Mid-Stream Catch-Up:** When a client reconnects via ` + "`Last-Event-ID: <epoch>:<offset>`" + ` (or reloads from ` + "`offset=0`" + `), Seamline replays finalized ` + "`record`" + ` frames, emits one coalesced ` + "`inflight_snapshot`" + ` containing the exact half-finished text up to ` + "`last_seq`" + `, and seamlessly resumes live ` + "`delta`" + ` tailing without gaps or duplicates.
-3. **Single-Record Compaction (` + "`fin=true`" + `):** Once generation completes, all 100+ chunks collapse into **1 durable ` + "`Record`" + `** advancing the session offset by ` + "`+1`" + `.`
+1. **Exact resume:** every frame carries ` + "`id: <epoch>:<seq>`" + `, so a reconnect with ` + "`Last-Event-ID`" + ` (or ` + "`?after_seq=`" + `) continues at the next seq with no gap and no duplicate.
+2. **Active run pinned:** between ` + "`run_started`" + ` and ` + "`run_finished`" + ` nothing is evicted, so an F5 in the middle of a long answer replays the whole run.
+3. **Explicit gaps:** a cursor from another epoch or one that fell out of the window gets a ` + "`cursor_reset`" + ` first, never a silent skip.`
 
 type demoSimulateParams struct {
 	sessionID string
@@ -41,51 +40,63 @@ func (h *handler) handleDemoIndex(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(demoHTML)
 }
 
+func mustJSON(v any) json.RawMessage {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		panic(err) // only called with maps of strings and ints, which always marshal
+	}
+	return raw
+}
+
 func (h *handler) handleDemoSimulate(w http.ResponseWriter, r *http.Request) {
 	params, err := decodeDemoSimulateParams(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid JSON request body")
 		return
 	}
 
 	snap, exists, err := h.broker.Inspect(r.Context(), params.sessionID)
 	if err != nil {
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
 	}
-	if exists && snap.InFlight != nil {
-		writeError(w, http.StatusConflict, "another stream is already in-flight for this session")
+	if exists && snap.Meta.State == model.StateRunning {
+		writeError(w, http.StatusConflict, codeConflict, "a run is already active for this session")
 		return
 	}
-
 	if !h.tryClaimDemoSlot(params.sessionID) {
-		writeError(w, http.StatusConflict, "demo simulation already active for this session")
+		writeError(w, http.StatusConflict, codeConflict, "demo simulation already active for this session")
 		return
 	}
 
-	userPayload, _ := json.Marshal(map[string]string{
-		"role":    "user",
-		"content": params.prompt,
-	})
-	if _, err := h.broker.Publish(r.Context(), params.sessionID, model.PublishRequest{
-		Type:    "user_message",
-		Payload: userPayload,
-	}); err != nil {
+	if err := h.startDemoRun(r.Context(), params); err != nil {
 		h.releaseDemoSlot(params.sessionID)
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
 	}
-
 	chunks := splitIntoTokenChunks(defaultDemoMarkdown)
-	streamID := generateID("stream_")
-	go h.streamSimulatedTurn(params.sessionID, streamID, chunks, params.interval)
+	go h.streamSimulatedTurn(params.sessionID, chunks, params.interval)
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":     "started",
 		"session_id": params.sessionID,
-		"stream_id":  streamID,
 		"chunks":     len(chunks),
 	})
+}
+
+// startDemoRun opens the run explicitly and publishes the user prompt.
+func (h *handler) startDemoRun(ctx context.Context, params demoSimulateParams) error {
+	if _, err := h.broker.Publish(ctx, params.sessionID, model.PublishRequest{
+		Type:    model.TypeRunStarted,
+		Payload: mustJSON(map[string]string{"source": "demo"}),
+	}); err != nil {
+		return err
+	}
+	_, err := h.broker.Publish(ctx, params.sessionID, model.PublishRequest{
+		Type:    "user_message",
+		Payload: mustJSON(map[string]string{"role": "user", "content": params.prompt}),
+	})
+	return err
 }
 
 func decodeDemoSimulateParams(w http.ResponseWriter, r *http.Request) (demoSimulateParams, error) {
@@ -105,12 +116,10 @@ func decodeDemoSimulateParams(w http.ResponseWriter, r *http.Request) (demoSimul
 	if sessionID == "" {
 		sessionID = "playground-1"
 	}
-
 	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
 		prompt = defaultDemoPrompt
 	}
-
 	return demoSimulateParams{
 		sessionID: sessionID,
 		prompt:    prompt,
@@ -144,7 +153,10 @@ func (h *handler) releaseDemoSlot(sessionID string) {
 	h.demoMu.Unlock()
 }
 
-func (h *handler) streamSimulatedTurn(sessionID, streamID string, chunks []string, interval time.Duration) {
+// streamSimulatedTurn publishes one assistant_delta event per chunk and ends the run. If a
+// publish fails, the run is ended with run_failed (terminal events are exempt from the active-run
+// quota) instead of being left for the idle timeout.
+func (h *handler) streamSimulatedTurn(sessionID string, chunks []string, interval time.Duration) {
 	defer h.releaseDemoSlot(sessionID)
 
 	ticker := time.NewTicker(interval)
@@ -155,21 +167,23 @@ func (h *handler) streamSimulatedTurn(sessionID, streamID string, chunks []strin
 		if i > 0 {
 			<-ticker.C
 		}
-		_, err := h.broker.Publish(ctx, sessionID, model.PublishRequest{
-			StreamID: streamID,
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    chunk,
-			Fin:      i == len(chunks)-1,
-		})
-		if err != nil {
+		if _, err := h.broker.Publish(ctx, sessionID, model.PublishRequest{
+			Type:    "assistant_delta",
+			Payload: mustJSON(map[string]string{"text": chunk}),
+		}); err != nil {
+			h.endDemoRun(ctx, sessionID, model.TypeRunFailed, map[string]string{"reason": err.Error()})
 			return
 		}
 	}
+	h.endDemoRun(ctx, sessionID, model.TypeRunFinished, map[string]int{"chunks": len(chunks)})
 }
 
-// splitIntoTokenChunks divides text into ~100 realistic LLM-like token slices
-// while preserving every character and whitespace byte-for-byte.
+func (h *handler) endDemoRun(ctx context.Context, sessionID, eventType string, payload any) {
+	_, _ = h.broker.Publish(ctx, sessionID, model.PublishRequest{Type: eventType, Payload: mustJSON(payload)})
+}
+
+// splitIntoTokenChunks divides text into realistic LLM-like token slices while preserving every
+// character and whitespace byte-for-byte.
 func splitIntoTokenChunks(text string) []string {
 	var chunks []string
 	var cur strings.Builder
