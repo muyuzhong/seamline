@@ -49,7 +49,7 @@ Inside `Broker.Subscribe(ctx, sessionID, afterOffset, afterEpoch)`:
    - Reads committed records `(afterOffset, snapOffset]` from `Storage` and emits `event: record` (`id: <epoch>:<offset>`).
    - If `inFlightSnap != nil`, emits one `event: inflight_snapshot` (`seq = inFlightSnap.LastSeq`, `delta = inFlightSnap.Merged`).
    - Drains `liveCh`, skipping any `record` with `offset <= snapOffset` and any `delta` with `seq <= inFlightSnap.LastSeq`, forwarding every subsequent event in strict order.
-4. **Slow Subscriber Backpressure:** `Publish` never blocks on slow readers (`select` with `default`). If a subscriber's buffer fills up, Seamline evicts only that subscriber and emits `event: error` (`{"error":"slow_subscriber"}`) before closing its stream.
+4. **Slow Subscriber Backpressure:** `Publish` never blocks on slow readers (`select` with `default`). If a subscriber's buffer fills up, Seamline evicts only that subscriber and emits `event: stream_error` (`{"error":"slow_subscriber"}`) before closing its stream.
 
 ---
 
@@ -73,10 +73,16 @@ data: {"kind":"delta","epoch":"9f8e7d6c5b4a","stream_id":"turn-1","seq":43,"type
 id: 9f8e7d6c5b4a:2
 event: record
 data: {"kind":"record","offset":2,"epoch":"9f8e7d6c5b4a","stream_id":"turn-1","type":"assistant_message","payload":{"content":"Seamline decouples high-frequency token deltas from durable storage."},"created_at":"2026-11-21T12:00:02Z"}
+
+event: stream_error
+data: {"error":"slow_subscriber"}
 ```
 
 ### Why `id:` Is Only Set on `event: record`
 Browser `EventSource` automatically remembers the most recent `id:` header and sends it as `Last-Event-ID` on reconnect. Because `delta` frames intentionally omit `id:`, a client that drops at token `#42` reconnects with `Last-Event-ID: <epoch>:1` (the last committed record), receives the coalesced `inflight_snapshot` for tokens `1..55` generated so far, and resumes live `delta` frames from `#56` onward.
+
+### Why `event: stream_error` Instead of `event: error`
+Per the HTML `EventSource` specification, a server-sent `event: error` dispatches on the same `"error"` event channel as built-in browser network connection errors (`es.onerror`). Naming application-level terminal stream notifications `event: stream_error` keeps protocol backpressure signals (`slow_subscriber`) cleanly separated from transport disconnects.
 
 ---
 
