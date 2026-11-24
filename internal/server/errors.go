@@ -10,11 +10,13 @@ import (
 
 // Machine-readable error codes returned as {"error": "...", "code": "..."}.
 const (
-	codeInvalidRequest = "invalid_request"
-	codeNotFound       = "not_found"
-	codeConflict       = "conflict"
-	codeBrokerClosed   = "broker_closed"
-	codeInternal       = "internal_error"
+	codeInvalidRequest         = "invalid_request"
+	codeNotFound               = "not_found"
+	codeConflict               = "conflict"
+	codeEventTooLarge          = "event_too_large"
+	codeActiveRunQuotaExceeded = "active_run_quota_exceeded"
+	codeBrokerClosed           = "broker_closed"
+	codeInternal               = "internal_error"
 )
 
 // brokerErrors maps broker errors to HTTP status and error code.
@@ -24,6 +26,8 @@ var brokerErrors = []struct {
 	code   string
 }{
 	{broker.ErrInvalidInput, http.StatusBadRequest, codeInvalidRequest},
+	{broker.ErrEventTooLarge, http.StatusRequestEntityTooLarge, codeEventTooLarge},
+	{broker.ErrActiveRunQuotaExceeded, http.StatusRequestEntityTooLarge, codeActiveRunQuotaExceeded},
 	{broker.ErrBrokerClosed, http.StatusServiceUnavailable, codeBrokerClosed},
 }
 

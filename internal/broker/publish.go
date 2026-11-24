@@ -25,6 +25,9 @@ func (b *Broker) validatePublishRequest(sessionID string, req model.PublishReque
 	if sessionID == "" || req.Type == "" || (hasJSON(req.Payload) && !json.Valid(req.Payload)) {
 		return ErrInvalidInput
 	}
+	if len(req.Payload) > b.cfg.MaxEventBytes {
+		return ErrEventTooLarge
+	}
 	return nil
 }
 
@@ -67,6 +70,9 @@ func (b *Broker) appendLocked(ctx context.Context, actor *sessionActor, eventTyp
 		return model.Event{}, err
 	}
 	actor.latestSeq, actor.activeRunStartSeq = ev.Seq, info.ActiveRunStartSeq
+	if info.ActiveRunStartSeq != 0 {
+		actor.runActiveAt = now
+	}
 	actor.fanOutLocked(eventDelivery(ev))
 	return ev, nil
 }

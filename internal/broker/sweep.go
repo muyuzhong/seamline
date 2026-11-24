@@ -20,14 +20,34 @@ func (b *Broker) sweepLoop() {
 	}
 }
 
-// sweepOnce runs one maintenance pass: evict idle actors, keep the streams of the live ones
-// alive (subscribers may be attached), then let storage apply its retention.
+// sweepOnce runs one maintenance pass: end silent runs, evict idle actors, keep the streams of
+// the live ones alive (subscribers may be attached), then let storage apply its retention.
 func (b *Broker) sweepOnce(now time.Time) {
+	b.sealIdleRuns(now)
 	ctx := context.Background()
 	for _, id := range b.evictIdleActors(now) {
 		_ = b.store.Touch(ctx, id)
 	}
 	_ = b.store.Sweep(ctx, now)
+}
+
+// sealIdleRuns ends silent runs. It works on a snapshot of the actors outside b.mu and skips busy
+// ones (TryLock). It needs no pins: eviction runs after it in the same pass, and an actor is only
+// evicted without an active run, so there is nothing to seal on it anyway.
+func (b *Broker) sealIdleRuns(now time.Time) {
+	b.mu.RLock()
+	actors := make([]*sessionActor, 0, len(b.actors))
+	for _, actor := range b.actors {
+		actors = append(actors, actor)
+	}
+	b.mu.RUnlock()
+
+	for _, actor := range actors {
+		if actor.mu.TryLock() {
+			b.sealIdleRunLocked(actor, now)
+			actor.mu.Unlock()
+		}
+	}
 }
 
 // evictIdleActors drops idle actors and returns the IDs of the actors that stay.

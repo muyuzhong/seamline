@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -50,4 +51,46 @@ func TestActorWithActiveRunIsNotEvicted(t *testing.T) {
 	}
 	mustPublish(t, b, "running", ev(model.TypeRunFinished, ""))
 	waitFor(t, "eviction after the run ended", func() bool { return b.activeActorCount() == 0 })
+}
+
+func TestIdleRunIsSealedWithRunFailed(t *testing.T) {
+	ctx := context.Background()
+	b := New(hotwindow.NewMemoryStorage(), Config{ActiveRunIdleTimeout: 80 * time.Millisecond, SweepInterval: 5 * time.Millisecond})
+	closeBroker(t, b)
+	const sid = "seal"
+
+	sub, err := b.Subscribe(ctx, sid, 0, "")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Cancel()
+
+	mustPublish(t, b, sid, ev(model.TypeRunStarted, ""))
+	// Events inside the run keep it alive well past the timeout.
+	for i := 0; i < 20; i++ {
+		mustPublish(t, b, sid, ev("assistant_delta", textPayload(".")))
+		time.Sleep(10 * time.Millisecond)
+	}
+	if meta := mustInspect(t, b, sid); meta.State != model.StateRunning || meta.LatestSeq != 21 {
+		t.Fatalf("an active producer must not be sealed: %+v", meta)
+	}
+
+	// Then the producer goes silent: the sweeper ends the run with run_failed {"reason":"idle_timeout"}.
+	var sealed model.Event
+	for sealed.Type != model.TypeRunFailed {
+		sealed = recvEvent(t, sub)
+	}
+	if sealed.Seq != 22 || string(sealed.Payload) != `{"reason":"idle_timeout"}` {
+		t.Fatalf("unexpected sealing event: %+v (%s)", sealed, sealed.Payload)
+	}
+	if meta := mustInspect(t, b, sid); meta.State != model.StateFailed || meta.ActiveRunStartSeq != 0 {
+		t.Fatalf("sealed run must be failed: %+v", meta)
+	}
+
+	// Events outside a run never start the idle timer.
+	mustPublish(t, b, sid, ev("note", ""))
+	time.Sleep(200 * time.Millisecond)
+	if meta := mustInspect(t, b, sid); meta.LatestSeq != 23 || meta.State != model.StateFailed {
+		t.Fatalf("an event outside a run must not be sealed: %+v", meta)
+	}
 }
