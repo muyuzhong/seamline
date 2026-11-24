@@ -8,13 +8,13 @@ This file is the **single source of truth** for AI coding agents (Claude Code, C
 
 ## Project Map
 
-- `cmd/seamline/`: HTTP/SSE server entrypoint, CLI flags, and deterministic graceful shutdown (`brk.Close()` before `httpServer.Shutdown()`).
-- `cmd/simworker/`: CLI worker simulator: one run of `run_started`, `user_message`, interleaved `assistant_delta` / `tool_call_delta` events and `run_finished`, with idempotency keys and retries (`main.go`, `publisher.go`).
-- `internal/model/`: Domain and wire structs (`Event`, `PublishRequest`, `PublishResult`, `Delivery`, `CursorReset`, `SessionMeta`, `SessionSnapshot`) and the run event types (`TerminalState`).
-- `internal/hotwindow/`: Hot-window `Storage` interface (each method maps onto Redis primitives, `hotwindow.go`), `MemoryStorage` (`memstore.go`) and per-stream retention / run bookkeeping (`stream.go`).
-- `internal/broker/`: `Broker`, config, Inspect/List (`broker.go`), `sessionActor` and hydration (`actor.go`), `Publish` (`publish.go`), run state machine and idle sealing (`run.go`), subscription registration and live pump (`subscribe.go`), cursor classification and catch-up replay (`replay.go`), sweeper (`sweep.go`), time-bounded idempotency index (`window.go`).
-- `internal/server/`: `http.ServeMux` REST + W3C SSE transport (`server.go`), error codes (`errors.go`) and the embedded F5 Live Playground (`demo.go`, `demo.html`).
-- `docs/ARCHITECTURE.md`: Specification of the implemented data plane: event model, hot window, commit consistency, zero-gap handoff proof sketch, lock hierarchy, and SSE wire protocol.
+- `cmd/seamline/`: HTTP/SSE server entrypoint, CLI flags and graceful shutdown.
+- `cmd/simworker/`: CLI worker that publishes one simulated run with idempotency keys and retries.
+- `internal/model/`: Domain and wire types shared by every layer.
+- `internal/hotwindow/`: The hot-window `Storage` interface (shaped for Redis) and the in-memory `MemoryStorage`: seq allocation, the run state machine, retention and byte quotas.
+- `internal/broker/`: Per-session actors: publish and fan-out, subscriptions with cursor classification and catch-up replay, idle run sealing, idempotency keys and the sweeper.
+- `internal/server/`: REST + W3C SSE transport, error codes and the embedded F5 Live Playground.
+- `docs/ARCHITECTURE.md`: Specification of the implemented data plane, down to files and internal functions: event model, hot window, commit consistency, zero-gap handoff proof sketch, lock hierarchy and SSE wire protocol.
 - `docs/DESIGN_V2.md`: **Authoritative Phase 2 / Phase 3 blueprint** — payload-opaque **pure monotonic event cursor (`<epoch>:<seq>`)**, per-session `epoch` + `MetaTTL`, pinned active-run byte ring buffer (`active_run_start_seq` + three-tier byte quotas), `idempotency_key`, `seamline_cursor` DB alignment, `event: cursor_reset`, and stateful Agent session control plane.
 
 ---
@@ -26,10 +26,10 @@ Consult the corresponding specification **before** modifying that subsystem:
 | Area Being Changed | Required Reference |
 | :--- | :--- |
 | Retention, runs, quotas, epochs, idempotency, `cursor_reset`, DB alignment, control plane, Redis | [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md) |
-| `internal/broker/` publish path, run state machine, sealing, or `Storage` calls | [Commit & Failure Consistency](docs/ARCHITECTURE.md#4-commit--failure-consistency-model) |
-| `Broker.Subscribe`, `runSubscriberPump`, `Last-Event-ID`, or epoch cursor handling | [Zero-Gap Catch-Up to Live Handoff](docs/ARCHITECTURE.md#5-catch-up-to-live-tailing-zero-gap-proof-sketch) |
-| Locks (`b.mu`, `actor.mu`, `sub.errMu`), `pins`, the sweeper, or `ListSessions` | [Concurrency, Lock Hierarchy & Pinning](docs/ARCHITECTURE.md#6-concurrency-lock-hierarchy--actor-pinning-model) |
-| `internal/server/`, SSE frame formatting, CORS, or `demo.html` Playground UI | [SSE Wire Protocol Specification](docs/ARCHITECTURE.md#7-sse-wire-protocol-specification) |
+| The publish path, run state, idle sealing, or `Storage` | [Commit & Failure Consistency](docs/ARCHITECTURE.md#4-commit--failure-consistency-model) |
+| Subscriptions, `Last-Event-ID`, or cursor handling | [Zero-Gap Catch-Up to Live Handoff](docs/ARCHITECTURE.md#5-catch-up-to-live-tailing-zero-gap-proof-sketch) |
+| Locks, actor lifetime, or the sweeper | [Concurrency, Lock Hierarchy & Pinning](docs/ARCHITECTURE.md#6-concurrency-lock-hierarchy--actor-pinning-model) |
+| `internal/server/`, SSE frames, CORS, or the Playground UI | [SSE Wire Protocol Specification](docs/ARCHITECTURE.md#7-sse-wire-protocol-specification) |
 | Linter rules, Makefile targets, or GitHub Actions CI | [`Makefile`](Makefile), [`.golangci.yml`](.golangci.yml), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
 ---
@@ -54,7 +54,7 @@ Formatting rewrites files; always re-run `make check` and `make lint` **after** 
 
 ## Hard Engineering Invariants
 
-Every change to Seamline **must** preserve the invariants below. When a change intentionally evolves one of them (for example a Phase 2b/3 item from [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)), update this file, [`CLAUDE.md`](CLAUDE.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) in the same PR instead of treating the old rule as a blocker.
+Every change to Seamline **must** preserve the invariants below. When a change intentionally evolves one of them (for example a Phase 2b/3 item from [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)), update this file and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) in the same PR instead of treating the old rule as a blocker.
 
 ### 1. Dependency Discipline & No `cgo`
 - Core runtime packages (`internal/model`, `internal/hotwindow`, `internal/broker`, `internal/server`) use **100% Go 1.23+ standard library** (`go 1.23` in `go.mod`). Optional external drivers (such as a Phase 3 `RedisStorage`) require explicit approval before adding dependencies.
@@ -62,51 +62,45 @@ Every change to Seamline **must** preserve the invariants below. When a change i
 - Production binaries (`./cmd/seamline`, `./cmd/simworker`) must build cleanly with `CGO_ENABLED=0`. (Note: `go test -race` requires `CGO_ENABLED=1` on the test runner; never set global `CGO_ENABLED=0` across race-test steps.)
 
 ### 2. Strict Lock Hierarchy & Cross-Session Isolation
-- Lock acquisition order is strictly one-way; `MemoryStorage.mu` is a leaf taken only inside `Storage` calls:
+- Lock order is strictly one-way; the storage lock is a leaf taken only inside `Storage` calls:
   ```text
-  Broker.mu (b.mu)  ──►  sessionActor.mu (actor.mu)  ──►  subState.errMu (sub.errMu)
+  broker lock  ──►  session actor lock  ──►  subscription error lock
   ```
-- **Never** acquire `b.mu` while holding `actor.mu` or `sub.errMu`.
-- **Never block waiting on `actor.mu` while holding `b.mu`:** `Publish` performs `Storage` I/O under `actor.mu`, so a slow write on session A must not freeze other sessions.
-  - **Hydration (`acquireActor`):** look up cached actors under `b.mu.RLock()` with atomic pinning; call `store.EnsureStream` outside `b.mu`; insert with double-checked locking under `b.mu.Lock()`.
-  - **Eviction (`evictIdleActors`):** under `b.mu` probe actors only with `actor.mu.TryLock()`. An actor with an active run (`activeRunStartSeq != 0`) is never evicted: it owns the run's idle timer.
-  - **Sealing (`sealIdleRuns`):** pin actors under `b.mu.RLock()`, release `b.mu`, then `TryLock` each actor. Release the sweeper's pin with `actor.pins.Add(-1)`, **never** `unpin()`: `unpin()` refreshes `lastActiveNano`, and a sweeper that touches actors keeps every session alive.
-  - **Reads (`Inspect`, `ListSessions`, `CreateSession`):** read session state from `Storage`, which is authoritative; lock an actor only to count subscribers, after releasing `b.mu`.
-- Prevent actor eviction during active operations only via atomic pins (`actor.pins.Add(1)` before releasing `b.mu`, paired with `defer actor.unpin()`). Do not introduce boolean eviction flags.
+- **Never** take the broker lock while holding a session lock, and **never** block on a session lock while holding the broker lock: storage I/O runs under the session lock, so a slow write on one session must not freeze the others. Background maintenance only try-locks sessions.
+- Storage is authoritative for session state: reads (`Inspect`, `ListSessions`, `CreateSession`) go to storage, not to in-memory actors.
+- An API call pins its session actor so idle eviction cannot drop it; an actor with an active run or with subscribers is never evicted. Background maintenance must never count as session activity.
 
-### 3. Commit & State Mutation Invariant (`store.Append` Is the Point of No Return)
-- **One atomic commit:** `store.Append` writes the event **together with** the session state it leaves behind (`state`, `active_run_start_seq`, latest finished run) as one `hotwindow.Commit`. There is no separate metadata write (no `SaveMeta`).
-- **Pre-commit immutability:** validate (`type`, JSON payload, `MaxEventBytes`), check `ctx.Err()`, look up the `idempotency_key`, and build the commit with `actor.nextCommit` in local variables. **Never** change `latestSeq`, `activeRunStartSeq`, `state`, `runActiveAt` or the `idempotent` index before `store.Append` succeeds. Why: a failed append must not consume a seq, move the run pin, or remember a key (the retry would be falsely deduplicated).
-- **Point of no return:** once `store.Append` returns `nil`, immediately `applyCommitLocked`, record the `idempotency_key`, and `fanOutLocked`; never return an error from `Publish` after that. Idle sealing (`run_failed {"reason":"idle_timeout"}`) goes through the same path.
+### 3. Commit & State Mutation Invariant (`Storage.Append` Is the Point of No Return)
+- **One atomic commit:** `Storage.Append` assigns the next seq, applies the run state machine and the active-run quota, and writes the event **together with** the session state it leaves behind (`state`, `active_run_start_seq`, latest finished run). There is no separate metadata write.
+- **Nothing changes before the commit:** validation and the idempotency lookup change nothing; the broker's view of the session (latest seq, run pin, run idle timer, idempotency keys) changes only after `Append` succeeds. Why: a failed append must not consume a seq, move the run pin, or remember a key (the retry would be falsely deduplicated).
+- **Point of no return:** once `Append` succeeds, mirror its result, fan the event out and record the `idempotency_key`; never return an error from `Publish` after that. Idle sealing (`run_failed {"reason":"idle_timeout"}`) goes through the same path.
 - **Runs are explicit:** only `run_started` while no run is active opens a run; `run_finished` / `run_failed` / `run_interrupted` while running end it; every other event (including terminal types outside a run) leaves the run as is.
-- **Retention (`hotwindow`):** never evict the active run (`seq >= active_run_start_seq`); the latest finished run ignores `MaxHistoryBytes` and expires `HistoryTTL` after its end; other history expires by `HistoryTTL`, or by `MaxHistoryBytes` while always keeping the newest event; the window stays contiguous. Retention never resets a stream's epoch or seq counter; only `MetaTTL` drops a stream, and the sweeper `Touch`es every live actor's stream. `MaxActiveRunBytes` never rejects a terminal event.
+- **Retention (`hotwindow`):** never evict the active run (`seq >= active_run_start_seq`); the latest finished run ignores `MaxHistoryBytes` and expires `HistoryTTL` after its end; other history expires by `HistoryTTL`, or by `MaxHistoryBytes` while always keeping the newest event; the window stays contiguous. Retention never resets a stream's epoch or seq counter; only `MetaTTL` drops a stream, and the broker keeps the streams of its live sessions alive. `MaxActiveRunBytes` never rejects a terminal event.
 
 ### 4. Zero-Gap Subscription Handoff
-- In `Broker.Subscribe`, register `actor.subscribers[sub]` and capture the snapshot `(epoch, latestSeq, activeRunStartSeq)` inside the **exact same `actor.mu` critical section**. Every event in `liveCh` is then newer than the snapshot; the `Seq <= snapSeq` filter in `drainLiveStream` is defense in depth.
-- Cursors are classified before any frame is sent (`planReplay`): no cursor → fresh subscription (whole window, no reset); other epoch or a bare seq → `epoch_mismatch`; seq beyond the snapshot → `cursor_ahead`; next seq evicted (checked against the window from the same `ReadAfter`) → `cursor_expired`. Never silently reset a cursor.
-- `cursor_reset` is sent at most once and only as the first frame; the retained window and live events follow on the same connection. Replay checks contiguity (`contiguity`); a hole ends the subscription with `ErrInsufficientState` (`stream_error insufficient_state`), never a silent skip.
+- Register the subscriber and capture the snapshot `(epoch, latest seq, active_run_start_seq)` in **one** session critical section, so every live event is newer than the snapshot.
+- Classify the cursor before any frame is sent: no cursor → fresh subscription (whole window, no reset); other epoch or a bare seq → `epoch_mismatch`; seq beyond the snapshot → `cursor_ahead`; next seq already evicted → `cursor_expired`. Never silently reset a cursor.
+- `cursor_reset` is sent at most once and only as the first frame; the retained window and live events follow on the same connection. A hole in the replay ends the subscription with `stream_error` `insufficient_state`, never a silent skip.
 
 ### 5. Non-Blocking Fan-Out, SSE Wire Protocol & Playground XSS Safety
-- **Non-blocking `Publish`:** `fanOutLocked` uses non-blocking channel sends. A stalled reader is evicted (`ErrSlowSubscriber`) without delaying producers or sibling subscribers.
+- **Non-blocking publish:** fan-out never blocks; a stalled reader is evicted (`slow_subscriber`) without delaying producers or other subscribers.
 - **Cursor placement:** every business event frame is `id: <epoch>:<seq>` + `data: <Event JSON>` with **no `event:` line** (EventSource `message`), so producer event types can never collide with control frame names. Control frames `event: cursor_reset` (flat `model.CursorReset` JSON) and `event: stream_error` carry **no** `id:`.
 - **Terminal errors:** emit `event: stream_error` (never `event: error`, which collides with `EventSource`'s network `error` event) with `{"error":"slow_subscriber"}` or `{"error":"insufficient_state"}`. Native `EventSource` clients keep the instance open so the browser reconnects with `Last-Event-ID`; a new `EventSource` passes `?after_seq=<epoch>:<seq>`.
-- **Single CORS & shutdown path:** set CORS headers once in `withCORS`. During shutdown (`cmd/seamline/main.go`), call `brk.Close()` **once** and **before** `httpServer.Shutdown()`.
+- **Single CORS & shutdown path:** set CORS headers in one place. On shutdown close the broker **once** and **before** the HTTP server.
 - **DOM XSS prevention:** in `demo.html` (and any future web UI) render session IDs, payloads and URL parameters only via `document.createElement`, `textContent` and `replaceChildren`—**never** `innerHTML`.
 
-### 6. Readability, File Modularity & Cognitive Complexity (`gocognit <= 15`)
+### 6. Readability & Cognitive Complexity (`gocognit <= 15`)
 - **Hard complexity ceiling (`gocognit <= 15`):** every non-test Go function across `cmd/` and `internal/` keeps cognitive complexity `<= 15` (enforced in CI via `.golangci.yml`).
-- **Flat guard clauses & table-of-contents entrypoints:** prefer early returns. Entrypoints (`Publish`, `Subscribe`, `handleStream`, `acquireActor`) read top-to-bottom and delegate to single-purpose helpers (`nextCommit`, `replayCatchUp`, `replayEvents`, `drainLiveStream`, `streamSSELoop`).
-- **Focused ~250-line files:** split packages by responsibility (~200–300 lines per file). Never contort logic just to game metrics.
+- **Flat guard clauses:** prefer early returns; entrypoints read top-to-bottom and delegate to single-purpose helpers.
+- **Focused files:** split packages by responsibility (~200–300 lines per file). Never contort logic just to game metrics.
 
-### 7. Testing & Linter Discipline
-- Changes to `internal/broker` or `internal/hotwindow` ship with deterministic regression tests, including fault injection (`flakyStore`, `gappyStore`) where storage behaviour matters. Keep coverage for: a failed append leaving no trace; the explicit run state machine; active run never evicted and latest finished run protected; terminal events exempt from the active quota; idle sealing; each `cursor_reset` reason; replay gaps ending with `insufficient_state`; epoch kept by retention and rotated by `MetaTTL`; live sessions not expiring; idempotency keys recorded only after commit; slow storage on one session not blocking others.
-- Key tests must be able to fail: verify new tests by deliberately breaking the code they guard. Tests must not hang on a regression; bound every wait with a timeout. No round-trip serialization tests.
-- Always close `*http.Response.Body` (`bodyclose`); use `errors.Is` / `errors.As` and wrap with `%w` (`errorlint`).
-- Storage implementations deep-copy `json.RawMessage` payloads on write and read.
+### 7. Testing
+- Test externally visible contracts and core invariants, not implementation details; do not duplicate coverage another package already has, and write no serialization round-trip tests. Bound every wait with a timeout. Use fault injection only when a change touches the storage commit path.
+- `Storage` isolates `Payload` at its write entry (`Append` keeps a private copy); stored events are immutable and readers share them.
 
 ---
 
 ## Maintaining These Instructions
 
-- Keep `AGENTS.md` concise and authoritative. Deep protocol proofs, failure matrices, and wire-protocol state machines belong in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-- Keep [`CLAUDE.md`](CLAUDE.md) synchronized as a lightweight pointer to `AGENTS.md` so every AI coding assistant follows identical engineering constraints.
+- Keep `AGENTS.md` to the package map and the invariants. Files, internal functions, proofs, failure matrices and wire-protocol details belong in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and code comments.
+- Keep [`CLAUDE.md`](CLAUDE.md) a lightweight pointer to `AGENTS.md`; do not copy rules into it.

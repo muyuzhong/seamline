@@ -28,9 +28,9 @@ Seamline is a **short hot window**, not a system of record: long-term history be
  ┌──────────────────────┐            ┌─────────────────────────────────────────┐           ┌──────────────────────────────┐
  │ POST /events         │            │ 1. validate type / JSON / MaxEventBytes │           │ id: <epoch>:<seq>            │
  │ {type, payload,      ├───────────►│ 2. idempotency_key lookup               ├──────────►│ data: {"seq":…,"type":…,     │
- │  idempotency_key}    │            │ 3. nextCommit: seq+1, run state machine │  every    │        "payload":…}          │
- └──────────────────────┘            │ 4. store.Append(event + session state)  │  event    │                              │
-                                     │ 5. apply commit, fan out                │           │ Reconnect / F5:              │
+ │  idempotency_key}    │            │ 3. store.Append: next seq, run state,   │  every    │        "payload":…}          │
+ └──────────────────────┘            │    quota, event + state in one commit   │  event    │                              │
+                                     │ 4. mirror seq and run pin, fan out      │           │ Reconnect / F5:              │
           ╳ producer goes silent     ├─────────────────────────────────────────┤           │  [event: cursor_reset]       │
  ───────────────────────────────────►│ sweeper: run_failed {"reason":          ├──────────►│  retained window             │
                                      │          "idle_timeout"}                │           │  live events                 │
@@ -62,7 +62,7 @@ Seamline is a **short hot window**, not a system of record: long-term history be
 
 ### 3.2 Session Stream Identity: Epoch & Seq
 - **The epoch belongs to the session stream, not to the broker process.** `hotwindow` generates a random 12-hex epoch when it creates a stream (`EnsureStream`). `Broker.InstanceID()` (`/healthz` `instance_id`) only identifies the process.
-- Storage owns the seq counter (`LatestSeq`) and requires `Append` to use exactly `LatestSeq + 1` with the stream's epoch.
+- Storage owns the seq counter (`LatestSeq`): `Append` gives the next event `LatestSeq + 1` and the stream's epoch.
 - Retention evicts events but **never** resets the epoch or the seq counter; an evicted cursor is reported as `cursor_expired`.
 - A stream is dropped only after `MetaTTL` without activity (publishes, subscriptions, and the sweeper's `Touch` of every live actor keep it alive). Recreating it yields a **new epoch** and seq restarts at 1. An in-memory restart gives every session a new epoch.
 
@@ -71,12 +71,12 @@ Seamline is a **short hot window**, not a system of record: long-term history be
 | Limit | Default | Enforced in | On overflow |
 | :--- | :--- | :--- | :--- |
 | `MaxEventBytes` (payload of one publish) | 256 KiB | `broker.validatePublishRequest`; body limit = `MaxEventBytes` + 16 KiB | `413 event_too_large` |
-| `MaxActiveRunBytes` (retained bytes of the active run) | 16 MiB | `hotwindow` `stream.check` | `413 active_run_quota_exceeded`; terminal events exempt |
+| `MaxActiveRunBytes` (retained bytes of the active run) | 16 MiB | `hotwindow` `Append` | `413 active_run_quota_exceeded`; terminal events exempt |
 | `ActiveRunIdleTimeout` | 2m | sweeper `sealIdleRuns` | `run_failed {"reason":"idle_timeout"}` |
 | `MaxHistoryBytes` (events outside the active run; `payload + type + 64B` each) | 8 MiB | `hotwindow` `stream.evict` | oldest history evicted; latest finished run and newest event kept. The window stays contiguous, so history published after the latest finished run is evicted by bytes only once that run expires (`HistoryTTL` from its end); until then retained history can exceed this limit |
 | `HistoryTTL` | 15m | `Append` / `Sweep` | history evicted; the latest finished run counts from its end |
 | `MetaTTL` | 24h | `MemoryStorage.Sweep` | stream dropped (new epoch on recreation) |
-| `IdempotencyWindow` | 5m | `windowIndex` in the actor | key forgotten (also when the actor is evicted, see §3.4) |
+| `IdempotencyWindow` | 5m | idempotency map in the actor | key forgotten (also when the actor is evicted, see §3.4) |
 
 ### 3.4 Idempotent Retries
 A publish may carry `idempotency_key`. Within `IdempotencyWindow` a repeat returns the original `{epoch, seq, deduplicated: true}` and is not fanned out. The key is recorded only after the append succeeds. Content is not compared. The index lives in the session actor and idle eviction (§6.3) drops it, so keep `IdleSessionTTL` (default 30m) at least `IdempotencyWindow`; otherwise a retry that arrives after the actor was evicted is committed again.
@@ -88,13 +88,13 @@ A publish may carry `idempotency_key`. Within `IdempotencyWindow` a repeat retur
 `Publish` runs under `actor.mu`, serializing one session while sessions run in parallel.
 
 ### 4.1 Pre-Commit Immutability
-Validation, `ctx.Err()`, the idempotency lookup and `actor.nextCommit` (next seq, run state machine, normalized payload copy) only build local values. The actor (`latestSeq`, `activeRunStartSeq`, `state`, `runActiveAt`, `idempotent`) is not touched.
+Validation, `ctx.Err()` and the idempotency lookup change nothing. The actor (`latestSeq`, `activeRunStartSeq`, `runActiveAt`, `idempotent`) changes only after `Append` succeeded.
 
 ### 4.2 One Atomic Append
-`store.Append(hotwindow.Commit{Event, State, ActiveRunStartSeq})` validates the epoch, `seq == LatestSeq + 1`, the run transition (a run starts only from "no run", at this event's seq, and ends only from the current run) and the active-run quota, then writes the event and the session state together and applies retention. There is no second metadata write, so storage can never hold an event without its run bookkeeping; `Inspect`, `ListSessions` and `CreateSession` read storage directly.
+`store.Append(ctx, sessionID, type, payload, now)` assigns the next seq and the stream's epoch, keeps a private copy of the payload, applies the run state machine (§2) and the active-run quota, then writes the event and the session state together, applies retention, and returns the stored event with the session meta. The broker builds no commit of its own, so the state machine exists once, there is no second metadata write, and storage can never hold an event without its run bookkeeping; `Inspect`, `ListSessions` and `CreateSession` read storage directly. Stored events are immutable: `ReadAfter` and fan-out share them without copying.
 
 ### 4.3 Point of No Return
-After `Append` returns `nil`: `applyCommitLocked`, record the `idempotency_key`, `fanOutLocked`; `Publish` then returns success. Idle sealing uses the same path.
+After `Append` returns `nil`, `appendLocked` mirrors the seq and run pin (and `runActiveAt` while a run is active) and calls `fanOutLocked`; `Publish` then records the `idempotency_key` and returns success. Idle sealing uses the same `appendLocked` path.
 
 ### 4.4 Failure Matrix
 
@@ -112,7 +112,7 @@ After `Append` returns `nil`: `applyCommitLocked`, record the `idempotency_key`,
 **Theorem:** for a session stream with epoch $E$, a subscriber that is not evicted (slow consumer or insufficient state) receives (a) with no cursor: no `cursor_reset`, then every retained event and all later events exactly once and in order; (b) when its cursor is `<E>:S_0` with `EarliestSeq - 1 <= S_0 <= LatestSeq`: every event with seq $> S_0$ exactly once and in order; (c) otherwise: one `cursor_reset` followed by every retained event and all later events exactly once and in order.
 
 1. **Linearization point:** `registerSubscriber` inserts `sub` and captures `(epoch, snapSeq = latestSeq, activeRunStartSeq)` in one `actor.mu` critical section $T_{sub}$. `Publish` and sealing hold `actor.mu` across `Append` and `fanOutLocked`, so every event with seq $\le$ `snapSeq` is in storage and every later event goes to `liveCh` in order.
-2. **Cursor classification** (`planReplay`) uses only the cursor and the snapshot; one atomic `ReadAfter` returns the events and the window, so the `cursor_expired` test (`S_0 + 1 < min(EarliestSeq, snapSeq + 1)`) and the replayed events agree. Seqs above `snapSeq` arrive through `liveCh`, so publishes that evict them from storage before the read never expire a caught-up cursor.
+2. **Cursor classification** (`planReplay`) uses only the cursor and the snapshot. With nothing to replay (`S_0 = snapSeq`, or a fresh subscription to an empty stream) the pump skips storage: every later event arrives through `liveCh`, so a caught-up cursor never expires. Otherwise one atomic `ReadAfter` returns the events and the window, so the `cursor_expired` test (`S_0 + 1 < EarliestSeq`) and the replayed events agree.
 3. **Replay** sends events up to `snapSeq` (later ones arrive through `liveCh`) and checks contiguity: for a resumable cursor the first event must be `S_0 + 1`; after a reset or on a fresh subscription it may start anywhere in the window. A hole ends the subscription with `ErrInsufficientState`.
 4. **Live:** every `liveCh` event has seq $>$ `snapSeq`; the `Seq <= snapSeq` filter is defense in depth. $\blacksquare$
 
@@ -137,18 +137,17 @@ Because the active run is pinned, `EarliestSeq <= active_run_start_seq` holds wh
 ### 6.2 `b.mu` Rules
 `b.mu` protects `b.closed` and `b.actors`; it is never held while blocking on `actor.mu` or doing storage I/O.
 - **`acquireActor`:** cached lookup under `b.mu.RLock()` with atomic pinning; on a miss `store.EnsureStream` outside `b.mu`, then double-checked insertion under `b.mu.Lock()`.
-- **`evictIdleActors`:** under `b.mu.Lock()`, skip pinned actors and probe others with `actor.mu.TryLock()`.
-- **`sealIdleRuns`:** pin all actors under `b.mu.RLock()`, release it, `TryLock` each actor.
-- **`maintainStorage`:** copy live session IDs under `b.mu.RLock()`, then `Touch` and `Sweep` outside `b.mu`.
+- **`sealIdleRuns`:** snapshot the actors under `b.mu.RLock()` (no pins), release it, `TryLock` each actor.
+- **`evictIdleActors`:** under `b.mu.Lock()`, skip pinned actors, probe others with `actor.mu.TryLock()`, and return the IDs of the actors that stay; `Touch` and `Sweep` then run outside `b.mu`.
 - **`Inspect` / `ListSessions`:** read storage; `subscriberCount` looks up the actor under `b.mu.RLock()` and locks it after releasing `b.mu`.
 
 ### 6.3 Pinning & Idle Eviction
-API calls pin their actor and release it with `defer actor.unpin()` (which refreshes `lastActiveNano`). **Sweeper pins are released with `actor.pins.Add(-1)` and never touch the actor.** An actor is evicted iff, while `actor.mu` is held via `TryLock()`: no pins, no subscribers, **no active run** (the actor owns the run's idle timer), and idle longer than `IdleSessionTTL`. Evicting an actor only drops the broker-side cache (including its idempotency index, §3.4); the stream stays in storage.
+API calls pin their actor and release it with `defer actor.unpin()` (which refreshes `lastActiveNano`). **The sweeper takes no pins and never refreshes `lastActiveNano`:** sealing works on a snapshot, and eviction runs after it in the same pass and never removes an actor with an active run. An actor is evicted iff, while `actor.mu` is held via `TryLock()`: no pins, no subscribers, **no active run** (the actor owns the run's idle timer), and idle longer than `IdleSessionTTL`. Evicting an actor only drops the broker-side cache (including its idempotency index, §3.4); the stream stays in storage.
 
 ### 6.4 Sweeper Pass (every `SweepInterval`)
 1. `sealIdleRuns`: end runs silent for `ActiveRunIdleTimeout`.
-2. `evictIdleActors`.
-3. `maintainStorage`: `Touch` every remaining actor's stream, then `store.Sweep(now)` (history TTL, `MetaTTL`).
+2. `evictIdleActors`, which returns the live session IDs.
+3. `Touch` the stream of every live actor (subscribers may be attached), then `store.Sweep(now)` (history TTL, `MetaTTL`).
 
 ---
 
@@ -158,7 +157,7 @@ API calls pin their actor and release it with `defer actor.unpin()` (which refre
 
 ### 7.1 Cursor Resolution
 1. `Last-Event-ID: <epoch>:<seq>` (sent by `EventSource` on automatic reconnects).
-2. `?after_seq=<epoch>:<seq>` or `?after_seq=<seq>&epoch=<epoch>` (page load, database watermark, SDKs).
+2. `?after_seq=<epoch>:<seq>` (page load, database watermark, SDKs).
 3. Default: fresh subscription (retained window, then live events; no reset).
 
 A cursor with a seq but no epoch cannot be validated and is answered with `cursor_reset` `epoch_mismatch`.
