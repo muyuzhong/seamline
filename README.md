@@ -49,7 +49,7 @@ Inside `Broker.Subscribe(ctx, sessionID, afterOffset, afterEpoch)`:
    - Reads committed records `(afterOffset, snapOffset]` from `Storage` and emits `event: record` (`id: <epoch>:<offset>`).
    - If `inFlightSnap != nil`, emits one `event: inflight_snapshot` (`seq = inFlightSnap.LastSeq`, `delta = inFlightSnap.Merged`).
    - Drains `liveCh`, skipping any `record` with `offset <= snapOffset` and any `delta` with `seq <= inFlightSnap.LastSeq`, forwarding every subsequent event in strict order.
-4. **Slow Subscriber Backpressure:** `Publish` never blocks on slow readers (`select` with `default`). If a subscriber's buffer fills up, Seamline evicts only that subscriber and emits `event: error` (`{"error":"slow_subscriber"}`) before closing its stream.
+4. **Slow Subscriber Backpressure:** `Publish` never blocks on slow readers (`select` with `default`). If a subscriber's buffer fills up, Seamline evicts only that subscriber and emits `event: stream_error` (`{"error":"slow_subscriber"}`) before closing its stream.
 
 ---
 
@@ -73,10 +73,16 @@ data: {"kind":"delta","epoch":"9f8e7d6c5b4a","stream_id":"turn-1","seq":43,"type
 id: 9f8e7d6c5b4a:2
 event: record
 data: {"kind":"record","offset":2,"epoch":"9f8e7d6c5b4a","stream_id":"turn-1","type":"assistant_message","payload":{"content":"Seamline decouples high-frequency token deltas from durable storage."},"created_at":"2026-11-21T12:00:02Z"}
+
+event: stream_error
+data: {"error":"slow_subscriber"}
 ```
 
 ### Why `id:` Is Only Set on `event: record`
 Browser `EventSource` automatically remembers the most recent `id:` header and sends it as `Last-Event-ID` on reconnect. Because `delta` frames intentionally omit `id:`, a client that drops at token `#42` reconnects with `Last-Event-ID: <epoch>:1` (the last committed record), receives the coalesced `inflight_snapshot` for tokens `1..55` generated so far, and resumes live `delta` frames from `#56` onward.
+
+### Why `event: stream_error` Instead of `event: error`
+Per the HTML `EventSource` specification, a server-sent `event: error` dispatches on the same `"error"` event channel as built-in browser network connection errors (`es.onerror`). Naming application-level terminal stream notifications `event: stream_error` keeps protocol backpressure signals (`slow_subscriber`) cleanly separated from transport disconnects.
 
 ---
 
@@ -87,6 +93,7 @@ Requirements: **Go 1.23+** (100% Go standard library, zero external dependencies
 ### 1. Start the Seamline Server & Live F5 Playground
 
 ```bash
+# Run directly with Go (or via Makefile: make run-demo)
 go run ./cmd/seamline --addr :8080 --demo=true
 ```
 
@@ -159,6 +166,10 @@ curl -N -H 'Last-Event-ID: <epoch>:1' \
 ## Testing / 测试验证
 
 ```bash
+# Run full formatting, vet, and race-detector suite
+make check
+
+# Or directly with the Go toolchain:
 gofmt -l .
 go vet ./...
 go test -race -v ./...
@@ -166,11 +177,19 @@ go test -race -v ./...
 
 ---
 
+## Documentation & Engineering Specs / 架构与工程规范
+
+- [v2 Architecture Evolution & Centrifugo Comparison (`docs/DESIGN_V2.md`)](docs/DESIGN_V2.md) — **Next-stage blueprint**: short-TTL hot-window scope boundary (RAM + pluggable Redis, no custom disk WAL), unified monotonic event cursor (`<epoch>:<seq>`) for payload-opaque tool/JSON streaming, downstream-agnostic protocol design, and stateful Agent control-plane differentiation vs. Centrifugo.
+- [Phase 1 Architecture & Concurrency Invariants (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md) — Formal specification of the Phase 1 engine, lock hierarchy, and catch-up handoff proof sketch.
+- [Engineering Constraints (`AGENTS.md`)](AGENTS.md) — Hard concurrency, cognitive complexity (`gocognit <= 15`), and verification rules (`make check`, `make lint`).
+
+---
+
 ## Roadmap / 演进路线图
 
-- **Phase 1 (Current):** Core dual-speed broker (`SessionActor`), in-memory storage engine, monotonic sequence idempotency, atomic `inflight_snapshot` + live `delta` handoff, slow-subscriber eviction, idle actor eviction, zero-dependency HTTP/SSE server, CLI worker simulator, and embedded F5 Live Playground.
-- **Phase 2:** Append-only disk Write-Ahead Log (WAL) + CRC32 framing & segment compaction implementing `storage.Storage`, crash recovery with persistent epoch continuity, and Prometheus `/metrics` observability.
-- **Phase 3:** Multi-stream concurrent tool-call multiplexing per session, consistent-hash horizontal session routing, and lightweight TypeScript / Go client SDKs.
+- **Phase 1 (Current `main`):** Core per-session actor broker, thread-safe in-memory engine, atomic catch-up to live-tailing handoff, slow-subscriber backpressure eviction (`stream_error`), idle actor eviction, zero-dependency HTTP/SSE server (compatible with custom backend/CLI/desktop apps and browsers), CLI worker simulator, and `gocognit <= 15` CI gates.
+- **Phase 2 (Next — Event Cursor & Stateful Agent Control Plane):** Streamline the hot buffer to a payload-opaque **single monotonic event cursor (`<epoch>:<seq>`) + TTL ring buffer** (natively supporting parallel streaming tool-call JSON & custom events), and build the core **Agent Session Control Plane**: bidirectional `Cancel` / `Steer` queue, atomic CAS `WaitingApproval` human-in-the-loop gate, Run concurrency guard, and Worker heartbeat lease (zombie-session reaper). See [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
+- **Phase 3 (Production Scale-Out):** Pluggable **Redis hot-window backend** (`Streams + EXPIRE`, replacing custom disk WAL so permanent history stays cleanly in client storage or business DBs), lightweight publisher/subscriber token auth, and `/metrics` observability.
 
 ---
 
