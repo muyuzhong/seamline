@@ -33,6 +33,7 @@ const (
 
 	DefaultMaxEventBytes        = 256 << 10
 	DefaultActiveRunIdleTimeout = 2 * time.Minute
+	DefaultIdempotencyWindow    = 5 * time.Minute
 )
 
 type Config struct {
@@ -47,6 +48,8 @@ type Config struct {
 	// ActiveRunIdleTimeout ends an active run with run_failed {"reason":"idle_timeout"} when
 	// no event was published in it for this long (default 2m).
 	ActiveRunIdleTimeout time.Duration
+	// IdempotencyWindow is how long an idempotency_key deduplicates retries (default 5m).
+	IdempotencyWindow time.Duration
 }
 
 func orDefault[T int | time.Duration](v, def T) T {
@@ -62,6 +65,7 @@ func normalizeConfig(cfg Config) Config {
 	cfg.SweepInterval = orDefault(cfg.SweepInterval, defaultSweepInterval)
 	cfg.MaxEventBytes = orDefault(cfg.MaxEventBytes, DefaultMaxEventBytes)
 	cfg.ActiveRunIdleTimeout = orDefault(cfg.ActiveRunIdleTimeout, DefaultActiveRunIdleTimeout)
+	cfg.IdempotencyWindow = orDefault(cfg.IdempotencyWindow, DefaultIdempotencyWindow)
 	if cfg.InstanceID == "" {
 		cfg.InstanceID = randomHex(6)
 	}

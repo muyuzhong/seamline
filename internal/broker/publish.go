@@ -53,12 +53,36 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 		return model.PublishResult{}, err
 	}
 
+	now := time.Now().UTC()
 	actor.touch()
-	ev, err := b.appendLocked(ctx, actor, req.Type, payloadOrNil(req.Payload), time.Now().UTC())
+	if e, ok := actor.idempotent[req.IdempotencyKey]; ok && now.Before(e.expiresAt) {
+		return model.PublishResult{Epoch: actor.epoch, Seq: e.seq, Deduplicated: true}, nil
+	}
+	ev, err := b.appendLocked(ctx, actor, req.Type, payloadOrNil(req.Payload), now)
 	if err != nil {
 		return model.PublishResult{}, err
 	}
+	if req.IdempotencyKey != "" {
+		b.rememberKeyLocked(actor, req.IdempotencyKey, ev.Seq, now)
+	}
 	return model.PublishResult{Epoch: ev.Epoch, Seq: ev.Seq}, nil
+}
+
+// rememberKeyLocked records the seq a key committed for IdempotencyWindow. Expired keys are swept
+// at most once per window, and a session that never sends keys never allocates the map.
+func (b *Broker) rememberKeyLocked(actor *sessionActor, key string, seq uint64, now time.Time) {
+	if actor.idempotent == nil {
+		actor.idempotent = make(map[string]idemEntry)
+	}
+	if !now.Before(actor.idemPruneAt) {
+		for k, e := range actor.idempotent {
+			if !now.Before(e.expiresAt) {
+				delete(actor.idempotent, k)
+			}
+		}
+		actor.idemPruneAt = now.Add(b.cfg.IdempotencyWindow)
+	}
+	actor.idempotent[key] = idemEntry{seq: seq, expiresAt: now.Add(b.cfg.IdempotencyWindow)}
 }
 
 // appendLocked commits the next event of the actor's session; storage assigns its seq and moves

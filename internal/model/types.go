@@ -49,6 +49,8 @@ type Event struct {
 type PublishRequest struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload,omitempty"`
+	// IdempotencyKey deduplicates retries within the broker's idempotency window.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type PublishResult struct {
