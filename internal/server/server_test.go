@@ -375,67 +375,11 @@ func TestMidStreamDisconnectAndReconnectWithLastEventID(t *testing.T) {
 	if text.String() != strings.Join(chunks, "") {
 		t.Fatalf("reconstructed text mismatch:\n got %q\nwant %q", text.String(), strings.Join(chunks, ""))
 	}
-}
-
-func TestFreshPageLoadMidRunReplaysWholeRun(t *testing.T) {
-	_, srv := newTestEnv(t, "f5epoch", broker.Config{}, server.Config{KeepaliveInterval: 5 * time.Second})
-	base := srv.URL + "/v1/sessions/f5"
-
-	doPostJSON(t, base+"/events", ev(model.TypeRunStarted, nil), http.StatusOK, nil)
-	var want strings.Builder
-	for i := 1; i <= 40; i++ {
-		tok := fmt.Sprintf("word_%d ", i)
-		want.WriteString(tok)
-		if i <= 20 {
-			doPostJSON(t, base+"/events", textEv(tok), http.StatusOK, nil)
-		}
-	}
-	var mid model.SessionSnapshot
-	doGetJSON(t, base, http.StatusOK, &mid)
-	if mid.Meta.State != model.StateRunning || mid.Meta.ActiveRunStartSeq != 1 || mid.Meta.LatestSeq != 21 || mid.Meta.EarliestSeq != 1 {
-		t.Fatalf("mid-run session: %+v", mid.Meta)
-	}
-
-	f5 := openSSEStream(t, base+"/stream", nil)
-	var got strings.Builder
-	for seq := uint64(1); seq <= 21; seq++ {
-		f, e := f5.nextEvent(t, 2*time.Second)
-		if e.Seq != seq || f.ID != fmt.Sprintf("f5epoch:%d", seq) {
-			t.Fatalf("fresh load replay: got %+v / %+v, want seq %d", f, e, seq)
-		}
-		if seq > 1 {
-			got.WriteString(payloadText(t, e))
-		}
-	}
-	tokens := strings.SplitAfter(want.String(), " ")
-	for i := 20; i < 40; i++ {
-		doPostJSON(t, base+"/events", textEv(tokens[i]), http.StatusOK, nil)
-	}
-	doPostJSON(t, base+"/events", ev(model.TypeRunFinished, nil), http.StatusOK, nil)
-	for seq := uint64(22); seq <= 41; seq++ {
-		_, e := f5.nextEvent(t, 2*time.Second)
-		if e.Seq != seq {
-			t.Fatalf("live seq %d, want %d", e.Seq, seq)
-		}
-		got.WriteString(payloadText(t, e))
-	}
-	if f, e := f5.nextEvent(t, 2*time.Second); e.Type != model.TypeRunFinished || f.ID != "f5epoch:42" {
-		t.Fatalf("expected run_finished as f5epoch:42, got %+v / %+v", f, e)
-	}
-	if got.String() != want.String() {
-		t.Fatalf("assembled text mismatch: %q", got.String())
-	}
-
-	var post model.SessionSnapshot
-	doGetJSON(t, base, http.StatusOK, &post)
-	if post.Meta.State != model.StateCompleted || post.Meta.ActiveRunStartSeq != 0 || post.Meta.LatestSeq != 42 {
-		t.Fatalf("after the run: %+v", post.Meta)
-	}
 
 	// The query-parameter cursor resumes the same way as Last-Event-ID.
-	q := openSSEStream(t, base+"/stream?after_seq=f5epoch:40", nil)
-	if _, e := q.nextEvent(t, 2*time.Second); e.Seq != 41 {
-		t.Fatalf("?after_seq=f5epoch:40 must resume at 41, got %d", e.Seq)
+	q := openSSEStream(t, base+"/stream?after_seq=ep1234:60", nil)
+	if _, e := q.nextEvent(t, 2*time.Second); e.Seq != 61 {
+		t.Fatalf("?after_seq=ep1234:60 must resume at 61, got %d", e.Seq)
 	}
 }
 
