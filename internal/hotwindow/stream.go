@@ -1,6 +1,7 @@
 package hotwindow
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/model"
@@ -40,77 +41,69 @@ type stream struct {
 	touchedAt   time.Time
 }
 
-func (s *stream) info(sessionID string) StreamInfo {
+func (s *stream) info(sessionID string) model.SessionMeta {
 	earliest := s.top + 1
 	if len(s.events) > 0 {
 		earliest = s.events[0].Seq
 	}
-	return StreamInfo{
+	return model.SessionMeta{
 		SessionID:         sessionID,
 		Epoch:             s.epoch,
 		EarliestSeq:       earliest,
 		LatestSeq:         s.top,
 		ActiveRunStartSeq: s.pin,
 		State:             s.state,
-		RetainedBytes:     s.bytes,
-		ActiveRunBytes:    s.activeBytes,
 		CreatedAt:         s.createdAt,
 		UpdatedAt:         s.updatedAt,
 	}
 }
 
-// validTransition allows a run to start only from "no run" (at this event's seq) and to end
-// only from the current run.
-func (s *stream) validTransition(next, seq uint64) bool {
-	if s.pin == 0 {
-		return next == 0 || next == seq
+// nextRun is the run state machine: only run_started while no run is active opens a run (at
+// seq), a terminal event ends the active run, and every other event leaves the run as is.
+func (s *stream) nextRun(eventType string, seq uint64) (uint64, model.SessionState) {
+	running := s.pin != 0
+	if eventType == model.TypeRunStarted && !running {
+		return seq, model.StateRunning
 	}
-	return next == 0 || next == s.pin
+	if terminal, ok := model.TerminalState(eventType); ok && running {
+		return 0, terminal
+	}
+	return s.pin, s.state
 }
 
-// activeBytesAfter is the active run's retained size once c is appended (0 when c leaves no run).
-func (s *stream) activeBytesAfter(c Commit) int64 {
+// activeBytesAfter is the active run's retained size once ev is appended with run pin (0 when ev
+// leaves no run, so a terminal event is never rejected by the active-run quota).
+func (s *stream) activeBytesAfter(ev model.Event, pin uint64) int64 {
 	switch {
-	case c.ActiveRunStartSeq == 0:
+	case pin == 0:
 		return 0
-	case c.ActiveRunStartSeq == s.pin:
-		return s.activeBytes + eventSize(c.Event)
+	case pin == s.pin:
+		return s.activeBytes + eventSize(ev)
 	default:
-		return eventSize(c.Event)
+		return eventSize(ev)
 	}
 }
 
-// check validates c without changing anything. A terminal event (ActiveRunStartSeq 0) is never
-// rejected by the active-run quota, so a run can always end.
-func (s *stream) check(c Commit, r Retention) error {
-	switch {
-	case c.Event.Epoch != s.epoch:
-		return ErrEpochMismatch
-	case c.Event.Seq != s.top+1:
-		return ErrNonMonotonicSeq
-	case !s.validTransition(c.ActiveRunStartSeq, c.Event.Seq):
-		return ErrInvalidRunTransition
-	case s.activeBytesAfter(c) > r.MaxActiveRunBytes:
-		return ErrActiveRunQuotaExceeded
-	default:
-		return nil
+// appendEvent commits the next event with the run bookkeeping it implies. It changes nothing
+// when the active-run quota rejects the event.
+func (s *stream) appendEvent(eventType string, payload json.RawMessage, now time.Time, r Retention) (model.Event, error) {
+	ev := model.Event{Seq: s.top + 1, Epoch: s.epoch, Type: eventType, Payload: payload, CreatedAt: now}
+	pin, state := s.nextRun(eventType, ev.Seq)
+	active := s.activeBytesAfter(ev, pin)
+	if active > r.MaxActiveRunBytes {
+		return model.Event{}, ErrActiveRunQuotaExceeded
 	}
-}
-
-// apply appends a checked commit and moves the run bookkeeping.
-func (s *stream) apply(c Commit) {
-	ev := cloneEvent(c.Event)
-	active := s.activeBytesAfter(c)
-	if s.pin != 0 && c.ActiveRunStartSeq == 0 {
-		s.lastRun = finishedRun{start: s.pin, end: ev.Seq, endedAt: ev.CreatedAt}
+	if payload != nil {
+		ev.Payload = append(json.RawMessage(nil), payload...)
+	}
+	if s.pin != 0 && pin == 0 {
+		s.lastRun = finishedRun{start: s.pin, end: ev.Seq, endedAt: now}
 	}
 	s.events = append(s.events, ev)
 	s.bytes += eventSize(ev)
 	s.activeBytes = active
-	s.pin = c.ActiveRunStartSeq
-	s.top = ev.Seq
-	s.state = c.State
-	s.updatedAt = ev.CreatedAt
+	s.pin, s.state, s.top, s.updatedAt = pin, state, ev.Seq, now
+	return ev, nil
 }
 
 // evict drops the oldest evictable events. It stops at the first event it must keep, so the

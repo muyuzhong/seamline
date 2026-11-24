@@ -10,17 +10,16 @@ import (
 )
 
 type subState struct {
-	liveCh     chan model.Delivery
-	cancelCh   chan struct{}
-	cancelOnce sync.Once
-	evictedCh  chan struct{}
-	errMu      sync.Mutex
-	err        error
+	liveCh   chan model.Delivery
+	stopCh   chan struct{} // closed when the subscription ends for any reason but ctx
+	stopOnce sync.Once
+	errMu    sync.Mutex
+	err      error
 }
 
 func (s *subState) cancel() {
-	s.cancelOnce.Do(func() {
-		close(s.cancelCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
 	})
 }
 
@@ -49,7 +48,6 @@ type sessionActor struct {
 	epoch             string
 	latestSeq         uint64
 	activeRunStartSeq uint64
-	state             model.SessionState
 	runActiveAt       time.Time // last publish into the active run (ActiveRunIdleTimeout)
 	idempotent        *windowIndex[uint64]
 	subscribers       map[*subState]struct{}
@@ -78,7 +76,7 @@ func (a *sessionActor) fanOutLocked(d model.Delivery) {
 			delete(a.subscribers, sub)
 			sub.setErr(ErrSlowSubscriber)
 			close(sub.liveCh)
-			close(sub.evictedCh)
+			sub.cancel()
 		}
 	}
 }
@@ -90,6 +88,7 @@ func (a *sessionActor) closeSubscribersWithErr(err error) {
 		delete(a.subscribers, sub)
 		sub.setErr(err)
 		close(sub.liveCh)
+		sub.cancel()
 	}
 }
 
@@ -141,7 +140,6 @@ func (b *Broker) acquireActor(ctx context.Context, sessionID string) (*sessionAc
 		epoch:             info.Epoch,
 		latestSeq:         info.LatestSeq,
 		activeRunStartSeq: info.ActiveRunStartSeq,
-		state:             info.State,
 		runActiveAt:       time.Now(),
 		idempotent:        newWindowIndex[uint64](b.cfg.IdempotencyWindow),
 		subscribers:       make(map[*subState]struct{}),
