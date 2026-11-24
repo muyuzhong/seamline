@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/broker"
+	"github.com/muyuzhong/seamline/internal/hotwindow"
 	"github.com/muyuzhong/seamline/internal/server"
-	"github.com/muyuzhong/seamline/internal/storage"
 )
 
 func main() {
@@ -30,7 +30,7 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	store := storage.NewMemoryStorage()
+	store := hotwindow.NewMemoryStorage()
 	brk := broker.New(store, broker.Config{
 		SubscriberBufferSize: *subBuffer,
 		IdleSessionTTL:       *idleTTL,
@@ -54,7 +54,7 @@ func main() {
 	go func() {
 		logger.Info("seamline server listening",
 			"addr", *addr,
-			"epoch", brk.Epoch(),
+			"instance_id", brk.InstanceID(),
 			"demo", *demo,
 			"sub_buffer", *subBuffer,
 			"idle_ttl", idleTTL.String(),

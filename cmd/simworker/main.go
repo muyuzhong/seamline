@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -23,79 +20,56 @@ import (
 	"github.com/muyuzhong/seamline/internal/model"
 )
 
-const defaultSimText = "Seamline streams ephemeral token deltas at memory speed while compacting finalized AI turns into a single durable record. Disconnect mid-stream or hit F5 in your browser: Last-Event-ID plus inflight_snapshot recovers the exact generation state without losing or duplicating a single character."
+const defaultSimText = "Seamline gives every event the next monotonic cursor <epoch>:<seq> and pins the active run, so a disconnect or an F5 in the middle of a long answer resumes exactly at the next event."
 
 var errInterrupted = errors.New("interrupted")
+
+type simConfig struct {
+	base    string
+	session string
+	runID   string
+	prompt  string
+	text    string
+	tools   int
+	delay   time.Duration
+}
 
 func main() {
 	var (
 		serverURL = flag.String("server", "http://localhost:8080", "Seamline base URL")
 		sessionID = flag.String("session", "demo-1", "target session ID")
-		delay     = flag.Duration("delay", 30*time.Millisecond, "delay between streamed token deltas")
-		text      = flag.String("text", defaultSimText, "assistant text to stream as token deltas")
-		prompt    = flag.String("prompt", "Simulate a resumable AI assistant stream.", "initial user message prompt")
-		streamID  = flag.String("stream-id", "", "explicit stream ID (auto-generated if empty)")
+		delay     = flag.Duration("delay", 30*time.Millisecond, "delay between streamed rounds of events")
+		text      = flag.String("text", defaultSimText, "assistant text to stream as assistant_delta events")
+		prompt    = flag.String("prompt", "Simulate a resumable AI assistant run.", "user_message content")
+		runID     = flag.String("run-id", "", "run ID used in event payloads (auto-generated if empty)")
+		tools     = flag.Int("tools", 0, "number of parallel tool calls whose JSON arguments stream interleaved with the text")
 	)
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
-	base := strings.TrimRight(strings.TrimSpace(*serverURL), "/")
-	sess := strings.TrimSpace(*sessionID)
-	if sess == "" {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := simConfig{
+		base:    strings.TrimRight(strings.TrimSpace(*serverURL), "/"),
+		session: strings.TrimSpace(*sessionID),
+		runID:   defaultString(strings.TrimSpace(*runID), newRunID()),
+		prompt:  *prompt,
+		text:    defaultString(*text, defaultSimText),
+		tools:   max(*tools, 0),
+		delay:   *delay,
+	}
+	if cfg.session == "" {
 		logger.Error("session ID must not be empty")
 		os.Exit(1)
 	}
 
-	sid := defaultString(strings.TrimSpace(*streamID), newStreamID())
-	chunks := chunkText(defaultString(*text, defaultSimText))
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	if err := createSession(ctx, client, base, sess); err != nil {
-		logger.Error("failed to initialize session", "error", err)
-		os.Exit(1)
-	}
-
-	userRes, err := publishUserPrompt(ctx, client, base, sess, *prompt)
+	last, err := runSimulation(ctx, cfg, logger)
 	if err != nil {
-		logger.Error("failed to publish user prompt record", "error", err)
+		logger.Error("simulation failed", "run_id", cfg.runID, "error", err)
 		os.Exit(1)
 	}
-	logger.Info("published user message record",
-		"session", sess,
-		"committed_offset", userRes.CommittedOffset,
-		"epoch", userRes.Epoch,
-	)
-
-	logger.Info("streaming assistant deltas",
-		"session", sess,
-		"stream_id", sid,
-		"chunks", len(chunks),
-		"delay", delay.String(),
-	)
-
-	finalRes, sent, err := streamAssistantChunks(ctx, client, base, sess, sid, chunks, *delay)
-	if err != nil {
-		if errors.Is(err, errInterrupted) {
-			logger.Warn("simworker interrupted mid-stream", "sent_chunks", sent)
-			os.Exit(130)
-		}
-		logger.Error("failed to publish delta", "seq", sent+1, "error", err)
-		os.Exit(1)
-	}
-
-	logger.Info("stream completed and compacted",
-		"session", sess,
-		"stream_id", sid,
-		"coalesced_chunks", len(chunks),
-		"committed_offset", finalRes.CommittedOffset,
-		"epoch", finalRes.Epoch,
-	)
+	logger.Info("run finished", "run_id", cfg.runID, "seamline_cursor", fmt.Sprintf("%s:%d", last.Epoch, last.Seq))
 }
 
 func defaultString(val, fallback string) string {
@@ -105,51 +79,86 @@ func defaultString(val, fallback string) string {
 	return val
 }
 
-func publishUserPrompt(ctx context.Context, client *http.Client, base, sessionID, prompt string) (model.PublishResult, error) {
-	userPayload, _ := json.Marshal(map[string]string{
-		"role":    "user",
-		"content": prompt,
-	})
-	return publishEvent(ctx, client, base, sessionID, model.PublishRequest{
-		Type:    "user_message",
-		Payload: userPayload,
-	})
+func newRunID() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("run_%d", time.Now().UnixNano())
+	}
+	return "run_" + hex.EncodeToString(b[:])
 }
 
-func streamAssistantChunks(
-	ctx context.Context,
-	client *http.Client,
-	base, sessionID, streamID string,
-	chunks []string,
-	delay time.Duration,
-) (model.PublishResult, int, error) {
-	var finalRes model.PublishResult
-	for i, delta := range chunks {
-		if i > 0 && !sleepWithContext(ctx, delay) {
-			return model.PublishResult{}, i, errInterrupted
-		}
-		res, err := publishEvent(ctx, client, base, sessionID, model.PublishRequest{
-			StreamID: streamID,
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    delta,
-			Fin:      i == len(chunks)-1,
-		})
-		if err != nil {
-			return model.PublishResult{}, i, err
-		}
-		finalRes = res
+// runSimulation publishes one run: run_started, the user message, interleaved assistant_delta and
+// tool_call_delta events, and run_finished. On failure it ends the run with run_failed or
+// run_interrupted so the session does not wait for the idle timeout.
+func runSimulation(ctx context.Context, cfg simConfig, logger *slog.Logger) (model.PublishResult, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	pub := &publisher{client: client, endpoint: eventsURL(cfg.base, cfg.session), runID: cfg.runID}
+
+	if _, err := pub.publish(ctx, model.TypeRunStarted, map[string]string{"run_id": cfg.runID}); err != nil {
+		return model.PublishResult{}, err
 	}
-	return finalRes, len(chunks), nil
+	if _, err := pub.publish(ctx, "user_message", map[string]string{"role": "user", "content": cfg.prompt}); err != nil {
+		return model.PublishResult{}, pub.abort(err)
+	}
+	chunks, toolArgs := chunkText(cfg.text), buildToolArgs(cfg.tools)
+	logger.Info("streaming run", "run_id", cfg.runID, "text_chunks", len(chunks), "tools", len(toolArgs), "delay", cfg.delay.String())
+	if err := streamRun(ctx, pub, chunks, toolArgs, cfg.delay); err != nil {
+		return model.PublishResult{}, pub.abort(err)
+	}
+	return pub.publish(ctx, model.TypeRunFinished, map[string]string{"run_id": cfg.runID})
+}
+
+func streamRun(ctx context.Context, pub *publisher, chunks []string, toolArgs [][]string, delay time.Duration) error {
+	rounds := len(chunks)
+	for _, parts := range toolArgs {
+		rounds = max(rounds, len(parts))
+	}
+	for i := 0; i < rounds; i++ {
+		if i > 0 && !sleepWithContext(ctx, delay) {
+			return errInterrupted
+		}
+		if err := publishRound(ctx, pub, i, chunks, toolArgs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishRound publishes the i-th text chunk and the i-th argument chunk of every tool call, so
+// several logical streams interleave inside the single event sequence.
+func publishRound(ctx context.Context, pub *publisher, i int, chunks []string, toolArgs [][]string) error {
+	if i < len(chunks) {
+		if _, err := pub.publish(ctx, "assistant_delta", map[string]string{"text": chunks[i]}); err != nil {
+			return err
+		}
+	}
+	for t, parts := range toolArgs {
+		if i >= len(parts) {
+			continue
+		}
+		payload := map[string]string{"call_id": fmt.Sprintf("call_%d", t+1), "name": "search", "args_delta": parts[i]}
+		if _, err := pub.publish(ctx, "tool_call_delta", payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildToolArgs(n int) [][]string {
+	out := make([][]string, n)
+	for t := range out {
+		args := fmt.Sprintf(`{"query":"seamline resume test %d","limit":%d}`, t+1, 5+t)
+		out[t] = chunkFixedRunes([]rune(args), 6)
+	}
+	return out
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
-		return true
+		return ctx.Err() == nil
 	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-
 	select {
 	case <-ctx.Done():
 		return false
@@ -158,60 +167,8 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func createSession(ctx context.Context, client *http.Client, base, sessionID string) error {
-	payload, _ := json.Marshal(map[string]string{"session_id": sessionID})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/sessions", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST /v1/sessions status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return nil
-}
-
-func publishEvent(ctx context.Context, client *http.Client, base, sessionID string, pub model.PublishRequest) (model.PublishResult, error) {
-	body, err := json.Marshal(pub)
-	if err != nil {
-		return model.PublishResult{}, err
-	}
-
-	endpoint := fmt.Sprintf("%s/v1/sessions/%s/events", base, url.PathEscape(sessionID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return model.PublishResult{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return model.PublishResult{}, err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		return model.PublishResult{}, fmt.Errorf("POST %s status %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-
-	var res model.PublishResult
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return model.PublishResult{}, err
-	}
-	return res, nil
+func eventsURL(base, sessionID string) string {
+	return fmt.Sprintf("%s/v1/sessions/%s/events", base, url.PathEscape(sessionID))
 }
 
 func chunkText(text string) []string {
@@ -256,12 +213,4 @@ func shouldFlushSimChunk(runes []rune, idx, curLen, maxBytes int) bool {
 		return idx+1 < len(runes) && !unicode.IsSpace(runes[idx+1])
 	}
 	return curLen >= maxBytes
-}
-
-func newStreamID() string {
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("sim_%d", time.Now().UnixNano())
-	}
-	return "sim_" + hex.EncodeToString(b[:])
 }

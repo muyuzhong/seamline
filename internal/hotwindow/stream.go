@@ -41,12 +41,12 @@ type stream struct {
 	touchedAt   time.Time
 }
 
-func (s *stream) info(sessionID string) StreamInfo {
+func (s *stream) info(sessionID string) model.SessionMeta {
 	earliest := s.top + 1
 	if len(s.events) > 0 {
 		earliest = s.events[0].Seq
 	}
-	return StreamInfo{
+	return model.SessionMeta{
 		SessionID:         sessionID,
 		Epoch:             s.epoch,
 		EarliestSeq:       earliest,

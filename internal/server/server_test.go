@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/muyuzhong/seamline/internal/broker"
+	"github.com/muyuzhong/seamline/internal/hotwindow"
 	"github.com/muyuzhong/seamline/internal/model"
 	"github.com/muyuzhong/seamline/internal/server"
-	"github.com/muyuzhong/seamline/internal/storage"
 )
 
 type sseFrame struct {
@@ -158,7 +158,7 @@ func (c *sseClient) nextFrame(t *testing.T, timeout time.Duration) sseFrame {
 	}
 }
 
-func (c *sseClient) nextEvent(t *testing.T, timeout time.Duration) (sseFrame, model.OutEvent) {
+func (c *sseClient) nextEvent(t *testing.T, timeout time.Duration) (sseFrame, model.Event) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
@@ -171,17 +171,21 @@ func (c *sseClient) nextEvent(t *testing.T, timeout time.Duration) (sseFrame, mo
 			// Comment frame (: connected or : keepalive)
 			continue
 		}
-		var ev model.OutEvent
+		if f.Event != "" {
+			t.Fatalf("expected a business event frame, got event: %s (%s)", f.Event, f.Data)
+		}
+		var ev model.Event
 		if err := json.Unmarshal([]byte(f.Data), &ev); err != nil {
-			t.Fatalf("unmarshal OutEvent (%q): %v", f.Data, err)
+			t.Fatalf("unmarshal Event (%q): %v", f.Data, err)
 		}
 		return f, ev
 	}
 }
 
-func newTestEnv(t *testing.T, bCfg broker.Config, sCfg server.Config) (*broker.Broker, *httptest.Server) {
+// newTestEnv starts a server whose session streams all get the given epoch.
+func newTestEnv(t *testing.T, epoch string, bCfg broker.Config, sCfg server.Config, opts ...hotwindow.Option) (*broker.Broker, *httptest.Server) {
 	t.Helper()
-	store := storage.NewMemoryStorage()
+	store := hotwindow.NewMemoryStorage(append([]hotwindow.Option{hotwindow.WithEpochSource(func() string { return epoch })}, opts...)...)
 	brk := broker.New(store, bCfg)
 	srv := httptest.NewServer(server.NewHandler(brk, sCfg))
 	t.Cleanup(func() {
@@ -260,264 +264,132 @@ func doGetJSON(t *testing.T, url string, wantStatus int, dst any) {
 	}
 }
 
-func extractPayloadContent(t *testing.T, raw json.RawMessage) string {
+func doPostRaw(t *testing.T, url, body string, wantStatus int) map[string]string {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	var out map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("POST %s status=%d (want %d): %v", url, resp.StatusCode, wantStatus, out)
+	}
+	return out
+}
+
+func ev(eventType string, payload any) model.PublishRequest {
+	req := model.PublishRequest{Type: eventType}
+	if payload != nil {
+		raw, _ := json.Marshal(payload)
+		req.Payload = raw
+	}
+	return req
+}
+
+func textEv(s string) model.PublishRequest {
+	return ev("assistant_delta", map[string]string{"text": s})
+}
+
+func payloadText(t *testing.T, e model.Event) string {
 	t.Helper()
 	var p struct {
-		Content string `json:"content"`
+		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(raw, &p); err != nil {
-		t.Fatalf("unmarshal payload content (%s): %v", string(raw), err)
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		t.Fatalf("unmarshal payload (%s): %v", e.Payload, err)
 	}
-	return p.Content
+	return p.Text
 }
 
 func TestMidStreamDisconnectAndReconnectWithLastEventID(t *testing.T) {
-	brk, srv := newTestEnv(t, broker.Config{Epoch: "ep1234"}, server.Config{
-		KeepaliveInterval: 5 * time.Second,
-		EnableDemo:        true,
-	})
+	_, srv := newTestEnv(t, "ep1234", broker.Config{}, server.Config{KeepaliveInterval: 5 * time.Second})
+	base := srv.URL + "/v1/sessions/resume-sess"
 
-	sessionID := "resume-sess"
-
-	// 1. Publish an initial user message record (Committed Offset = 1).
-	var pubRes model.PublishResult
-	doPostJSON(t, srv.URL+"/v1/sessions/"+sessionID+"/events", model.PublishRequest{
-		Type:  "user_message",
-		Delta: "Tell me about resumable SSE streams.",
-	}, http.StatusOK, &pubRes)
-	if pubRes.CommittedOffset != 1 {
-		t.Fatalf("expected CommittedOffset=1, got %d", pubRes.CommittedOffset)
+	var res model.PublishResult
+	doPostJSON(t, base+"/events", ev(model.TypeRunStarted, nil), http.StatusOK, &res)
+	if res.Seq != 1 || res.Epoch != "ep1234" {
+		t.Fatalf("unexpected publish result %+v", res)
 	}
+	doPostJSON(t, base+"/events", ev("user_message", map[string]string{"role": "user", "content": "hi"}), http.StatusOK, nil)
 
-	// 2. Connect Client 1 from offset 0.
-	c1 := openSSEStream(t, srv.URL+"/v1/sessions/"+sessionID+"/stream", nil)
+	c1 := openSSEStream(t, base+"/stream", nil)
 	if c1.corsOrigin != "*" {
 		t.Fatalf("expected CORS header *, got %q", c1.corsOrigin)
 	}
-
-	connFrame := c1.nextFrame(t, 2*time.Second)
-	if !strings.Contains(connFrame.Comment, "connected epoch=ep1234") {
-		t.Fatalf("expected connected epoch comment, got %+v", connFrame)
+	if f := c1.nextFrame(t, 2*time.Second); !strings.Contains(f.Comment, "connected epoch=ep1234") {
+		t.Fatalf("expected connected comment, got %+v", f)
+	}
+	for seq := uint64(1); seq <= 2; seq++ {
+		if f, e := c1.nextEvent(t, 2*time.Second); f.ID != fmt.Sprintf("ep1234:%d", seq) || e.Seq != seq {
+			t.Fatalf("frame %d: %+v / %+v", seq, f, e)
+		}
 	}
 
-	rec1Frame, rec1Ev := c1.nextEvent(t, 2*time.Second)
-	if rec1Frame.Event != "record" || rec1Frame.ID != "ep1234:1" || rec1Ev.Offset != 1 {
-		t.Fatalf("unexpected initial record frame: %+v / %+v", rec1Frame, rec1Ev)
-	}
-	savedLastEventID := rec1Frame.ID
-
-	// Build a 60-chunk message.
-	const totalChunks = 60
-	chunks := make([]string, totalChunks)
-	var fullBuilder strings.Builder
-	for i := 0; i < totalChunks; i++ {
+	const total = 60
+	chunks := make([]string, total)
+	for i := range chunks {
 		chunks[i] = fmt.Sprintf("[tok-%02d]", i+1)
-		fullBuilder.WriteString(chunks[i])
 	}
-	expectedFullText := fullBuilder.String()
-
-	// 3. Publish chunks 1..15 while Client 1 is connected.
 	for i := 0; i < 15; i++ {
-		doPostJSON(t, srv.URL+"/v1/sessions/"+sessionID+"/events", model.PublishRequest{
-			StreamID: "turn-1",
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    chunks[i],
-			Fin:      false,
-		}, http.StatusOK, nil)
+		doPostJSON(t, base+"/events", textEv(chunks[i]), http.StatusOK, nil)
 	}
-
-	var c1Partial strings.Builder
+	var text strings.Builder
+	var lastID string
 	for i := 0; i < 15; i++ {
-		f, ev := c1.nextEvent(t, 2*time.Second)
-		if f.Event != "delta" {
-			t.Fatalf("expected delta event, got %s", f.Event)
+		f, e := c1.nextEvent(t, 2*time.Second)
+		if f.ID != fmt.Sprintf("ep1234:%d", e.Seq) || e.Seq != uint64(3+i) {
+			t.Fatalf("every event frame must carry id <epoch>:<seq>: %+v / %+v", f, e)
 		}
-		if f.ID != "" {
-			t.Fatalf("ephemeral delta frame MUST NOT set SSE id header, got %q", f.ID)
-		}
-		c1Partial.WriteString(ev.Delta)
+		text.WriteString(payloadText(t, e))
+		lastID = f.ID
 	}
-	if c1Partial.String() != strings.Join(chunks[:15], "") {
-		t.Fatalf("client 1 partial mismatch: %q", c1Partial.String())
-	}
-
-	// 4. Disconnect Client 1 mid-stream!
 	c1.Close()
 
-	// 5. While Client 1 is offline, publish chunks 16..38 on the server.
+	// While the client is away, more events are published.
 	for i := 15; i < 38; i++ {
-		doPostJSON(t, srv.URL+"/v1/sessions/"+sessionID+"/events", model.PublishRequest{
-			StreamID: "turn-1",
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    chunks[i],
-			Fin:      false,
-		}, http.StatusOK, nil)
+		doPostJSON(t, base+"/events", textEv(chunks[i]), http.StatusOK, nil)
 	}
-
-	// 6. Reconnect as Client 2 passing Last-Event-ID: ep1234:1!
-	c2 := openSSEStream(t, srv.URL+"/v1/sessions/"+sessionID+"/stream", map[string]string{
-		"Last-Event-ID": savedLastEventID,
-	})
-
-	// Client 2 must NOT re-receive Record #1; its very first event must be inflight_snapshot at seq=38!
-	snapFrame, snapEv := c2.nextEvent(t, 2*time.Second)
-	if snapFrame.Event != "inflight_snapshot" {
-		t.Fatalf("expected inflight_snapshot first after Last-Event-ID, got %q (%+v)", snapFrame.Event, snapEv)
+	c2 := openSSEStream(t, base+"/stream", map[string]string{"Last-Event-ID": lastID})
+	for i := 38; i < total; i++ {
+		doPostJSON(t, base+"/events", textEv(chunks[i]), http.StatusOK, nil)
 	}
-	if snapEv.Seq != 38 || snapEv.Delta != strings.Join(chunks[:38], "") {
-		t.Fatalf("unexpected snapshot: seq=%d (want 38), delta=%q", snapEv.Seq, snapEv.Delta)
-	}
+	doPostJSON(t, base+"/events", ev(model.TypeRunFinished, nil), http.StatusOK, nil)
 
-	var reconstructed strings.Builder
-	reconstructed.WriteString(snapEv.Delta)
-
-	// 7. Publish remaining chunks 39..60 (chunk 60 has Fin=true).
-	for i := 38; i < totalChunks; i++ {
-		doPostJSON(t, srv.URL+"/v1/sessions/"+sessionID+"/events", model.PublishRequest{
-			StreamID: "turn-1",
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    chunks[i],
-			Fin:      i == totalChunks-1,
-		}, http.StatusOK, nil)
-	}
-
-	// Read remaining 22 deltas (39..60) + 1 finalized compacted record!
-	for i := 38; i < totalChunks; i++ {
-		f, ev := c2.nextEvent(t, 2*time.Second)
-		if f.Event != "delta" {
-			t.Fatalf("expected delta at seq %d, got %q", i+1, f.Event)
+	// The reconnect resumes exactly at the next seq and sees every later event once.
+	for seq := uint64(18); seq <= 63; seq++ {
+		f, e := c2.nextEvent(t, 2*time.Second)
+		if e.Seq != seq || f.ID != fmt.Sprintf("ep1234:%d", seq) {
+			t.Fatalf("resumed stream: got seq %d (id %q), want %d", e.Seq, f.ID, seq)
 		}
-		if ev.Seq != uint64(i+1) {
-			t.Fatalf("expected seq %d, got %d", i+1, ev.Seq)
+		if e.Type == "assistant_delta" {
+			text.WriteString(payloadText(t, e))
 		}
-		reconstructed.WriteString(ev.Delta)
-	}
-
-	compactedFrame, compactedEv := c2.nextEvent(t, 2*time.Second)
-	if compactedFrame.Event != "record" {
-		t.Fatalf("expected finalized record frame, got %q", compactedFrame.Event)
-	}
-	if compactedFrame.ID != fmt.Sprintf("%s:2", brk.Epoch()) {
-		t.Fatalf("expected SSE id=%s:2, got %q", brk.Epoch(), compactedFrame.ID)
-	}
-	if compactedEv.Offset != 2 || compactedEv.StreamID != "turn-1" {
-		t.Fatalf("unexpected compacted record metadata: %+v", compactedEv)
-	}
-
-	if reconstructed.String() != expectedFullText {
-		t.Fatalf("reconstructed text from snapshot+deltas mismatch:\ngot:  %q\nwant: %q", reconstructed.String(), expectedFullText)
-	}
-	if gotPayload := extractPayloadContent(t, compactedEv.Payload); gotPayload != expectedFullText {
-		t.Fatalf("compacted record payload mismatch:\ngot:  %q\nwant: %q", gotPayload, expectedFullText)
-	}
-}
-
-func TestFullPageReloadMidStreamAndCompactionInspect(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "f5epoch"}, server.Config{
-		KeepaliveInterval: 5 * time.Second,
-	})
-
-	sessionID := "f5-reload-sess"
-	const totalChunks = 40
-	var expected strings.Builder
-	chunks := make([]string, totalChunks)
-	for i := 0; i < totalChunks; i++ {
-		chunks[i] = fmt.Sprintf("word_%d ", i+1)
-		expected.WriteString(chunks[i])
-	}
-
-	// Stream chunks 1..20 before any browser tab connects (or simulating F5 reload from after_offset=0).
-	for i := 0; i < 20; i++ {
-		doPostJSON(t, srv.URL+"/v1/sessions/"+sessionID+"/events", model.PublishRequest{
-			StreamID: "msg-f5",
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    chunks[i],
-			Fin:      false,
-		}, http.StatusOK, nil)
-	}
-
-	// Inspect mid-stream: LastOffset must still be 0 while InFlight holds 20 coalesced chunks.
-	var midSnap model.SessionSnapshot
-	doGetJSON(t, srv.URL+"/v1/sessions/"+sessionID, http.StatusOK, &midSnap)
-
-	if midSnap.Meta.LastOffset != 0 {
-		t.Fatalf("expected LastOffset=0 mid-stream, got %d", midSnap.Meta.LastOffset)
-	}
-	if midSnap.Meta.State != model.StateRunning {
-		t.Fatalf("expected StateRunning mid-stream, got %q", midSnap.Meta.State)
-	}
-	if midSnap.InFlight == nil || midSnap.InFlight.LastSeq != 20 {
-		t.Fatalf("expected InFlight.LastSeq=20, got %+v", midSnap.InFlight)
-	}
-
-	// Connect F5 browser client with ?after_offset=0.
-	f5Client := openSSEStream(t, srv.URL+"/v1/sessions/"+sessionID+"/stream?after_offset=0", nil)
-	snapFrame, snapEv := f5Client.nextEvent(t, 2*time.Second)
-	if snapFrame.Event != "inflight_snapshot" || snapEv.Seq != 20 {
-		t.Fatalf("expected inflight_snapshot at seq=20, got %s seq=%d", snapFrame.Event, snapEv.Seq)
-	}
-
-	var assembled strings.Builder
-	assembled.WriteString(snapEv.Delta)
-
-	// Publish remaining chunks 21..40 with Fin=true on chunk 40.
-	for i := 20; i < totalChunks; i++ {
-		doPostJSON(t, srv.URL+"/v1/sessions/"+sessionID+"/events", model.PublishRequest{
-			StreamID: "msg-f5",
-			Seq:      uint64(i + 1),
-			Type:     "assistant_message",
-			Delta:    chunks[i],
-			Fin:      i == totalChunks-1,
-		}, http.StatusOK, nil)
-	}
-
-	for i := 20; i < totalChunks; i++ {
-		f, ev := f5Client.nextEvent(t, 2*time.Second)
-		if f.Event != "delta" {
-			t.Fatalf("expected delta, got %s", f.Event)
+		if seq == 63 && e.Type != model.TypeRunFinished {
+			t.Fatalf("last event must be run_finished, got %s", e.Type)
 		}
-		assembled.WriteString(ev.Delta)
+	}
+	if text.String() != strings.Join(chunks, "") {
+		t.Fatalf("reconstructed text mismatch:\n got %q\nwant %q", text.String(), strings.Join(chunks, ""))
 	}
 
-	recFrame, recEv := f5Client.nextEvent(t, 2*time.Second)
-	if recFrame.Event != "record" || recFrame.ID != "f5epoch:1" || recEv.Offset != 1 {
-		t.Fatalf("expected compacted record #1, got %+v / %+v", recFrame, recEv)
-	}
-	if assembled.String() != expected.String() {
-		t.Fatalf("assembled text mismatch: got %q, want %q", assembled.String(), expected.String())
-	}
-
-	// Inspect post-compaction: 40 chunks compacted into 1 single Record, InFlight == nil!
-	var postSnap model.SessionSnapshot
-	doGetJSON(t, srv.URL+"/v1/sessions/"+sessionID, http.StatusOK, &postSnap)
-
-	if postSnap.Meta.LastOffset != 1 {
-		t.Fatalf("expected LastOffset=1 after compaction, got %d", postSnap.Meta.LastOffset)
-	}
-	if postSnap.InFlight != nil {
-		t.Fatalf("expected InFlight=nil after compaction, got %+v", postSnap.InFlight)
-	}
-	if postSnap.Meta.State != model.StateIdle {
-		t.Fatalf("expected StateIdle after compaction, got %q", postSnap.Meta.State)
+	// The query-parameter cursor resumes the same way as Last-Event-ID.
+	q := openSSEStream(t, base+"/stream?after_seq=ep1234:60", nil)
+	if _, e := q.nextEvent(t, 2*time.Second); e.Seq != 61 {
+		t.Fatalf("?after_seq=ep1234:60 must resume at 61, got %d", e.Seq)
 	}
 }
 
 func TestSSEKeepaliveHeartbeat(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "hb0001"}, server.Config{
-		KeepaliveInterval: 30 * time.Millisecond,
-	})
+	_, srv := newTestEnv(t, "hb0001", broker.Config{}, server.Config{KeepaliveInterval: 30 * time.Millisecond})
 
 	sc := openSSEStream(t, srv.URL+"/v1/sessions/idle-hb/stream", nil)
-
-	first := sc.nextFrame(t, 1*time.Second)
-	if !strings.Contains(first.Comment, "connected epoch=hb0001") {
+	if first := sc.nextFrame(t, time.Second); !strings.Contains(first.Comment, "connected epoch=hb0001") {
 		t.Fatalf("expected connected comment, got %+v", first)
 	}
-
 	keepalives := 0
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for keepalives < 2 {
@@ -525,113 +397,77 @@ func TestSSEKeepaliveHeartbeat(t *testing.T) {
 		if rem <= 0 {
 			t.Fatalf("expected at least 2 keepalive frames, got %d", keepalives)
 		}
-		f := sc.nextFrame(t, rem)
-		if f.Comment == "keepalive" {
+		if f := sc.nextFrame(t, rem); f.Comment == "keepalive" {
 			keepalives++
 		}
 	}
 }
 
 func TestErrorStatusMappingAndRESTEndpoints(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "err999"}, server.Config{
-		EnableDemo: true,
-	})
+	_, srv := newTestEnv(t, "err999", broker.Config{InstanceID: "inst-err999"}, server.Config{EnableDemo: true})
+	api := srv.URL + "/v1/sessions"
 
-	// 1. Healthz check.
-	var hBody map[string]string
-	doGetJSON(t, srv.URL+"/healthz", http.StatusOK, &hBody)
-	if hBody["status"] != "ok" || hBody["epoch"] != "err999" {
-		t.Fatalf("unexpected /healthz response: %+v", hBody)
+	var health map[string]string
+	doGetJSON(t, srv.URL+"/healthz", http.StatusOK, &health)
+	if health["status"] != "ok" || health["instance_id"] != "inst-err999" {
+		t.Fatalf("unexpected /healthz: %+v", health)
 	}
-
-	// 2. Empty session list returns [] (not null) and missing session returns 404.
-	rawList := doGet(t, srv.URL+"/v1/sessions", http.StatusOK, nil)
-	if strings.TrimSpace(rawList) != "[]" {
-		t.Fatalf("expected empty JSON array [], got %s", rawList)
+	if raw := doGet(t, api, http.StatusOK, nil); strings.TrimSpace(raw) != "[]" {
+		t.Fatalf("expected [], got %s", raw)
 	}
-
-	_ = doGet(t, srv.URL+"/v1/sessions/does-not-exist", http.StatusNotFound, nil)
-
-	// 3. POST /v1/sessions with optional empty body generates a session and returns 201.
+	var notFound map[string]string
+	doGetJSON(t, api+"/does-not-exist", http.StatusNotFound, &notFound)
+	if notFound["code"] != "not_found" {
+		t.Fatalf("404 body: %+v", notFound)
+	}
 	var created model.SessionMeta
-	doPostJSON(t, srv.URL+"/v1/sessions", nil, http.StatusCreated, &created)
-	if created.SessionID == "" {
-		t.Fatalf("expected 201 Created with generated session_id, got %+v", created)
+	doPostJSON(t, api, nil, http.StatusCreated, &created)
+	if created.SessionID == "" || created.Epoch != "err999" || created.State != model.StateIdle {
+		t.Fatalf("created session: %+v", created)
 	}
 
-	// 4. 400 Bad Request on empty atomic event (neither payload nor delta).
-	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
-		Type: "user_message",
-	}, http.StatusBadRequest, nil)
-
-	// 5. 400 Bad Request on sequence gap (starting at seq=3 instead of seq=1).
-	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
-		StreamID: "stream-a",
-		Seq:      3,
-		Type:     "assistant_message",
-		Delta:    "oops",
-	}, http.StatusBadRequest, nil)
-
-	// Start valid stream-a at seq=1.
-	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
-		StreamID: "stream-a",
-		Seq:      1,
-		Type:     "assistant_message",
-		Delta:    "hello ",
-		Fin:      false,
-	}, http.StatusOK, nil)
-
-	// Sequence gap mid-stream (seq=1 -> seq=4) -> 400 Bad Request.
-	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
-		StreamID: "stream-a",
-		Seq:      4,
-		Type:     "assistant_message",
-		Delta:    "gap",
-	}, http.StatusBadRequest, nil)
-
-	// 6. 409 Conflict when concurrent stream-b attempts to publish while stream-a is in-flight!
-	doPostJSON(t, srv.URL+"/v1/sessions/s-err/events", model.PublishRequest{
-		StreamID: "stream-b",
-		Seq:      1,
-		Type:     "assistant_message",
-		Delta:    "intruder",
-	}, http.StatusConflict, nil)
-
-	// 7. Malformed Last-Event-ID returns 400 Bad Request.
-	_ = doGet(t, srv.URL+"/v1/sessions/s-err/stream", http.StatusBadRequest, map[string]string{
-		"Last-Event-ID": "not-a-valid-cursor",
-	})
-
-	// 8. Demo Playground GET / returns XSS-safe HTML and POST /v1/demo/simulate streams & compacts cleanly.
-	idxHTML := doGet(t, srv.URL+"/", http.StatusOK, nil)
-	if !strings.Contains(idxHTML, "Seamline Live Playground") {
-		t.Fatalf("expected Playground HTML on GET /")
+	events := api + "/s-err/events"
+	codes := []struct {
+		name   string
+		body   string
+		status int
+		code   string
+	}{
+		{"missing type", `{"payload":{}}`, http.StatusBadRequest, "invalid_request"},
+		{"malformed JSON", `{"type":"x","payload":{`, http.StatusBadRequest, "invalid_request"},
 	}
-	if strings.Contains(idxHTML, "innerHTML") {
-		t.Fatalf("expected Playground HTML to avoid innerHTML assignments for DOM XSS safety")
-	}
-	if !strings.Contains(idxHTML, "stream_error") {
-		t.Fatalf("expected Playground HTML to listen for stream_error SSE event")
-	}
-	if !strings.Contains(idxHTML, "after_offset=") {
-		t.Fatalf("expected Playground HTML connectClientA to support ?after_offset= cursor fallback")
+	for _, tc := range codes {
+		if out := doPostRaw(t, events, tc.body, tc.status); out["code"] != tc.code {
+			t.Fatalf("%s: code %q, want %q (%v)", tc.name, out["code"], tc.code, out)
+		}
 	}
 
-	doPostJSON(t, srv.URL+"/v1/demo/simulate", map[string]any{
-		"session_id": "sim-test",
-		"delay_ms":   1,
-	}, http.StatusAccepted, nil)
+	_ = doGet(t, api+"/s-err/stream", http.StatusBadRequest, map[string]string{"Last-Event-ID": "not-a-valid-cursor"})
 
-	// Wait for the simulated stream (delay_ms=1) to compact into offset=2 (user record #1 + compacted assistant record #2).
+	page := doGet(t, srv.URL+"/", http.StatusOK, nil)
+	for _, want := range []string{"Seamline Live Playground", "stream_error"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("playground HTML must contain %q", want)
+		}
+	}
+	if strings.Contains(page, "innerHTML") {
+		t.Fatalf("playground HTML must not use innerHTML")
+	}
+
+	var sim struct {
+		Chunks int `json:"chunks"`
+	}
+	doPostJSON(t, srv.URL+"/v1/demo/simulate", map[string]any{"session_id": "sim-test", "delay_ms": 1}, http.StatusAccepted, &sim)
+	wantLatest := uint64(sim.Chunks + 3) // run_started + user_message + chunks + run_finished
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var snap model.SessionSnapshot
-		doGetJSON(t, srv.URL+"/v1/sessions/sim-test", http.StatusOK, &snap)
-		if snap.Meta.LastOffset == 2 && snap.InFlight == nil {
+		doGetJSON(t, api+"/sim-test", http.StatusOK, &snap)
+		if snap.Meta.State == model.StateCompleted && snap.Meta.LatestSeq == wantLatest {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for /v1/demo/simulate compaction; last snapshot=%+v", snap)
+			t.Fatalf("simulated run did not finish: %+v (want latest_seq %d)", snap.Meta, wantLatest)
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
@@ -667,77 +503,35 @@ func (w *stallResponseWriter) Flush() {
 }
 
 func TestSlowSubscriberEmitsSSEErrorFrame(t *testing.T) {
-	store := storage.NewMemoryStorage()
-	brk := broker.New(store, broker.Config{
-		SubscriberBufferSize: 2,
-		Epoch:                "slow01",
-	})
+	brk := broker.New(hotwindow.NewMemoryStorage(), broker.Config{SubscriberBufferSize: 2})
 	defer func() {
 		_ = brk.Close()
 	}()
-
 	h := server.NewHandler(brk, server.Config{KeepaliveInterval: 10 * time.Second})
 
-	rw := &stallResponseWriter{
-		header:      make(http.Header),
-		connectedCh: make(chan struct{}),
-		unblockCh:   make(chan struct{}),
-	}
-
+	rw := &stallResponseWriter{header: make(http.Header), connectedCh: make(chan struct{}), unblockCh: make(chan struct{})}
 	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/slow-sess/stream", nil)
-	doneCh := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		defer close(doneCh)
+		defer close(done)
 		h.ServeHTTP(rw, req)
 	}()
-
-	// Wait until the SSE handler has subscribed and flushed `: connected`.
 	<-rw.connectedCh
 
-	// While rw.Flush() is stalled, overflow liveCh (buffer=2) + pump buffer with deltas.
+	// While Flush is stalled, overflow liveCh (buffer 2) and the pump with events.
 	for i := 1; i <= 12; i++ {
-		_, err := brk.Publish(context.Background(), "slow-sess", model.PublishRequest{
-			StreamID: "flood-1",
-			Seq:      uint64(i),
-			Type:     "assistant_message",
-			Delta:    fmt.Sprintf("chunk-%d ", i),
-			Fin:      false,
-		})
-		if err != nil {
+		if _, err := brk.Publish(context.Background(), "slow-sess", textEv(fmt.Sprintf("chunk-%d ", i))); err != nil {
 			t.Fatalf("Publish %d: %v", i, err)
 		}
 	}
-
-	// Unblock Flush() so handleStream drains any buffered events and sees ErrSlowSubscriber.
 	close(rw.unblockCh)
-	<-doneCh
+	<-done
 
-	if rw.status != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", rw.status)
-	}
 	wire := rw.buf.String()
-	if !strings.Contains(wire, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n") {
-		t.Fatalf("expected slow_subscriber SSE stream_error frame in output, got:\n%s", wire)
+	if rw.status != http.StatusOK || !strings.Contains(wire, "event: stream_error\ndata: {\"error\":\"slow_subscriber\"}\n\n") {
+		t.Fatalf("expected slow_subscriber stream_error frame (status %d), got:\n%s", rw.status, wire)
 	}
 	if strings.Contains(wire, "event: error\n") {
-		t.Fatalf("must not emit colliding event: error frame, got:\n%s", wire)
-	}
-}
-
-func TestEpochMismatchResetsCursorToZero(t *testing.T) {
-	_, srv := newTestEnv(t, broker.Config{Epoch: "newepoch"}, server.Config{
-		KeepaliveInterval: 5 * time.Second,
-	})
-
-	doPostJSON(t, srv.URL+"/v1/sessions/ep-sess/events", model.PublishRequest{
-		Type:  "user_message",
-		Delta: "persisted across epoch check",
-	}, http.StatusOK, nil)
-
-	// Reconnect with stale epoch and high offset; broker must reset after_offset to 0 and replay offset 1.
-	sc := openSSEStream(t, srv.URL+"/v1/sessions/ep-sess/stream?after_offset=99&epoch=old_stale_epoch", nil)
-	f, ev := sc.nextEvent(t, 2*time.Second)
-	if f.Event != "record" || ev.Offset != 1 {
-		t.Fatalf("expected stale epoch cursor reset to replay offset 1, got %+v / %+v", f, ev)
+		t.Fatalf("must not emit a colliding event: error frame:\n%s", wire)
 	}
 }

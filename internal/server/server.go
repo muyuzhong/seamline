@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +18,9 @@ import (
 
 const defaultKeepaliveInterval = 15 * time.Second
 
+// maxPublishBodyBytes bounds a publish request body.
+const maxPublishBodyBytes = 4 << 20
+
 // Config configures the Seamline HTTP/SSE transport layer.
 type Config struct {
 	KeepaliveInterval time.Duration
@@ -34,7 +35,7 @@ type handler struct {
 	activeDemos map[string]struct{}
 }
 
-// NewHandler constructs an http.Handler serving the Seamline REST + Resumable SSE API.
+// NewHandler constructs an http.Handler serving the Seamline REST + resumable SSE API.
 func NewHandler(b *broker.Broker, cfg Config) http.Handler {
 	keepalive := cfg.KeepaliveInterval
 	if keepalive <= 0 {
@@ -78,8 +79,8 @@ func withCORS(next http.Handler) http.Handler {
 
 func (h *handler) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status": "ok",
-		"epoch":  h.broker.Epoch(),
+		"status":      "ok",
+		"instance_id": h.broker.InstanceID(),
 	})
 }
 
@@ -90,19 +91,14 @@ func (h *handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil && r.Body != http.NoBody {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeError(w, http.StatusBadRequest, "invalid JSON request body")
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid JSON request body")
 			return
 		}
 	}
 
-	sessionID := strings.TrimSpace(req.SessionID)
-	if sessionID == "" {
-		sessionID = generateID("sess_")
-	}
-
-	meta, err := h.broker.CreateSession(r.Context(), sessionID)
+	meta, err := h.broker.CreateSession(r.Context(), strings.TrimSpace(req.SessionID))
 	if err != nil {
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, meta)
@@ -111,41 +107,35 @@ func (h *handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 func (h *handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := h.broker.ListSessions(r.Context())
 	if err != nil {
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
-	}
-	if sessions == nil {
-		sessions = []model.SessionSnapshot{}
 	}
 	writeJSON(w, http.StatusOK, sessions)
 }
 
 func (h *handler) handleInspectSession(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.PathValue("id")
-	snap, ok, err := h.broker.Inspect(r.Context(), sessionID)
+	snap, ok, err := h.broker.Inspect(r.Context(), r.PathValue("id"))
 	if err != nil {
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
 	}
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, codeNotFound, "session not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
 }
 
 func (h *handler) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.PathValue("id")
 	var req model.PublishRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxPublishBodyBytes))
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid JSON request body")
 		return
 	}
-
-	res, err := h.broker.Publish(r.Context(), sessionID, req)
+	res, err := h.broker.Publish(r.Context(), r.PathValue("id"), req)
 	if err != nil {
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -154,19 +144,17 @@ func (h *handler) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming unsupported by response writer")
+		writeError(w, http.StatusInternalServerError, codeInternal, "streaming unsupported by response writer")
 		return
 	}
-
-	afterEpoch, afterOffset, err := extractStreamCursor(r)
+	afterEpoch, afterSeq, err := extractStreamCursor(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error())
 		return
 	}
-
-	sub, err := h.broker.Subscribe(r.Context(), r.PathValue("id"), afterOffset, afterEpoch)
+	sub, err := h.broker.Subscribe(r.Context(), r.PathValue("id"), afterSeq, afterEpoch)
 	if err != nil {
-		h.writeBrokerError(w, err)
+		writeBrokerError(w, err)
 		return
 	}
 	defer sub.Cancel()
@@ -181,7 +169,6 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
-
 	h.streamSSELoop(r.Context(), w, flusher, sub)
 }
 
@@ -198,19 +185,21 @@ func (h *handler) streamSSELoop(ctx context.Context, w io.Writer, flusher http.F
 				return
 			}
 			flusher.Flush()
-		case ev, ok := <-sub.Events:
+		case d, ok := <-sub.Events:
 			if !ok {
-				writeSlowSubscriberSSE(w, flusher, sub.Err())
+				writeTerminalStreamError(w, flusher, sub.Err())
 				return
 			}
-			if err := writeSSEEvent(w, flusher, ev); err != nil {
+			if err := writeDelivery(w, flusher, d); err != nil {
 				return
 			}
 		}
 	}
 }
 
-func writeSlowSubscriberSSE(w io.Writer, flusher http.Flusher, err error) {
+// writeTerminalStreamError tells the client why the broker ended its subscription. The native
+// EventSource then reconnects with Last-Event-ID.
+func writeTerminalStreamError(w io.Writer, flusher http.Flusher, err error) {
 	if !errors.Is(err, broker.ErrSlowSubscriber) {
 		return
 	}
@@ -218,110 +207,52 @@ func writeSlowSubscriberSSE(w io.Writer, flusher http.Flusher, err error) {
 	flusher.Flush()
 }
 
-func writeSSEEvent(w io.Writer, flusher http.Flusher, ev model.OutEvent) error {
-	data, err := json.Marshal(ev)
+// formatDelivery renders one SSE frame. Business events carry id: <epoch>:<seq> and no event:
+// line (EventSource dispatches them as "message"), so producer event types can never collide
+// with control frame names.
+func formatDelivery(d model.Delivery) (string, error) {
+	data, err := json.Marshal(d.Event)
+	return fmt.Sprintf("id: %s:%d\ndata: %s\n\n", d.Event.Epoch, d.Event.Seq, data), err
+}
+
+func writeDelivery(w io.Writer, flusher http.Flusher, d model.Delivery) error {
+	frame, err := formatDelivery(d)
 	if err != nil {
 		return err
 	}
-
-	var writeErr error
-	if ev.Kind == model.EventCommitted {
-		_, writeErr = fmt.Fprintf(w, "id: %s:%d\nevent: record\ndata: %s\n\n", ev.Epoch, ev.Offset, data)
-	} else {
-		_, writeErr = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", sseEventName(ev.Kind), data)
+	if _, err := io.WriteString(w, frame); err != nil {
+		return err
 	}
-	if writeErr != nil {
-		return writeErr
-	}
-
 	flusher.Flush()
 	return nil
 }
 
-func sseEventName(kind model.EventKind) string {
-	switch kind {
-	case model.EventInFlightSnapshot:
-		return "inflight_snapshot"
-	case model.EventDelta:
-		return "delta"
-	default:
-		return string(kind)
+// extractStreamCursor reads the resume cursor <epoch>:<seq> from the Last-Event-ID header, or
+// else from ?after_seq=.
+func extractStreamCursor(r *http.Request) (epoch string, seq uint64, err error) {
+	raw := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if raw == "" {
+		raw = strings.TrimSpace(r.URL.Query().Get("after_seq"))
 	}
-}
-
-func extractStreamCursor(r *http.Request) (epoch string, offset uint64, err error) {
-	if lastID := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastID != "" {
-		return parseCursor(lastID)
-	}
-
-	q := r.URL.Query()
-	rawOffset := strings.TrimSpace(q.Get("after_offset"))
-	rawEpoch := strings.TrimSpace(q.Get("epoch"))
-	if rawOffset == "" {
-		return rawEpoch, 0, nil
-	}
-
-	parsedEpoch, parsedOffset, err := parseCursor(rawOffset)
-	if err != nil {
-		return "", 0, err
-	}
-	if parsedEpoch == "" {
-		parsedEpoch = rawEpoch
-	}
-	return parsedEpoch, parsedOffset, nil
-}
-
-func parseCursor(raw string) (epoch string, offset uint64, err error) {
-	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", 0, nil
 	}
+	return parseCursor(raw)
+}
+
+// parseCursor parses <epoch>:<seq>. A bare <seq> yields an empty epoch, which never matches a
+// session stream.
+func parseCursor(raw string) (epoch string, seq uint64, err error) {
+	seqStr := raw
 	if idx := strings.LastIndexByte(raw, ':'); idx != -1 {
-		epoch = raw[:idx]
-		offsetStr := raw[idx+1:]
-		if epoch == "" || offsetStr == "" {
+		epoch, seqStr = raw[:idx], raw[idx+1:]
+		if epoch == "" {
 			return "", 0, errors.New("invalid cursor format")
 		}
-		n, err := strconv.ParseUint(offsetStr, 10, 64)
-		if err != nil {
-			return "", 0, fmt.Errorf("invalid cursor offset: %w", err)
-		}
-		return epoch, n, nil
 	}
-	n, err := strconv.ParseUint(raw, 10, 64)
+	n, err := strconv.ParseUint(seqStr, 10, 64)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid cursor offset: %w", err)
+		return "", 0, fmt.Errorf("invalid cursor seq: %w", err)
 	}
-	return "", n, nil
-}
-
-func (h *handler) writeBrokerError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, broker.ErrInvalidInput), errors.Is(err, broker.ErrSequenceGap):
-		writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, broker.ErrStreamConflict):
-		writeError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, broker.ErrBrokerClosed):
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
-	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}
-
-func generateID(prefix string) string {
-	var buf [6]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
-	}
-	return prefix + hex.EncodeToString(buf[:])
+	return epoch, n, nil
 }
