@@ -13,12 +13,12 @@ func hasJSON(raw json.RawMessage) bool {
 	return len(bytes.TrimSpace(raw)) > 0
 }
 
-// normalizeRaw returns a private copy of raw, or nil when it is empty or whitespace.
-func normalizeRaw(raw json.RawMessage) json.RawMessage {
+// payloadOrNil returns raw, or nil when it is empty or whitespace. Storage keeps its own copy.
+func payloadOrNil(raw json.RawMessage) json.RawMessage {
 	if !hasJSON(raw) {
 		return nil
 	}
-	return append(json.RawMessage(nil), raw...)
+	return raw
 }
 
 func (b *Broker) validatePublishRequest(sessionID string, req model.PublishRequest) error {
@@ -29,15 +29,6 @@ func (b *Broker) validatePublishRequest(sessionID string, req model.PublishReque
 		return ErrEventTooLarge
 	}
 	return nil
-}
-
-func (b *Broker) checkActorPublishReady(ctx context.Context) error {
-	select {
-	case <-b.doneCh:
-		return ErrBrokerClosed
-	default:
-	}
-	return ctx.Err()
 }
 
 // Publish assigns the next seq of the session to an opaque event, commits it to storage together
@@ -58,38 +49,54 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if err := b.checkActorPublishReady(ctx); err != nil {
+	if err := b.checkOpen(ctx); err != nil {
 		return model.PublishResult{}, err
 	}
 
 	now := time.Now().UTC()
 	actor.touch()
-	if res, ok := b.idempotentReplayLocked(actor, req.IdempotencyKey, now); ok {
-		return res, nil
+	if e, ok := actor.idempotent[req.IdempotencyKey]; ok && now.Before(e.expiresAt) {
+		return model.PublishResult{Epoch: actor.epoch, Seq: e.seq, Deduplicated: true}, nil
 	}
-
-	c := actor.nextCommit(req.Type, req.Payload, now)
-	if err := b.store.Append(ctx, sessionID, c); err != nil {
+	ev, err := b.appendLocked(ctx, actor, req.Type, payloadOrNil(req.Payload), now)
+	if err != nil {
 		return model.PublishResult{}, err
 	}
-
-	// Point of no return: the event and its session state are committed.
-	actor.applyCommitLocked(c, now)
 	if req.IdempotencyKey != "" {
-		actor.idempotent.put(req.IdempotencyKey, c.Event.Seq, now)
+		b.rememberKeyLocked(actor, req.IdempotencyKey, ev.Seq, now)
 	}
-	actor.fanOutLocked(eventDelivery(c.Event))
-	return model.PublishResult{Epoch: c.Event.Epoch, Seq: c.Event.Seq}, nil
+	return model.PublishResult{Epoch: ev.Epoch, Seq: ev.Seq}, nil
 }
 
-// idempotentReplayLocked returns the original result for a retried publish.
-func (b *Broker) idempotentReplayLocked(actor *sessionActor, key string, now time.Time) (model.PublishResult, bool) {
-	if key == "" {
-		return model.PublishResult{}, false
+// rememberKeyLocked records the seq a key committed for IdempotencyWindow. Expired keys are swept
+// at most once per window, and a session that never sends keys never allocates the map.
+func (b *Broker) rememberKeyLocked(actor *sessionActor, key string, seq uint64, now time.Time) {
+	if actor.idempotent == nil {
+		actor.idempotent = make(map[string]idemEntry)
 	}
-	seq, ok := actor.idempotent.get(key, now)
-	if !ok {
-		return model.PublishResult{}, false
+	if !now.Before(actor.idemPruneAt) {
+		for k, e := range actor.idempotent {
+			if !now.Before(e.expiresAt) {
+				delete(actor.idempotent, k)
+			}
+		}
+		actor.idemPruneAt = now.Add(b.cfg.IdempotencyWindow)
 	}
-	return model.PublishResult{Epoch: actor.epoch, Seq: seq, Deduplicated: true}, true
+	actor.idempotent[key] = idemEntry{seq: seq, expiresAt: now.Add(b.cfg.IdempotencyWindow)}
+}
+
+// appendLocked commits the next event of the actor's session; storage assigns its seq and moves
+// the run state. Only once Append succeeded does the actor mirror the new seq and run pin and fan
+// the event out, so a failed append changes nothing.
+func (b *Broker) appendLocked(ctx context.Context, actor *sessionActor, eventType string, payload json.RawMessage, now time.Time) (model.Event, error) {
+	ev, info, err := b.store.Append(ctx, actor.sessionID, eventType, payload, now)
+	if err != nil {
+		return model.Event{}, err
+	}
+	actor.latestSeq, actor.activeRunStartSeq = ev.Seq, info.ActiveRunStartSeq
+	if info.ActiveRunStartSeq != 0 {
+		actor.runActiveAt = now
+	}
+	actor.fanOutLocked(eventDelivery(ev))
+	return ev, nil
 }

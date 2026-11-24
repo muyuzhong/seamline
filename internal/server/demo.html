@@ -574,7 +574,8 @@
         if (ev.type === "user_message") {
           pane.items.push({ kind: "user", seq: ev.seq, text: payloadField(p, "content") });
         } else if (ev.type === "run_started") {
-          openRunBubble(pane, ev.seq);
+          // The run bubble opens lazily at the run's first delta, so it follows the user message.
+          return;
         } else if (ev.type === "assistant_delta") {
           (pane.openRun || openRunBubble(pane, ev.seq)).text += payloadField(p, "text");
         } else if (ev.type === "tool_call_delta") {
@@ -644,12 +645,10 @@
         pane.items = [];
         pane.openRun = null;
         pane.lastSeq = 0;
+        pane.cursor = "";
       }
 
       function handleBusinessEvent(pane, lastId, ev) {
-        if (ev.seq <= pane.lastSeq) {
-          return; // never happens with a correct broker; guards the UI anyway
-        }
         pane.lastSeq = ev.seq;
         pane.cursor = lastId || (ev.epoch + ":" + ev.seq);
         pane.eventCount++;
@@ -696,7 +695,6 @@
       }
 
       function resetPaneData(pane) {
-        pane.cursor = "";
         clearPaneItems(pane);
         pane.eventCount = 0;
         pane.resetCount = 0;
@@ -706,13 +704,10 @@
 
       // Client A: native EventSource. Business events have no "event:" line, so they arrive as
       // "message"; control frames are named cursor_reset and stream_error.
-      function connectClientA(fresh) {
+      function connectClientA() {
         disconnectClientA();
-        if (fresh) resetPaneData(clientA);
-        let url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
-        if (!fresh && clientA.cursor) {
-          url += "?after_seq=" + encodeURIComponent(clientA.cursor);
-        }
+        resetPaneData(clientA);
+        const url = "/v1/sessions/" + encodeURIComponent(currentSession) + "/stream";
         const es = new EventSource(url);
         clientA.es = es;
         es.onopen = () => {
@@ -899,13 +894,13 @@
         }
       });
 
-      document.getElementById("reloadFreshABtn").addEventListener("click", () => connectClientA(true));
+      document.getElementById("reloadFreshABtn").addEventListener("click", () => connectClientA());
 
       function switchSession(id) {
         currentSession = id.trim() || "playground-1";
         sessionInput.value = currentSession;
         syncUrlSession(currentSession);
-        connectClientA(true);
+        connectClientA();
         connectClientB(true);
         pollSessionMetrics();
       }
@@ -919,7 +914,7 @@
       });
 
       // Connect both panes on load (an F5 in the middle of a run replays it from run_started).
-      connectClientA(true);
+      connectClientA();
       connectClientB(true);
       pollSessionMetrics();
       setInterval(pollSessionMetrics, 250);
