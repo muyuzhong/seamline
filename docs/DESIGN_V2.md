@@ -14,14 +14,14 @@
 
 ### 1.1 存储职责边界：只管“短期热恢复窗口”，不做永久数据库
 在生产级 Agent 系统中，**长期历史持久化（System of Record）归属客户端本地存储（SQLite / IndexedDB / JSONL）或业务后端主数据库（PostgreSQL / MySQL）**。Seamline 不自研本地磁盘 WAL，仅负责活跃运行期及短期恢复窗口：
-- **默认内置 `MemoryStorage`**：零外部依赖单二进制启动，按字节配额与 `TTL` 自动淘汰过期历史事件；
+- **默认内置 `MemoryStorage`**（`internal/hotwindow`）：零外部依赖单二进制启动，按字节配额与 `TTL` 自动淘汰过期历史事件；
 - **可选插件 `RedisStorage`（Phase 3）**：基于 Redis 原生 `Streams (XADD)` + `EXPIRE` 承载跨重启热窗口与多实例共享状态，并在驱动层通过 **透明 I/O 微批管道（5~10ms Pipeline 批量刷写）** 吸收高频 Token 事件的网络往返开销，无需破坏上层逐事件游标模型。
 
 ### 1.2 统一载荷透明事件模型（Payload-Opaque Event Stream）
 放弃 Phase 1 将流拆分为 `Record` 与 `InFlight` 并在 Broker 内做字符串 `+` 拼接的做法，全链路统一为单一不可变结构 **`Event`**：
 
 - **单一事件原语**：无论是用户输入、单步文本 `delta`、多路并行工具调用（Parallel Tool Calls）交错输出的半截 JSON 参数碎片、思维链块，还是 `run_started` / `run_finished` 状态事件，进入会话即分配严格递增的 `seq = 1, 2, 3...`，Broker **不解析、不拼接 `Payload json.RawMessage`**，100% 原样缓存与广播。
-- **单一游标格式 `<epoch>:<seq>`**：每一条业务事件帧在 SSE 上均携带 `id: <epoch>:<seq>`（不带 `id:` 的帧仅限 `cursor_reset` 与 `stream_error` 两类控制帧）。客户端在 `seq = 42` 断线重连时，服务端精确从 `seq = 43` 起补发，零重传浪费，客户端只需维护一套纯粹的增量事件消费逻辑。
+- **单一游标格式 `<epoch>:<seq>`**：每一条业务事件帧在 SSE 上均携带 `id: <epoch>:<seq>`，且**不写 `event:` 行**（浏览器 `EventSource` 按默认 `message` 派发，生产者的 `type` 永远不会与控制帧重名）；不带 `id:` 的帧仅限 `cursor_reset` 与 `stream_error` 两类控制帧。发布请求为 `{"type","payload","idempotency_key"}`（`type` 必填、`payload` 可选且须为合法 JSON），响应为 `{"epoch","seq","deduplicated"}`。客户端在 `seq = 42` 断线重连时，服务端精确从 `seq = 43` 起补发，零重传浪费，客户端只需维护一套纯粹的增量事件消费逻辑。
 - **下游完全中立**：对外仅为标准 HTTP POST + W3C SSE（同时支持 `Last-Event-ID` 请求头与 `?after_seq=<epoch>:<seq>` 查询参数），任何自建后端服务（Go / Python / Rust / Node）、CLI/TUI、桌面/移动端、协作子 Agent 或原生浏览器 `EventSource` 均可直连。
 
 ### 1.3 分段水位锁定与三层硬字节配额（解决未落库长任务防截断）
@@ -58,6 +58,7 @@
 - `PublishRequest` 提供可选字段 `idempotency_key`（同一会话内保留 `5m` 时间窗，独立于 `HistoryTTL`）。
 - 重复 `idempotency_key` 直接返回首次提交的 `{seq, epoch, deduplicated: true}` 且不再扇出（不比对请求体内容，与 NATS `Nats-Msg-Id` 及 Centrifugo `idempotency_key` 语义一致）。
 - **原子性红线**：`idempotency_key` 与 `sessionActor` 内存状态（`latest_seq`、`active_run_start_seq`、会话状态）必须在 `Storage.Append` **成功之后**才更新；存储写入失败时内存零变更，调用方使用相同 `idempotency_key` 重试可正常提交。
+- **没有独立的元数据写入**：会话状态（`state`、`active_run_start_seq`、最近一轮）由 `Storage.Append` 与事件在同一次提交里原子写入（Redis 中为同一个 Lua 脚本），不再有 best-effort 的 `SaveMeta`；`Inspect` / `ListSessions` 直接读 Storage。
 
 ---
 
