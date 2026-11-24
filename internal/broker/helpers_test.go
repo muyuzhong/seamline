@@ -124,7 +124,7 @@ type flakyStore struct {
 	releaseAppend chan struct{}
 }
 
-func (f *flakyStore) Append(ctx context.Context, id, eventType string, payload json.RawMessage, now time.Time) (model.Event, hotwindow.StreamInfo, error) {
+func (f *flakyStore) Append(ctx context.Context, id, eventType string, payload json.RawMessage, now time.Time) (model.Event, model.SessionMeta, error) {
 	if f.slowSessionID != "" && id == f.slowSessionID {
 		select {
 		case f.enteredAppend <- struct{}{}:
@@ -133,7 +133,7 @@ func (f *flakyStore) Append(ctx context.Context, id, eventType string, payload j
 		<-f.releaseAppend
 	}
 	if f.failNextAppend.CompareAndSwap(true, false) {
-		return model.Event{}, hotwindow.StreamInfo{}, errInjectedStorage
+		return model.Event{}, model.SessionMeta{}, errInjectedStorage
 	}
 	return f.MemoryStorage.Append(ctx, id, eventType, payload, now)
 }

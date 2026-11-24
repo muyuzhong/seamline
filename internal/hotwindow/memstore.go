@@ -73,9 +73,9 @@ func checkArgs(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-func (m *MemoryStorage) EnsureStream(ctx context.Context, sessionID string) (StreamInfo, error) {
+func (m *MemoryStorage) EnsureStream(ctx context.Context, sessionID string) (model.SessionMeta, error) {
 	if err := checkArgs(ctx, sessionID); err != nil {
-		return StreamInfo{}, err
+		return model.SessionMeta{}, err
 	}
 	now := m.clock()
 
@@ -92,23 +92,23 @@ func (m *MemoryStorage) EnsureStream(ctx context.Context, sessionID string) (Str
 	return s.info(sessionID), nil
 }
 
-func (m *MemoryStorage) Stream(ctx context.Context, sessionID string) (StreamInfo, bool, error) {
+func (m *MemoryStorage) Stream(ctx context.Context, sessionID string) (model.SessionMeta, bool, error) {
 	if err := checkArgs(ctx, sessionID); err != nil {
-		return StreamInfo{}, false, err
+		return model.SessionMeta{}, false, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	s, ok := m.streams[sessionID]
 	if !ok {
-		return StreamInfo{}, false, nil
+		return model.SessionMeta{}, false, nil
 	}
 	return s.info(sessionID), true, nil
 }
 
-func (m *MemoryStorage) Append(ctx context.Context, sessionID, eventType string, payload json.RawMessage, now time.Time) (model.Event, StreamInfo, error) {
+func (m *MemoryStorage) Append(ctx context.Context, sessionID, eventType string, payload json.RawMessage, now time.Time) (model.Event, model.SessionMeta, error) {
 	if err := checkArgs(ctx, sessionID); err != nil {
-		return model.Event{}, StreamInfo{}, err
+		return model.Event{}, model.SessionMeta{}, err
 	}
 	touched := m.clock()
 
@@ -117,27 +117,27 @@ func (m *MemoryStorage) Append(ctx context.Context, sessionID, eventType string,
 
 	s, ok := m.streams[sessionID]
 	if !ok {
-		return model.Event{}, StreamInfo{}, ErrStreamNotFound
+		return model.Event{}, model.SessionMeta{}, ErrStreamNotFound
 	}
 	ev, err := s.appendEvent(eventType, payload, now, m.retention)
 	if err != nil {
-		return model.Event{}, StreamInfo{}, err
+		return model.Event{}, model.SessionMeta{}, err
 	}
 	s.touchedAt = touched
 	s.evict(now, m.retention)
 	return ev, s.info(sessionID), nil
 }
 
-func (m *MemoryStorage) ReadAfter(ctx context.Context, sessionID string, afterSeq uint64) ([]model.Event, StreamInfo, error) {
+func (m *MemoryStorage) ReadAfter(ctx context.Context, sessionID string, afterSeq uint64) ([]model.Event, model.SessionMeta, error) {
 	if err := checkArgs(ctx, sessionID); err != nil {
-		return nil, StreamInfo{}, err
+		return nil, model.SessionMeta{}, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	s, ok := m.streams[sessionID]
 	if !ok {
-		return nil, StreamInfo{}, ErrStreamNotFound
+		return nil, model.SessionMeta{}, ErrStreamNotFound
 	}
 	idx := sort.Search(len(s.events), func(i int) bool {
 		return s.events[i].Seq > afterSeq
@@ -178,12 +178,12 @@ func (m *MemoryStorage) Sweep(ctx context.Context, now time.Time) error {
 	return nil
 }
 
-func (m *MemoryStorage) List(ctx context.Context) ([]StreamInfo, error) {
+func (m *MemoryStorage) List(ctx context.Context) ([]model.SessionMeta, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	m.mu.RLock()
-	out := make([]StreamInfo, 0, len(m.streams))
+	out := make([]model.SessionMeta, 0, len(m.streams))
 	for id, s := range m.streams {
 		out = append(out, s.info(id))
 	}

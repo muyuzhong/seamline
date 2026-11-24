@@ -34,7 +34,7 @@ func (b *Broker) registerSubscriber(ctx context.Context, actor *sessionActor, su
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
 
-	if err := b.checkActorPublishReady(ctx); err != nil {
+	if err := b.checkOpen(ctx); err != nil {
 		return subSnapshot{}, err
 	}
 	actor.subscribers[sub] = struct{}{}
@@ -62,9 +62,8 @@ func (b *Broker) Subscribe(ctx context.Context, sessionID string, afterSeq uint6
 		return nil, err
 	}
 	sub := &subState{
-		liveCh:    make(chan model.Delivery, b.cfg.SubscriberBufferSize),
-		cancelCh:  make(chan struct{}),
-		evictedCh: make(chan struct{}),
+		liveCh: make(chan model.Delivery, b.cfg.SubscriberBufferSize),
+		stopCh: make(chan struct{}),
 	}
 	snap, err := b.registerSubscriber(ctx, actor, sub)
 	if err != nil {
@@ -137,37 +136,17 @@ func (b *Broker) replayCatchUp(
 	return true
 }
 
-func (b *Broker) checkPumpStop(ctx context.Context, sub *subState) bool {
+// checkPumpStop reports whether the subscription has ended. Eviction and Broker.Close both
+// close stopCh (after setting the error), so a pump only watches ctx and stopCh.
+func checkPumpStop(ctx context.Context, sub *subState) bool {
 	select {
 	case <-ctx.Done():
 		sub.setErr(ctx.Err())
 		return true
-	case <-sub.cancelCh:
-		return true
-	case <-sub.evictedCh:
-		return true
-	case <-b.doneCh:
-		sub.setErr(ErrBrokerClosed)
+	case <-sub.stopCh:
 		return true
 	default:
 		return false
-	}
-}
-
-func (b *Broker) waitNextLiveEvent(ctx context.Context, sub *subState) (model.Delivery, bool) {
-	select {
-	case <-ctx.Done():
-		sub.setErr(ctx.Err())
-		return model.Delivery{}, false
-	case <-sub.cancelCh:
-		return model.Delivery{}, false
-	case <-sub.evictedCh:
-		return model.Delivery{}, false
-	case <-b.doneCh:
-		sub.setErr(ErrBrokerClosed)
-		return model.Delivery{}, false
-	case d, ok := <-sub.liveCh:
-		return d, ok
 	}
 }
 
@@ -175,39 +154,34 @@ func (b *Broker) waitNextLiveEvent(ctx context.Context, sub *subState) (model.De
 // section, so every live event is newer than snapSeq; the filter is defense in depth.
 func (b *Broker) drainLiveStream(ctx context.Context, sub *subState, outCh chan<- model.Delivery, snapSeq uint64) {
 	for {
-		if b.checkPumpStop(ctx, sub) {
+		select {
+		case <-ctx.Done():
+			sub.setErr(ctx.Err())
 			return
-		}
-		d, ok := b.waitNextLiveEvent(ctx, sub)
-		if !ok {
+		case <-sub.stopCh:
 			return
-		}
-		if d.Event.Seq <= snapSeq {
-			continue
-		}
-		if !b.sendOut(ctx, sub, outCh, d) {
-			return
+		case d, ok := <-sub.liveCh:
+			if !ok {
+				return
+			}
+			if d.Event.Seq > snapSeq && !b.sendOut(ctx, sub, outCh, d) {
+				return
+			}
 		}
 	}
 }
 
 func (b *Broker) sendOut(ctx context.Context, sub *subState, outCh chan<- model.Delivery, d model.Delivery) bool {
-	if b.checkPumpStop(ctx, sub) {
+	if checkPumpStop(ctx, sub) {
 		return false
 	}
-	d.Event.Payload = payloadOrNil(d.Event.Payload)
 	select {
 	case outCh <- d:
 		return true
 	case <-ctx.Done():
 		sub.setErr(ctx.Err())
 		return false
-	case <-sub.cancelCh:
-		return false
-	case <-sub.evictedCh:
-		return false
-	case <-b.doneCh:
-		sub.setErr(ErrBrokerClosed)
+	case <-sub.stopCh:
 		return false
 	}
 }

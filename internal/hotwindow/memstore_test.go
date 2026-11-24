@@ -40,13 +40,13 @@ func newWriter(t *testing.T, s *MemoryStorage, id string) *writer {
 	return &writer{t: t, s: s, id: id}
 }
 
-func (w *writer) append(eventType string, payloadLen int, at time.Time) (StreamInfo, error) {
+func (w *writer) append(eventType string, payloadLen int, at time.Time) (model.SessionMeta, error) {
 	payload := json.RawMessage(`"` + strings.Repeat("x", max(payloadLen-2, 0)) + `"`)
 	_, info, err := w.s.Append(context.Background(), w.id, eventType, payload, at)
 	return info, err
 }
 
-func (w *writer) must(eventType string, payloadLen int, at time.Time) StreamInfo {
+func (w *writer) must(eventType string, payloadLen int, at time.Time) model.SessionMeta {
 	w.t.Helper()
 	info, err := w.append(eventType, payloadLen, at)
 	if err != nil {
@@ -55,7 +55,7 @@ func (w *writer) must(eventType string, payloadLen int, at time.Time) StreamInfo
 	return info
 }
 
-func (w *writer) window() (string, StreamInfo) {
+func (w *writer) window() (string, model.SessionMeta) {
 	w.t.Helper()
 	events, info, err := w.s.ReadAfter(context.Background(), w.id, 0)
 	if err != nil {

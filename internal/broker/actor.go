@@ -10,17 +10,16 @@ import (
 )
 
 type subState struct {
-	liveCh     chan model.Delivery
-	cancelCh   chan struct{}
-	cancelOnce sync.Once
-	evictedCh  chan struct{}
-	errMu      sync.Mutex
-	err        error
+	liveCh   chan model.Delivery
+	stopCh   chan struct{} // closed when the subscription ends for any reason but ctx
+	stopOnce sync.Once
+	errMu    sync.Mutex
+	err      error
 }
 
 func (s *subState) cancel() {
-	s.cancelOnce.Do(func() {
-		close(s.cancelCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
 	})
 }
 
@@ -75,7 +74,7 @@ func (a *sessionActor) fanOutLocked(d model.Delivery) {
 			delete(a.subscribers, sub)
 			sub.setErr(ErrSlowSubscriber)
 			close(sub.liveCh)
-			close(sub.evictedCh)
+			sub.cancel()
 		}
 	}
 }
@@ -87,6 +86,7 @@ func (a *sessionActor) closeSubscribersWithErr(err error) {
 		delete(a.subscribers, sub)
 		sub.setErr(err)
 		close(sub.liveCh)
+		sub.cancel()
 	}
 }
 

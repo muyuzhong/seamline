@@ -28,15 +28,6 @@ func (b *Broker) validatePublishRequest(sessionID string, req model.PublishReque
 	return nil
 }
 
-func (b *Broker) checkActorPublishReady(ctx context.Context) error {
-	select {
-	case <-b.doneCh:
-		return ErrBrokerClosed
-	default:
-	}
-	return ctx.Err()
-}
-
 // Publish assigns the next seq of the session to an opaque event, commits it to storage together
 // with the run bookkeeping, and fans it out.
 func (b *Broker) Publish(ctx context.Context, sessionID string, req model.PublishRequest) (model.PublishResult, error) {
@@ -55,7 +46,7 @@ func (b *Broker) Publish(ctx context.Context, sessionID string, req model.Publis
 
 	actor.mu.Lock()
 	defer actor.mu.Unlock()
-	if err := b.checkActorPublishReady(ctx); err != nil {
+	if err := b.checkOpen(ctx); err != nil {
 		return model.PublishResult{}, err
 	}
 
